@@ -1,0 +1,20 @@
+
+[package]
+name = "render"
+version = "0.1.0"
+authors = ["Robert A Ware"]
+edition = "2024"
+
+[dependencies]
+# -- External crates
+anyhow = "1.0.98"
+ash = "0.38.0"
+ash-window = "0.13.0"
+raw-window-handle = "0.6.2"
+winit = "0.30.11"
+
+[dev-dependencies]
+# -- External crates
+criterion = "0.5"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+rand = "0.8"
