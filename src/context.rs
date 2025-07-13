@@ -72,7 +72,7 @@ impl Context {
 
             let (physical_device, device_memory_properties, queue_family_index) =
                 get_physical_device(&instance, &surface_instance, &surface)?;
-            let device = create_device(&instance, physical_device, queue_family_index)?;
+            let device = create_logical_device(&instance, physical_device, queue_family_index)?;
 
             let (surface_format, surface_extent, pre_transform, desired_image_count) =
                 get_surface_info(
@@ -122,7 +122,6 @@ impl Context {
                 .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let depth_image = device.create_image(&depth_image_info, None)?;
-
             let depth_image_memory_req = device.get_image_memory_requirements(depth_image);
             let depth_image_memory_index = find_memorytype_index(
                 &depth_image_memory_req,
@@ -130,13 +129,11 @@ impl Context {
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )
             .expect("Unable to find suitable memory index for depth image.");
-
             let depth_image_allocate_info = vk::MemoryAllocateInfo::default()
                 .allocation_size(depth_image_memory_req.size)
                 .memory_type_index(depth_image_memory_index);
             let depth_image_device_memory =
                 device.allocate_memory(&depth_image_allocate_info, None)?;
-
             device.bind_image_memory(depth_image, depth_image_device_memory, 0)?;
             let depth_image_view =
                 create_depth_image_view(&device, &depth_image, depth_image_info.format)?;
@@ -351,7 +348,7 @@ fn get_physical_device(
 }
 
 #[inline]
-fn create_device(
+fn create_logical_device(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
