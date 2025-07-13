@@ -22,7 +22,7 @@ pub struct Pipeline {
 
 #[rustfmt::skip]
 impl Pipeline {
-    pub fn new(context: &mut Context) -> VkResult<Self> {
+    pub fn new(context: &Context) -> VkResult<Self> {
         let viewports = vec![create_viewport(context)];
         let renderpass = create_renderpass(context)?;
         let framebuffers = create_framebuffers(context, &renderpass)?;
@@ -39,9 +39,9 @@ impl Pipeline {
         )?;
 
         unsafe {
-            context.device.destroy_pipeline_layout(pipeline_layout, None);
-            context.device.destroy_shader_module(frag_shader_module, None);
             context.device.destroy_shader_module(vert_shader_module, None);
+            context.device.destroy_shader_module(frag_shader_module, None);
+            context.device.destroy_pipeline_layout(pipeline_layout, None);
         }
 
         Ok(Self {
@@ -52,7 +52,6 @@ impl Pipeline {
         })
     }
 
-    #[rustfmt::skip]
     pub fn destroy(&self, context: &Context) {
         unsafe {
             context.device.device_wait_idle().unwrap();
@@ -70,15 +69,15 @@ pub fn create_viewport(context: &Context) -> vk::Viewport {
     vk::Viewport {
         x: 0.0,
         y: 0.0,
-        width: context.surface_resolution.width as f32,
-        height: context.surface_resolution.height as f32,
+        width: context.surface_extent.width as f32,
+        height: context.surface_extent.height as f32,
         min_depth: 0.0,
         max_depth: 1.0,
     }
 }
 
 #[inline]
-pub fn create_renderpass(context: &mut Context) -> VkResult<vk::RenderPass> {
+pub fn create_renderpass(context: &Context) -> VkResult<vk::RenderPass> {
     let renderpass_attachments = [
         vk::AttachmentDescription::default()
             .format(context.surface_format.format)
@@ -136,8 +135,8 @@ pub fn create_framebuffers(
             let create_info = vk::FramebufferCreateInfo::default()
                 .render_pass(*renderpass)
                 .attachments(&attachments)
-                .width(context.surface_resolution.width)
-                .height(context.surface_resolution.height)
+                .width(context.surface_extent.width)
+                .height(context.surface_extent.height)
                 .layers(1);
 
             unsafe {
@@ -218,7 +217,7 @@ pub fn create_graphics_pipeline(
         ..Default::default()
     };
 
-    let scissors = [context.surface_resolution.into()];
+    let scissors = [context.surface_extent.into()];
     let viewport_state_info = vk::PipelineViewportStateCreateInfo::default()
         .scissors(&scissors)
         .viewports(&viewports);
@@ -262,9 +261,9 @@ pub fn create_graphics_pipeline(
         .logic_op(vk::LogicOp::CLEAR)
         .attachments(&color_blend_attachment_states);
 
-    let dynamic_state = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state_info =
-        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_state);
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
 
     let graphics_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&shader_stage_create_infos)
@@ -309,17 +308,12 @@ pub fn create_buffer<T: Copy>(
         let allocate_info = vk::MemoryAllocateInfo::default()
             .allocation_size(memory_req.size)
             .memory_type_index(memory_index);
-
         let memory = context.device.allocate_memory(&allocate_info, None)?;
-
-        // NOTE: What is this even for? Never used in example.
         let buffer_ptr =
             context
                 .device
                 .map_memory(memory, 0, memory_req.size, vk::MemoryMapFlags::empty())?;
-
-        let mut align = Align::new(buffer_ptr, align_of::<T>() as u64, memory_req.size);
-        align.copy_from_slice(&data);
+        Align::new(buffer_ptr, align_of::<T>() as u64, memory_req.size).copy_from_slice(&data);
 
         context.device.unmap_memory(memory);
         context.device.bind_buffer_memory(buffer, memory, 0)?;
@@ -394,10 +388,10 @@ pub fn test_submit(
         let render_pass_begin_info = vk::RenderPassBeginInfo::default()
             .render_pass(*renderpass)
             .framebuffer(framebuffers[present_index as usize])
-            .render_area(context.surface_resolution.into())
+            .render_area(context.surface_extent.into())
             .clear_values(&clear_values);
 
-        let scissors = [context.surface_resolution.into()];
+        let scissors = [context.surface_extent.into()];
 
         record_submit_commandbuffer(
             &context.device,
