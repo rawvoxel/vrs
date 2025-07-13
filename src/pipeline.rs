@@ -6,23 +6,21 @@ use std::{default::Default, io::Cursor, mem::offset_of};
 
 #[derive(Clone, Debug, Copy)]
 pub struct Vertex {
-    pos: [f32; 4],
-    col: [f32; 4],
-}
-
-pub struct Pipeline {
-    pub viewports: Vec<vk::Viewport>,
-    pub renderpass: vk::RenderPass,
-    pub framebuffers: Vec<vk::Framebuffer>,
-    pub vert_shader_module: vk::ShaderModule,
-    pub frag_shader_module: vk::ShaderModule,
-    pub pipeline_layout: vk::PipelineLayout,
-    pub graphics_pipeline: vk::Pipeline,
+    pub pos: [f32; 4],
+    pub col: [f32; 4],
 }
 
 const VERT_SPV: &[u8] = include_bytes!("../assets/shader/triangle/vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("../assets/shader/triangle/frag.spv");
 
+pub struct Pipeline {
+    pub viewports: Vec<vk::Viewport>,
+    pub renderpass: vk::RenderPass,
+    pub framebuffers: Vec<vk::Framebuffer>,
+    pub graphics_pipeline: vk::Pipeline,
+}
+
+#[rustfmt::skip]
 impl Pipeline {
     pub fn new(context: &mut Context) -> VkResult<Self> {
         let viewports = vec![create_viewport(context)];
@@ -40,13 +38,16 @@ impl Pipeline {
             &pipeline_layout,
         )?;
 
+        unsafe {
+            context.device.destroy_pipeline_layout(pipeline_layout, None);
+            context.device.destroy_shader_module(frag_shader_module, None);
+            context.device.destroy_shader_module(vert_shader_module, None);
+        }
+
         Ok(Self {
             viewports,
             renderpass,
             framebuffers,
-            vert_shader_module,
-            frag_shader_module,
-            pipeline_layout,
             graphics_pipeline,
         })
     }
@@ -56,9 +57,6 @@ impl Pipeline {
         unsafe {
             context.device.device_wait_idle().unwrap();
             context.device.destroy_pipeline(self.graphics_pipeline, None);
-            context.device.destroy_pipeline_layout(self.pipeline_layout, None);
-            context.device.destroy_shader_module(self.vert_shader_module, None);
-            context.device.destroy_shader_module(self.frag_shader_module, None);
             for framebuffer in self.framebuffers.iter() {
                 context.device.destroy_framebuffer(*framebuffer, None);
             }
@@ -67,6 +65,7 @@ impl Pipeline {
     }
 }
 
+#[inline]
 pub fn create_viewport(context: &Context) -> vk::Viewport {
     vk::Viewport {
         x: 0.0,
@@ -81,42 +80,35 @@ pub fn create_viewport(context: &Context) -> vk::Viewport {
 #[inline]
 pub fn create_renderpass(context: &mut Context) -> VkResult<vk::RenderPass> {
     let renderpass_attachments = [
-        vk::AttachmentDescription {
-            format: context.surface_format.format,
-            samples: vk::SampleCountFlags::TYPE_1,
-            load_op: vk::AttachmentLoadOp::CLEAR,
-            store_op: vk::AttachmentStoreOp::STORE,
-            final_layout: vk::ImageLayout::PRESENT_SRC_KHR,
-            ..Default::default()
-        },
-        vk::AttachmentDescription {
-            format: vk::Format::D16_UNORM,
-            samples: vk::SampleCountFlags::TYPE_1,
-            load_op: vk::AttachmentLoadOp::CLEAR,
-            initial_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            ..Default::default()
-        },
+        vk::AttachmentDescription::default()
+            .format(context.surface_format.format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+        vk::AttachmentDescription::default()
+            .format(vk::Format::D16_UNORM)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .initial_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
     ];
 
-    let color_attachment_ref = [vk::AttachmentReference {
-        attachment: 0,
-        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-    }];
+    let color_attachment_ref = [vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
 
-    let depth_attachment_ref = vk::AttachmentReference {
-        attachment: 1,
-        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-    };
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 
-    let dependencies = [vk::SubpassDependency {
-        src_subpass: vk::SUBPASS_EXTERNAL,
-        src_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-        dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ
-            | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-        dst_stage_mask: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-        ..Default::default()
-    }];
+    let subpass_dependencies = [vk::SubpassDependency::default()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        )
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)];
 
     let subpass = vk::SubpassDescription::default()
         .color_attachments(&color_attachment_ref)
@@ -126,11 +118,12 @@ pub fn create_renderpass(context: &mut Context) -> VkResult<vk::RenderPass> {
     let create_info = vk::RenderPassCreateInfo::default()
         .attachments(&renderpass_attachments)
         .subpasses(std::slice::from_ref(&subpass))
-        .dependencies(&dependencies);
+        .dependencies(&subpass_dependencies);
 
     Ok(unsafe { context.device.create_render_pass(&create_info, None)? })
 }
 
+#[inline]
 pub fn create_framebuffers(
     context: &Context,
     renderpass: &vk::RenderPass,
@@ -157,6 +150,7 @@ pub fn create_framebuffers(
         .collect())
 }
 
+#[inline]
 pub fn create_shader_module(context: &Context, spv_bytes: &[u8]) -> VkResult<vk::ShaderModule> {
     let mut spv_file = Cursor::new(&spv_bytes);
     let shader_code = read_spv(&mut spv_file).expect("Failed to read shader spv file.");
@@ -164,12 +158,14 @@ pub fn create_shader_module(context: &Context, spv_bytes: &[u8]) -> VkResult<vk:
     unsafe { Ok(context.device.create_shader_module(&shader_info, None)?) }
 }
 
+#[inline]
 #[rustfmt::skip]
 pub fn create_pipeline_layout(context: &Context) -> VkResult<vk::PipelineLayout> {
     let layout_create_info = vk::PipelineLayoutCreateInfo::default();
     unsafe { Ok(context.device.create_pipeline_layout(&layout_create_info, None)?) }
 }
 
+#[inline]
 pub fn create_graphics_pipeline(
     context: &Context,
     viewports: &Vec<vk::Viewport>,
@@ -262,7 +258,7 @@ pub fn create_graphics_pipeline(
         alpha_blend_op: vk::BlendOp::ADD,
         color_write_mask: vk::ColorComponentFlags::RGBA,
     }];
-    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+    let color_blend_state_info = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op(vk::LogicOp::CLEAR)
         .attachments(&color_blend_attachment_states);
 
@@ -278,7 +274,7 @@ pub fn create_graphics_pipeline(
         .rasterization_state(&rasterization_info)
         .multisample_state(&multisample_state_info)
         .depth_stencil_state(&depth_state_info)
-        .color_blend_state(&color_blend_state)
+        .color_blend_state(&color_blend_state_info)
         .dynamic_state(&dynamic_state_info)
         .layout(*pipeline_layout)
         .render_pass(*renderpass);
@@ -293,107 +289,78 @@ pub fn create_graphics_pipeline(
     }
 }
 
+#[inline]
+pub fn create_buffer<T: Copy>(
+    context: &Context,
+    buffer_info: &vk::BufferCreateInfo,
+    data: &[T],
+) -> VkResult<(vk::Buffer, vk::DeviceMemory)> {
+    unsafe {
+        let buffer = context.device.create_buffer(&buffer_info, None)?;
+
+        let memory_req = context.device.get_buffer_memory_requirements(buffer);
+        let memory_index = find_memorytype_index(
+            &memory_req,
+            &context.device_memory_properties,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )
+        .expect("Unable to find suitable memorytype for buffer.");
+
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_req.size)
+            .memory_type_index(memory_index);
+
+        let memory = context.device.allocate_memory(&allocate_info, None)?;
+
+        // NOTE: What is this even for? Never used in example.
+        let buffer_ptr =
+            context
+                .device
+                .map_memory(memory, 0, memory_req.size, vk::MemoryMapFlags::empty())?;
+
+        let mut align = Align::new(buffer_ptr, align_of::<T>() as u64, memory_req.size);
+        align.copy_from_slice(&data);
+
+        context.device.unmap_memory(memory);
+        context.device.bind_buffer_memory(buffer, memory, 0)?;
+
+        Ok((buffer, memory))
+    }
+}
+
+#[inline]
 pub fn create_index_buffer(
     context: &Context,
     data: &[u32],
 ) -> VkResult<(vk::Buffer, vk::DeviceMemory)> {
-    unsafe {
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size_of_val(&data) as u64)
-            .usage(vk::BufferUsageFlags::INDEX_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(size_of_val(&data) as u64)
+        .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let buffer = context.device.create_buffer(&buffer_info, None)?;
-
-        let buffer_memory_req = context.device.get_buffer_memory_requirements(buffer);
-        let buffer_memory_index = find_memorytype_index(
-            &buffer_memory_req,
-            &context.device_memory_properties,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .expect("Unable to find suitable memorytype for the index buffer.");
-
-        let index_allocate_info = vk::MemoryAllocateInfo {
-            allocation_size: buffer_memory_req.size,
-            memory_type_index: buffer_memory_index,
-            ..Default::default()
-        };
-
-        let buffer_memory = context.device.allocate_memory(&index_allocate_info, None)?;
-        let buffer_ptr = context.device.map_memory(
-            buffer_memory,
-            0,
-            buffer_memory_req.size,
-            vk::MemoryMapFlags::empty(),
-        )?;
-
-        // NOTE: What is this even for? Never used in example.
-        let mut align = Align::new(buffer_ptr, align_of::<u32>() as u64, buffer_memory_req.size);
-        align.copy_from_slice(&data);
-
-        context.device.unmap_memory(buffer_memory);
-        context
-            .device
-            .bind_buffer_memory(buffer, buffer_memory, 0)?;
-
-        Ok((buffer, buffer_memory))
-    }
+    Ok(create_buffer(context, &buffer_info, data)?)
 }
 
+#[inline]
 pub fn create_vertex_buffer(
     context: &Context,
-    vertices: &[Vertex],
+    data: &[Vertex],
 ) -> VkResult<(vk::Buffer, vk::DeviceMemory)> {
-    unsafe {
-        let buffer_create_info = vk::BufferCreateInfo {
-            size: 3 * size_of::<Vertex>() as u64,
-            usage: vk::BufferUsageFlags::VERTEX_BUFFER,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
-            ..Default::default()
-        };
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(3 * size_of::<Vertex>() as u64)
+        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let buffer = context.device.create_buffer(&buffer_create_info, None)?;
-        let buffer_memory_req = context.device.get_buffer_memory_requirements(buffer);
-        let buffer_memory_index = find_memorytype_index(
-            &buffer_memory_req,
-            &context.device_memory_properties,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .expect("Unable to find suitable memorytype for the vertex buffer.");
-
-        let buffer_allocate_info = vk::MemoryAllocateInfo {
-            allocation_size: buffer_memory_req.size,
-            memory_type_index: buffer_memory_index,
-            ..Default::default()
-        };
-
-        let buffer_memory = context
-            .device
-            .allocate_memory(&buffer_allocate_info, None)?;
-
-        let buffer_ptr = context.device.map_memory(
-            buffer_memory,
-            0,
-            buffer_memory_req.size,
-            vk::MemoryMapFlags::empty(),
-        )?;
-
-        let mut align = Align::new(
-            buffer_ptr,
-            align_of::<Vertex>() as u64,
-            buffer_memory_req.size,
-        );
-        align.copy_from_slice(&vertices);
-        context.device.unmap_memory(buffer_memory);
-        context
-            .device
-            .bind_buffer_memory(buffer, buffer_memory, 0)?;
-
-        Ok((buffer, buffer_memory))
-    }
+    Ok(create_buffer(context, &buffer_info, data)?)
 }
 
-pub fn test_triangle(context: &mut Context, pipeline: &Pipeline) -> Result<()> {
+pub fn test_submit(
+    context: &Context,
+    pipeline: &Pipeline,
+    index_count: u32,
+    index_buffer: &vk::Buffer,
+    vertex_buffer: &vk::Buffer,
+) -> Result<()> {
     let Pipeline {
         viewports,
         renderpass,
@@ -402,46 +369,27 @@ pub fn test_triangle(context: &mut Context, pipeline: &Pipeline) -> Result<()> {
         ..
     } = pipeline;
 
-    let indices = [0u32, 1, 2];
-    let vertices = [
-        Vertex {
-            pos: [-1.0, 1.0, 0.0, 1.0],
-            col: [0.0, 1.0, 0.0, 1.0],
+    let clear_values = [
+        vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 0.0],
+            },
         },
-        Vertex {
-            pos: [1.0, 1.0, 0.0, 1.0],
-            col: [0.0, 0.0, 1.0, 1.0],
-        },
-        Vertex {
-            pos: [0.0, -1.0, 0.0, 1.0],
-            col: [1.0, 0.0, 0.0, 1.0],
+        vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue {
+                depth: 1.0,
+                stencil: 0,
+            },
         },
     ];
 
-    let (index_buffer, index_buffer_memory) = create_index_buffer(context, &indices)?;
-    let (vertex_buffer, vertex_buffer_memory) = create_vertex_buffer(context, &vertices)?;
-
     unsafe {
-        let (present_index, _) = context.swapchain_device.acquire_next_image(
+        let (present_index, _suboptimal) = context.swapchain_device.acquire_next_image(
             context.swapchain,
             u64::MAX,
             context.present_complete_semaphore,
             vk::Fence::null(),
         )?;
-
-        let clear_values = [
-            vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 0.0],
-                },
-            },
-            vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
-                    stencil: 0,
-                },
-            },
-        ];
 
         let render_pass_begin_info = vk::RenderPassBeginInfo::default()
             .render_pass(*renderpass)
@@ -472,14 +420,14 @@ pub fn test_triangle(context: &mut Context, pipeline: &Pipeline) -> Result<()> {
                 );
                 device.cmd_set_viewport(draw_command_buffer, 0, &viewports);
                 device.cmd_set_scissor(draw_command_buffer, 0, &scissors);
-                device.cmd_bind_vertex_buffers(draw_command_buffer, 0, &[vertex_buffer], &[0]);
+                device.cmd_bind_vertex_buffers(draw_command_buffer, 0, &[*vertex_buffer], &[0]);
                 device.cmd_bind_index_buffer(
                     draw_command_buffer,
-                    index_buffer,
+                    *index_buffer,
                     0,
                     vk::IndexType::UINT32,
                 );
-                device.cmd_draw_indexed(draw_command_buffer, indices.len() as u32, 1, 0, 0, 1);
+                device.cmd_draw_indexed(draw_command_buffer, index_count, 1, 0, 0, 1);
                 device.cmd_end_render_pass(draw_command_buffer);
             },
         )?;
@@ -495,13 +443,7 @@ pub fn test_triangle(context: &mut Context, pipeline: &Pipeline) -> Result<()> {
 
         context
             .swapchain_device
-            .queue_present(context.present_queue, &present_info)
-            .unwrap();
-
-        context.device.free_memory(index_buffer_memory, None);
-        context.device.destroy_buffer(index_buffer, None);
-        context.device.free_memory(vertex_buffer_memory, None);
-        context.device.destroy_buffer(vertex_buffer, None);
+            .queue_present(context.present_queue, &present_info)?;
     }
 
     Ok(())
