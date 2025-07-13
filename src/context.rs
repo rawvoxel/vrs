@@ -6,7 +6,7 @@ use ash::{
     prelude::VkResult,
     vk,
 };
-use ash_window::{self, create_surface, enumerate_required_extensions};
+use ash_window::{create_surface, enumerate_required_extensions};
 use std::{
     borrow::Cow,
     ffi::{self, c_char},
@@ -291,7 +291,6 @@ fn create_instance(entry: &Entry, raw_display_handle: RawDisplayHandle) -> VkRes
     let engine_name = c"raw_engine";
     let version = vk::make_api_version(0, 0, 1, 0);
 
-    // Application
     let app_info = vk::ApplicationInfo::default()
         .application_name(&app_name)
         .application_version(version)
@@ -299,13 +298,11 @@ fn create_instance(entry: &Entry, raw_display_handle: RawDisplayHandle) -> VkRes
         .engine_version(version)
         .api_version(vk::API_VERSION_1_3);
 
-    // Layers
     let layers_names_raw: Vec<*const c_char> = [c"VK_LAYER_KHRONOS_validation"]
         .iter()
         .map(|raw_name| raw_name.as_ptr())
         .collect();
 
-    // Extensions
     let mut extension_names = enumerate_required_extensions(raw_display_handle)?.to_vec();
     extension_names.push(debug_utils::NAME.as_ptr());
 
@@ -316,14 +313,12 @@ fn create_instance(entry: &Entry, raw_display_handle: RawDisplayHandle) -> VkRes
         extension_names.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
     }
 
-    // Flags
     let instance_create_flags = if cfg!(any(target_os = "macos", target_os = "ios")) {
         vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
     } else {
         vk::InstanceCreateFlags::default()
     };
 
-    // Instance
     let instance_create_info = vk::InstanceCreateInfo::default()
         .application_info(&app_info)
         .enabled_layer_names(&layers_names_raw)
@@ -562,7 +557,6 @@ fn create_semaphores(device: &Device) -> VkResult<(vk::Semaphore, vk::Semaphore)
 #[inline]
 fn create_fences(device: &Device) -> VkResult<(vk::Fence, vk::Fence)> {
     let fence_create_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-
     unsafe {
         let draw_commands_reuse_fence = device.create_fence(&fence_create_info, None)?;
         let init_commands_reuse_fence = device.create_fence(&fence_create_info, None)?;
