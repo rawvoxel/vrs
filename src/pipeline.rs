@@ -21,17 +21,31 @@ pub struct Pipeline {
     pub graphics_pipeline: vk::Pipeline,
 }
 
-#[rustfmt::skip]
 impl Pipeline {
     pub fn new(context: &Context) -> VkResult<Self> {
-        let viewports = vec![create_viewport(context)];
-        let renderpass = create_renderpass(context)?;
-        let framebuffers = create_framebuffers(context, &renderpass)?;
-        let vert_shader_module = create_shader_module(context, VERT_SPV)?;
-        let frag_shader_module = create_shader_module(context, FRAG_SPV)?;
-        let pipeline_layout = create_pipeline_layout(context)?;
+        let viewports = vec![
+            vk::Viewport::default()
+                .x(0.0)
+                .y(0.0)
+                .width(context.surface_extent.width as f32)
+                .height(context.surface_extent.height as f32)
+                .min_depth(0.0)
+                .max_depth(1.0),
+        ];
+        let renderpass = create_renderpass(&context.device, context.surface_format)?;
+        let framebuffers = create_framebuffers(
+            &context.device,
+            context.present_image_views.clone(),
+            context.depth_image_view,
+            context.surface_extent,
+            renderpass,
+        )?;
+        let vert_shader_module = create_shader_module(&context.device, VERT_SPV)?;
+        let frag_shader_module = create_shader_module(&context.device, FRAG_SPV)?;
+        let pipeline_layout = create_pipeline_layout(&context.device)?;
         let graphics_pipeline = create_graphics_pipeline(
-            context,
+            &context.device,
+            context.surface_extent,
             &viewports,
             renderpass,
             vert_shader_module,
@@ -40,9 +54,15 @@ impl Pipeline {
         )?;
 
         unsafe {
-            context.device.destroy_shader_module(vert_shader_module, None);
-            context.device.destroy_shader_module(frag_shader_module, None);
-            context.device.destroy_pipeline_layout(pipeline_layout, None);
+            context
+                .device
+                .destroy_shader_module(vert_shader_module, None);
+            context
+                .device
+                .destroy_shader_module(frag_shader_module, None);
+            context
+                .device
+                .destroy_pipeline_layout(pipeline_layout, None);
         }
 
         Ok(Self {
@@ -53,35 +73,26 @@ impl Pipeline {
         })
     }
 
-    pub fn destroy(&self, context: &Context) {
+    pub fn destroy(&self, device: &ash::Device) {
         unsafe {
-            context.device.device_wait_idle().unwrap();
-            context.device.destroy_pipeline(self.graphics_pipeline, None);
+            device.device_wait_idle().unwrap();
+            device.destroy_pipeline(self.graphics_pipeline, None);
             for framebuffer in self.framebuffers.iter() {
-                context.device.destroy_framebuffer(*framebuffer, None);
+                device.destroy_framebuffer(*framebuffer, None);
             }
-            context.device.destroy_render_pass(self.renderpass, None);
+            device.destroy_render_pass(self.renderpass, None);
         }
     }
 }
 
 #[inline]
-pub fn create_viewport(context: &Context) -> vk::Viewport {
-    vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: context.surface_extent.width as f32,
-        height: context.surface_extent.height as f32,
-        min_depth: 0.0,
-        max_depth: 1.0,
-    }
-}
-
-#[inline]
-pub fn create_renderpass(context: &Context) -> VkResult<vk::RenderPass> {
+pub fn create_renderpass(
+    device: &ash::Device,
+    surface_format: vk::SurfaceFormatKHR,
+) -> VkResult<vk::RenderPass> {
     let renderpass_attachments = [
         vk::AttachmentDescription::default()
-            .format(context.surface_format.format)
+            .format(surface_format.format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -120,29 +131,30 @@ pub fn create_renderpass(context: &Context) -> VkResult<vk::RenderPass> {
         .subpasses(std::slice::from_ref(&subpass))
         .dependencies(&subpass_dependencies);
 
-    Ok(unsafe { context.device.create_render_pass(&create_info, None)? })
+    Ok(unsafe { device.create_render_pass(&create_info, None)? })
 }
 
 #[inline]
 pub fn create_framebuffers(
-    context: &Context,
-    renderpass: &vk::RenderPass,
+    device: &ash::Device,
+    present_image_views: Vec<vk::ImageView>,
+    depth_image_view: vk::ImageView,
+    surface_extent: vk::Extent2D,
+    renderpass: vk::RenderPass,
 ) -> VkResult<Vec<vk::Framebuffer>> {
-    Ok(context
-        .present_image_views
+    Ok(present_image_views
         .iter()
         .map(|&present_image_view| {
-            let attachments = [present_image_view, context.depth_image_view];
+            let attachments = [present_image_view, depth_image_view];
             let create_info = vk::FramebufferCreateInfo::default()
-                .render_pass(*renderpass)
+                .render_pass(renderpass)
                 .attachments(&attachments)
-                .width(context.surface_extent.width)
-                .height(context.surface_extent.height)
+                .width(surface_extent.width)
+                .height(surface_extent.height)
                 .layers(1);
 
             unsafe {
-                context
-                    .device
+                device
                     .create_framebuffer(&create_info, None)
                     .expect("Could not create vk::Framebuffer.")
             }
@@ -151,23 +163,24 @@ pub fn create_framebuffers(
 }
 
 #[inline]
-pub fn create_shader_module(context: &Context, spv_bytes: &[u8]) -> VkResult<vk::ShaderModule> {
+pub fn create_shader_module(device: &ash::Device, spv_bytes: &[u8]) -> VkResult<vk::ShaderModule> {
     let mut spv_file = Cursor::new(&spv_bytes);
     let shader_code = read_spv(&mut spv_file).expect("Failed to read shader spv file.");
     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
-    unsafe { Ok(context.device.create_shader_module(&shader_info, None)?) }
+    unsafe { Ok(device.create_shader_module(&shader_info, None)?) }
 }
 
 #[inline]
 #[rustfmt::skip]
-pub fn create_pipeline_layout(context: &Context) -> VkResult<vk::PipelineLayout> {
+pub fn create_pipeline_layout(device: &ash::Device) -> VkResult<vk::PipelineLayout> {
     let layout_create_info = vk::PipelineLayoutCreateInfo::default();
-    unsafe { Ok(context.device.create_pipeline_layout(&layout_create_info, None)?) }
+    unsafe { Ok(device.create_pipeline_layout(&layout_create_info, None)?) }
 }
 
 #[inline]
 pub fn create_graphics_pipeline(
-    context: &Context,
+    device: &ash::Device,
+    surface_extent: vk::Extent2D,
     viewports: &Vec<vk::Viewport>,
     renderpass: vk::RenderPass,
     vert_shader_module: vk::ShaderModule,
@@ -211,7 +224,7 @@ pub fn create_graphics_pipeline(
     let vertex_input_assembly_state_info = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
-    let scissors = [context.surface_extent.into()];
+    let scissors = [surface_extent.into()];
     let viewport_state_info = vk::PipelineViewportStateCreateInfo::default()
         .scissors(&scissors)
         .viewports(viewports);
@@ -269,8 +282,7 @@ pub fn create_graphics_pipeline(
         .render_pass(renderpass);
 
     unsafe {
-        let graphics_pipelines = context
-            .device
+        let graphics_pipelines = device
             .create_graphics_pipelines(vk::PipelineCache::null(), &[graphics_pipeline_info], None)
             .expect("Could not create vk::Pipeline.");
 
