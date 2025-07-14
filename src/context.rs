@@ -13,6 +13,7 @@ use std::{
 };
 use winit::raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
+#[derive(Clone)]
 pub struct Context {
     pub entry: Entry,
     pub instance: Instance,
@@ -22,7 +23,7 @@ pub struct Context {
     pub debug_utils_messenger: vk::DebugUtilsMessengerEXT,
 
     pub physical_device: vk::PhysicalDevice,
-    pub device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+    pub physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub queue_family_index: u32,
 
     pub surface_instance: surface::Instance,
@@ -70,7 +71,7 @@ impl Context {
             let surface =
                 ash_window::create_surface(&entry, &instance, display_handle, window_handle, None)?;
 
-            let (physical_device, device_memory_properties, queue_family_index) =
+            let (physical_device, physical_device_memory_properties, queue_family_index) =
                 get_physical_device(&instance, &surface_instance, &surface)?;
             let device = create_logical_device(&instance, physical_device, queue_family_index)?;
 
@@ -121,20 +122,8 @@ impl Context {
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let depth_image = device.create_image(&depth_image_info, None)?;
-            let depth_image_memory_req = device.get_image_memory_requirements(depth_image);
-            let depth_image_memory_index = find_memorytype_index(
-                &depth_image_memory_req,
-                &device_memory_properties,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-            .expect("Unable to find suitable memory index for depth image.");
-            let depth_image_allocate_info = vk::MemoryAllocateInfo::default()
-                .allocation_size(depth_image_memory_req.size)
-                .memory_type_index(depth_image_memory_index);
-            let depth_image_device_memory =
-                device.allocate_memory(&depth_image_allocate_info, None)?;
-            device.bind_image_memory(depth_image, depth_image_device_memory, 0)?;
+            let (depth_image, depth_image_device_memory) =
+                create_image(&device, depth_image_info, physical_device_memory_properties)?;
             let depth_image_view =
                 create_depth_image_view(&device, &depth_image, depth_image_info.format)?;
 
@@ -143,6 +132,7 @@ impl Context {
             let init_commands_fence = create_fence(&device)?;
             let draw_commands_fence = create_fence(&device)?;
 
+            // NOTE: WHAT IS THIS
             let image_memory_barriers = vk::ImageMemoryBarrier::default()
                 .image(depth_image)
                 .dst_access_mask(
@@ -166,7 +156,7 @@ impl Context {
                 &[],
                 &[],
                 &[],
-                |device, setup_command_buffer| {
+                |setup_command_buffer| {
                     device.cmd_pipeline_barrier(
                         setup_command_buffer,
                         vk::PipelineStageFlags::BOTTOM_OF_PIPE,
@@ -188,7 +178,7 @@ impl Context {
                 debug_utils_messenger,
 
                 physical_device,
-                device_memory_properties,
+                physical_device_memory_properties,
                 queue_family_index,
 
                 surface_instance,
@@ -514,6 +504,29 @@ fn create_present_image_views(
     Ok(image_views)
 }
 
+fn create_image(
+    device: &Device,
+    image_info: vk::ImageCreateInfo,
+    physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+) -> VkResult<(vk::Image, vk::DeviceMemory)> {
+    unsafe {
+        let image = device.create_image(&image_info, None)?;
+        let memory_req = device.get_image_memory_requirements(image);
+        let memory_index = find_memorytype_index(
+            &memory_req,
+            &physical_device_memory_properties,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .expect("Unable to find suitable memory index for image.");
+        let memory_allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_req.size)
+            .memory_type_index(memory_index);
+        let memory = device.allocate_memory(&memory_allocate_info, None)?;
+        device.bind_image_memory(image, memory, 0)?;
+        Ok((image, memory))
+    }
+}
+
 #[inline]
 fn create_depth_image_view(
     device: &Device,
@@ -546,7 +559,7 @@ fn create_fence(device: &Device) -> VkResult<vk::Fence> {
     unsafe { Ok(device.create_fence(&fence_info, None)?) }
 }
 
-pub fn record_submit_commandbuffer<F: FnOnce(&Device, vk::CommandBuffer)>(
+pub fn record_submit_commandbuffer<F: FnOnce(vk::CommandBuffer)>(
     device: &Device,
     command_buffer: vk::CommandBuffer,
     command_buffer_fence: vk::Fence,
@@ -575,7 +588,7 @@ pub fn record_submit_commandbuffer<F: FnOnce(&Device, vk::CommandBuffer)>(
         )?;
 
         device.begin_command_buffer(command_buffer, &command_buffer_begin_info)?;
-        op(device, command_buffer);
+        op(command_buffer);
         device.end_command_buffer(command_buffer)?;
 
         device.queue_submit(submit_queue, &[submit_info], command_buffer_fence)
