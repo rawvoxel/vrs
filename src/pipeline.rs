@@ -13,6 +13,7 @@ pub struct Vertex {
 const VERT_SPV: &[u8] = include_bytes!("../assets/shader/triangle/vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("../assets/shader/triangle/frag.spv");
 
+#[derive(Clone)]
 pub struct Pipeline {
     pub viewports: Vec<vk::Viewport>,
     pub renderpass: vk::RenderPass,
@@ -32,10 +33,10 @@ impl Pipeline {
         let graphics_pipeline = create_graphics_pipeline(
             context,
             &viewports,
-            &renderpass,
-            &vert_shader_module,
-            &frag_shader_module,
-            &pipeline_layout,
+            renderpass,
+            vert_shader_module,
+            frag_shader_module,
+            pipeline_layout,
         )?;
 
         unsafe {
@@ -168,95 +169,84 @@ pub fn create_pipeline_layout(context: &Context) -> VkResult<vk::PipelineLayout>
 pub fn create_graphics_pipeline(
     context: &Context,
     viewports: &Vec<vk::Viewport>,
-    renderpass: &vk::RenderPass,
-    vert_shader_module: &vk::ShaderModule,
-    frag_shader_module: &vk::ShaderModule,
-    pipeline_layout: &vk::PipelineLayout,
+    renderpass: vk::RenderPass,
+    vert_shader_module: vk::ShaderModule,
+    frag_shader_module: vk::ShaderModule,
+    pipeline_layout: vk::PipelineLayout,
 ) -> VkResult<vk::Pipeline> {
     let shader_entry_name = c"main";
     let shader_stage_create_infos = [
-        vk::PipelineShaderStageCreateInfo {
-            module: *vert_shader_module,
-            p_name: shader_entry_name.as_ptr(),
-            stage: vk::ShaderStageFlags::VERTEX,
-            ..Default::default()
-        },
-        vk::PipelineShaderStageCreateInfo {
-            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
-            module: *frag_shader_module,
-            p_name: shader_entry_name.as_ptr(),
-            stage: vk::ShaderStageFlags::FRAGMENT,
-            ..Default::default()
-        },
+        vk::PipelineShaderStageCreateInfo::default()
+            .module(vert_shader_module)
+            .name(shader_entry_name)
+            .stage(vk::ShaderStageFlags::VERTEX),
+        vk::PipelineShaderStageCreateInfo::default()
+            .module(frag_shader_module)
+            .name(shader_entry_name)
+            .stage(vk::ShaderStageFlags::FRAGMENT),
     ];
 
-    let vertex_input_binding_descriptions = [vk::VertexInputBindingDescription {
-        binding: 0,
-        stride: size_of::<Vertex>() as u32,
-        input_rate: vk::VertexInputRate::VERTEX,
-    }];
+    let vertex_input_binding_descriptions = [vk::VertexInputBindingDescription::default()
+        .binding(0)
+        .stride(size_of::<Vertex>() as u32)
+        .input_rate(vk::VertexInputRate::VERTEX)];
+
     let vertex_input_attribute_descriptions = [
-        vk::VertexInputAttributeDescription {
-            location: 0,
-            binding: 0,
-            format: vk::Format::R32G32B32A32_SFLOAT,
-            offset: offset_of!(Vertex, pos) as u32,
-        },
-        vk::VertexInputAttributeDescription {
-            location: 1,
-            binding: 0,
-            format: vk::Format::R32G32B32A32_SFLOAT,
-            offset: offset_of!(Vertex, col) as u32,
-        },
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(0)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(offset_of!(Vertex, pos) as u32),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(1)
+            .format(vk::Format::R32G32B32A32_SFLOAT)
+            .offset(offset_of!(Vertex, col) as u32),
     ];
+
     let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_attribute_descriptions(&vertex_input_attribute_descriptions)
         .vertex_binding_descriptions(&vertex_input_binding_descriptions);
-    let vertex_input_assembly_state_info = vk::PipelineInputAssemblyStateCreateInfo {
-        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-        ..Default::default()
-    };
+
+    let vertex_input_assembly_state_info = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
     let scissors = [context.surface_extent.into()];
     let viewport_state_info = vk::PipelineViewportStateCreateInfo::default()
         .scissors(&scissors)
-        .viewports(&viewports);
+        .viewports(viewports);
 
-    let rasterization_info = vk::PipelineRasterizationStateCreateInfo {
-        front_face: vk::FrontFace::COUNTER_CLOCKWISE,
-        line_width: 1.0,
-        polygon_mode: vk::PolygonMode::FILL,
-        ..Default::default()
-    };
-    let multisample_state_info = vk::PipelineMultisampleStateCreateInfo {
-        rasterization_samples: vk::SampleCountFlags::TYPE_1,
-        ..Default::default()
-    };
-    let noop_stencil_state = vk::StencilOpState {
-        fail_op: vk::StencilOp::KEEP,
-        pass_op: vk::StencilOp::KEEP,
-        depth_fail_op: vk::StencilOp::KEEP,
-        compare_op: vk::CompareOp::ALWAYS,
-        ..Default::default()
-    };
-    let depth_state_info = vk::PipelineDepthStencilStateCreateInfo {
-        depth_test_enable: 1,
-        depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
-        front: noop_stencil_state,
-        back: noop_stencil_state,
-        max_depth_bounds: 1.0,
-        ..Default::default()
-    };
-    let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState {
-        blend_enable: 0,
-        src_color_blend_factor: vk::BlendFactor::SRC_COLOR,
-        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_DST_COLOR,
-        color_blend_op: vk::BlendOp::ADD,
-        src_alpha_blend_factor: vk::BlendFactor::ZERO,
-        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
-        alpha_blend_op: vk::BlendOp::ADD,
-        color_write_mask: vk::ColorComponentFlags::RGBA,
-    }];
+    let rasterization_info = vk::PipelineRasterizationStateCreateInfo::default()
+        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+        .line_width(1.0)
+        .polygon_mode(vk::PolygonMode::FILL);
+
+    let multisample_state_info = vk::PipelineMultisampleStateCreateInfo::default()
+        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+    let noop_stencil_state = vk::StencilOpState::default()
+        .fail_op(vk::StencilOp::KEEP)
+        .pass_op(vk::StencilOp::KEEP)
+        .depth_fail_op(vk::StencilOp::KEEP)
+        .compare_op(vk::CompareOp::ALWAYS);
+
+    let depth_state_info = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(true)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+        .front(noop_stencil_state)
+        .back(noop_stencil_state)
+        .max_depth_bounds(1.0);
+
+    let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(false)
+        .src_color_blend_factor(vk::BlendFactor::SRC_COLOR)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_DST_COLOR)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .alpha_blend_op(vk::BlendOp::ADD)
+        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+
     let color_blend_state_info = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op(vk::LogicOp::CLEAR)
         .attachments(&color_blend_attachment_states);
@@ -275,8 +265,8 @@ pub fn create_graphics_pipeline(
         .depth_stencil_state(&depth_state_info)
         .color_blend_state(&color_blend_state_info)
         .dynamic_state(&dynamic_state_info)
-        .layout(*pipeline_layout)
-        .render_pass(*renderpass);
+        .layout(pipeline_layout)
+        .render_pass(renderpass);
 
     unsafe {
         let graphics_pipelines = context
@@ -300,7 +290,7 @@ pub fn create_buffer<T: Copy>(
         let memory_req = context.device.get_buffer_memory_requirements(buffer);
         let memory_index = find_memorytype_index(
             &memory_req,
-            &context.device_memory_properties,
+            &context.physical_device_memory_properties,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )
         .expect("Unable to find suitable memorytype for buffer.");
@@ -355,14 +345,6 @@ pub fn test_submit(
     index_buffer: &vk::Buffer,
     vertex_buffer: &vk::Buffer,
 ) -> Result<()> {
-    let Pipeline {
-        viewports,
-        renderpass,
-        framebuffers,
-        graphics_pipeline,
-        ..
-    } = pipeline;
-
     let clear_values = [
         vk::ClearValue {
             color: vk::ClearColorValue {
@@ -386,8 +368,8 @@ pub fn test_submit(
         )?;
 
         let render_pass_begin_info = vk::RenderPassBeginInfo::default()
-            .render_pass(*renderpass)
-            .framebuffer(framebuffers[present_index as usize])
+            .render_pass(pipeline.renderpass)
+            .framebuffer(pipeline.framebuffers[present_index as usize])
             .render_area(context.surface_extent.into())
             .clear_values(&clear_values);
 
@@ -401,28 +383,39 @@ pub fn test_submit(
             &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
             &[context.present_complete_semaphore],
             &[context.render_complete_semaphore],
-            |device, draw_command_buffer| {
-                device.cmd_begin_render_pass(
+            |draw_command_buffer| {
+                context.device.cmd_begin_render_pass(
                     draw_command_buffer,
                     &render_pass_begin_info,
                     vk::SubpassContents::INLINE,
                 );
-                device.cmd_bind_pipeline(
+                context.device.cmd_bind_pipeline(
                     draw_command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    *graphics_pipeline,
+                    pipeline.graphics_pipeline,
                 );
-                device.cmd_set_viewport(draw_command_buffer, 0, &viewports);
-                device.cmd_set_scissor(draw_command_buffer, 0, &scissors);
-                device.cmd_bind_vertex_buffers(draw_command_buffer, 0, &[*vertex_buffer], &[0]);
-                device.cmd_bind_index_buffer(
+                context
+                    .device
+                    .cmd_set_viewport(draw_command_buffer, 0, &pipeline.viewports);
+                context
+                    .device
+                    .cmd_set_scissor(draw_command_buffer, 0, &scissors);
+                context.device.cmd_bind_vertex_buffers(
+                    draw_command_buffer,
+                    0,
+                    &[*vertex_buffer],
+                    &[0],
+                );
+                context.device.cmd_bind_index_buffer(
                     draw_command_buffer,
                     *index_buffer,
                     0,
                     vk::IndexType::UINT32,
                 );
-                device.cmd_draw_indexed(draw_command_buffer, index_count, 1, 0, 0, 1);
-                device.cmd_end_render_pass(draw_command_buffer);
+                context
+                    .device
+                    .cmd_draw_indexed(draw_command_buffer, index_count, 1, 0, 0, 1);
+                context.device.cmd_end_render_pass(draw_command_buffer);
             },
         )?;
 
