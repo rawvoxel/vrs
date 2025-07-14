@@ -17,6 +17,7 @@ const FRAG_SPV: &[u8] = include_bytes!("../assets/shader/triangle/frag.spv");
 
 #[derive(Clone)]
 pub struct Pipeline {
+    pub scissors: Vec<vk::Rect2D>,
     pub viewports: Vec<vk::Viewport>,
     pub renderpass: vk::RenderPass,
     pub framebuffers: Vec<vk::Framebuffer>,
@@ -25,7 +26,8 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(context: &Context) -> VkResult<Self> {
-        let viewports = vec![
+        let scissors: Vec<vk::Rect2D> = vec![context.surface_info.extent.into()];
+        let viewports: Vec<vk::Viewport> = vec![
             vk::Viewport::default()
                 .x(0.0)
                 .y(0.0)
@@ -47,8 +49,8 @@ impl Pipeline {
         let pipeline_layout = create_pipeline_layout(&context.vk_device)?;
         let graphics_pipeline = create_graphics_pipeline(
             &context.vk_device,
-            context.surface_info.extent.into(),
-            viewports.clone(),
+            &scissors,
+            &viewports,
             renderpass,
             vert_shader_module,
             frag_shader_module,
@@ -68,6 +70,7 @@ impl Pipeline {
         }
 
         Ok(Self {
+            scissors,
             viewports,
             renderpass,
             framebuffers,
@@ -185,8 +188,8 @@ pub fn create_pipeline_layout(vk_device: &ash::Device) -> VkResult<vk::PipelineL
 #[inline]
 pub fn create_graphics_pipeline(
     vk_device: &ash::Device,
-    scissors: vk::Rect2D,
-    viewports: Vec<vk::Viewport>,
+    scissors: &Vec<vk::Rect2D>,
+    viewports: &Vec<vk::Viewport>,
     renderpass: vk::RenderPass,
     vert_shader_module: vk::ShaderModule,
     frag_shader_module: vk::ShaderModule,
@@ -229,10 +232,9 @@ pub fn create_graphics_pipeline(
     let vertex_input_assembly_state_info = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
-    let scissors = [scissors];
     let viewport_state_info = vk::PipelineViewportStateCreateInfo::default()
-        .scissors(&scissors)
-        .viewports(&viewports);
+        .scissors(scissors)
+        .viewports(viewports);
 
     let rasterization_info = vk::PipelineRasterizationStateCreateInfo::default()
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
@@ -406,8 +408,6 @@ pub fn test_submit(
             .render_area(surface_info.extent.into())
             .clear_values(&clear_values);
 
-        let scissors = [surface_info.extent.into()];
-
         record_submit_commandbuffer(
             &vk_device,
             commands.draw_buffers[swapchain.current_frame],
@@ -427,9 +427,8 @@ pub fn test_submit(
                     vk::PipelineBindPoint::GRAPHICS,
                     pipeline.graphics_pipeline,
                 );
-
                 vk_device.cmd_set_viewport(draw_command_buffer, 0, &pipeline.viewports);
-                vk_device.cmd_set_scissor(draw_command_buffer, 0, &scissors);
+                vk_device.cmd_set_scissor(draw_command_buffer, 0, &pipeline.scissors);
                 vk_device.cmd_bind_vertex_buffers(draw_command_buffer, 0, &[vertex_buffer], &[0]);
                 vk_device.cmd_bind_index_buffer(
                     draw_command_buffer,
