@@ -122,7 +122,7 @@ impl Renderer {
 
         // NOTE: WHAT IS THIS
         let image_memory_barrier = vk::ImageMemoryBarrier::default()
-            .image(swapchain.depth_image)
+            .image(swapchain.depth_image.inner)
             .dst_access_mask(
                 vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
                     | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
@@ -520,24 +520,38 @@ pub fn create_graphics_pipeline(
 
 #[inline]
 pub fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device) -> VkResult<Buffer> {
-    let memory_property_flags =
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     let buffer_info = vk::BufferCreateInfo::default()
         .size(3 * size_of::<Index>() as u64)
         .usage(vk::BufferUsageFlags::INDEX_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer_offset = 0;
+    let memory_property_flags =
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-    Buffer::new(adapter, render_device, memory_property_flags, buffer_info)
+    Buffer::new(
+        adapter,
+        render_device,
+        buffer_info,
+        buffer_offset,
+        memory_property_flags,
+    )
 }
 
 #[inline]
 pub fn create_vertex_buffer(adapter: &Adapter, render_device: &ash::Device) -> VkResult<Buffer> {
-    let memory_property_flags =
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
     let buffer_info = vk::BufferCreateInfo::default()
         .size(3 * size_of::<Vertex>() as u64)
         .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer_offset = 0;
+    let memory_property_flags =
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-    Buffer::new(adapter, render_device, memory_property_flags, buffer_info)
+    Buffer::new(
+        adapter,
+        render_device,
+        buffer_info,
+        buffer_offset,
+        memory_property_flags,
+    )
 }

@@ -33,8 +33,8 @@ impl PresentQueue {
                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
 
-            let presented_semaphores = sync::create_semaphores(logical_device, 2)?;
-            let rendered_semaphores = sync::create_semaphores(logical_device, 2)?;
+            let presented_semaphores = sync::create_semaphores(logical_device, 2);
+            let rendered_semaphores = sync::create_semaphores(logical_device, 2);
 
             Ok(Self {
                 inner: queue,

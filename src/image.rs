@@ -1,6 +1,7 @@
 use crate::{adapter::Adapter, alloc, surface::Surface};
 use ash::{prelude::VkResult, vk};
 
+#[derive(Clone)]
 pub struct Image {
     pub memory: vk::DeviceMemory,
     pub inner: vk::Image,
@@ -13,42 +14,30 @@ impl Image {
         image_info: vk::ImageCreateInfo,
         memory_property_flags: vk::MemoryPropertyFlags,
     ) -> VkResult<Self> {
-        let (image, memory) =
-            create_image(adapter, logical_device, image_info, memory_property_flags)?;
-        Ok(Self {
-            inner: image,
-            memory,
-        })
+        unsafe {
+            let image = logical_device.create_image(&image_info, None)?;
+            let memory_requirements = logical_device.get_image_memory_requirements(image);
+            let memory = alloc::vk_alloc(
+                adapter,
+                logical_device,
+                memory_property_flags,
+                memory_requirements,
+            )?;
+            logical_device.bind_image_memory(image, memory, 0)?;
+
+            Ok(Self {
+                inner: image,
+                memory,
+            })
+        }
     }
 
-    #[rustfmt::skip]
     pub fn destroy(&self, logical_device: &ash::Device) {
         unsafe {
             logical_device.device_wait_idle().unwrap();
             logical_device.free_memory(self.memory, None);
             logical_device.destroy_image(self.inner, None);
         }
-    }
-}
-
-#[inline]
-pub fn create_image(
-    adapter: &Adapter,
-    logical_device: &ash::Device,
-    image_info: vk::ImageCreateInfo,
-    memory_property_flags: vk::MemoryPropertyFlags,
-) -> VkResult<(vk::Image, vk::DeviceMemory)> {
-    unsafe {
-        let image = logical_device.create_image(&image_info, None)?;
-        let memory_requirements = logical_device.get_image_memory_requirements(image);
-        let memory = alloc::vk_alloc(
-            adapter,
-            logical_device,
-            memory_property_flags,
-            memory_requirements,
-        )?;
-        logical_device.bind_image_memory(image, memory, 0)?;
-        Ok((image, memory))
     }
 }
 
@@ -92,11 +81,11 @@ pub fn create_present_image_views(
 #[inline]
 pub fn create_depth_image_view(
     logical_device: &ash::Device,
-    image: vk::Image,
+    image: &Image,
     image_info: vk::ImageCreateInfo,
 ) -> VkResult<vk::ImageView> {
     let image_view_info = vk::ImageViewCreateInfo::default()
-        .image(image)
+        .image(image.inner)
         .format(image_info.format)
         .view_type(vk::ImageViewType::TYPE_2D)
         .subresource_range(

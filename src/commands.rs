@@ -11,7 +11,7 @@ impl Commands {
     pub fn new(logical_device: &ash::Device, command_pool: vk::CommandPool) -> VkResult<Self> {
         Ok(Self {
             buffers: create_command_buffers(logical_device, command_pool, 2)?,
-            fences: create_fences(logical_device, 2)?,
+            fences: create_fences(logical_device, 2),
         })
     }
 

@@ -25,10 +25,10 @@ use debug::Debug;
 pub struct App {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
-    pub debug_instance: ext::debug_utils::Instance,
-    pub debug: Debug,
     pub display_handle: RawDisplayHandle,
     pub window_handle: RawWindowHandle,
+    pub debug_instance: ext::debug_utils::Instance,
+    pub debug: Debug,
     pub adapters: Vec<Adapter>,
 }
 
@@ -45,7 +45,6 @@ impl App {
         let instance = create_instance(&entry, display_handle, app_info)?;
         let debug_instance = ext::debug_utils::Instance::new(&entry, &instance);
         let debug = Debug::new(&debug_instance)?;
-
         let adapters: Vec<Adapter> = unsafe {
             instance
                 .enumerate_physical_devices()?
@@ -57,16 +56,16 @@ impl App {
         Ok(Self {
             entry,
             instance,
-            debug_instance,
-            debug,
             display_handle,
             window_handle,
+            debug_instance,
+            debug,
             adapters,
         })
     }
 
     #[inline]
-    pub fn request_physical_device_type<'a>(
+    pub fn request_physical_device_type(
         &self,
         device_type: vk::PhysicalDeviceType,
     ) -> Option<Adapter> {
@@ -98,7 +97,6 @@ impl App {
             ];
 
             let features = vk::PhysicalDeviceFeatures::default().shader_clip_distance(true);
-
             let device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(std::slice::from_ref(&device_queue_info))
                 .enabled_extension_names(&extension_names_raw)

@@ -1,4 +1,9 @@
-use crate::{adapter::Adapter, image, renderer::Renderer, surface::Surface};
+use crate::{
+    adapter::Adapter,
+    image::{self, Image},
+    renderer::Renderer,
+    surface::Surface,
+};
 use ash::{khr, prelude::VkResult, vk};
 
 #[derive(Clone)]
@@ -8,8 +13,7 @@ pub struct Swapchain {
     pub present_images: Vec<vk::Image>,
     pub present_image_views: Vec<vk::ImageView>,
 
-    pub depth_image: vk::Image,
-    pub depth_image_memory: vk::DeviceMemory,
+    pub depth_image: Image,
     pub depth_image_view: vk::ImageView,
 
     pub frames_in_flight: usize,
@@ -43,15 +47,14 @@ impl Swapchain {
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let memory_property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-            let (depth_image, depth_image_memory) = image::create_image(
+            let depth_image = Image::new(
                 adapter,
                 logical_device,
                 depth_image_info,
-                memory_property_flags,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )?;
             let depth_image_view =
-                image::create_depth_image_view(logical_device, depth_image, depth_image_info)?;
+                image::create_depth_image_view(logical_device, &depth_image, depth_image_info)?;
 
             Ok(Swapchain {
                 inner: swapchain,
@@ -59,7 +62,6 @@ impl Swapchain {
                 present_image_views,
                 depth_image,
                 depth_image_view,
-                depth_image_memory,
                 frames_in_flight: 2,
                 current_frame: 0,
             })
@@ -75,11 +77,10 @@ impl Swapchain {
     pub fn destroy(&self, renderer: &Renderer) {
         unsafe {
             renderer.render_device.device_wait_idle().unwrap();
+            self.depth_image.destroy(&renderer.render_device);
             for &image_view in self.present_image_views.iter() {
                 renderer.render_device.destroy_image_view(image_view, None);
             }
-            renderer.render_device.free_memory(self.depth_image_memory, None);
-            renderer.render_device.destroy_image(self.depth_image, None);
             renderer.render_device.destroy_image_view(self.depth_image_view, None);
             renderer.swapchain_device.destroy_swapchain(self.inner, None);
         }
