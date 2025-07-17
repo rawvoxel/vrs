@@ -1,4 +1,4 @@
-use crate::{adapter::Adapter, context::Context, image, renderer::Renderer, surface::SurfaceInfo};
+use crate::{adapter::Adapter, image, renderer::Renderer, surface::Surface};
 use ash::{khr, prelude::VkResult, vk};
 
 #[derive(Clone)]
@@ -18,31 +18,25 @@ pub struct Swapchain {
 
 impl Swapchain {
     pub fn new(
-        context: &Context,
         adapter: &Adapter,
+        surface: &Surface,
         logical_device: &ash::Device,
         swapchain_device: &khr::swapchain::Device,
-        surface_info: SurfaceInfo,
         present_mode: vk::PresentModeKHR,
         old_swapchain: Option<vk::SwapchainKHR>,
     ) -> VkResult<Self> {
         unsafe {
-            let swapchain = create_swapchain(
-                context,
-                swapchain_device,
-                surface_info,
-                present_mode,
-                old_swapchain,
-            )?;
+            let swapchain =
+                create_swapchain(swapchain_device, surface, present_mode, old_swapchain)?;
 
             let present_images = swapchain_device.get_swapchain_images(swapchain)?;
             let present_image_views =
-                image::create_present_image_views(logical_device, surface_info, &present_images)?;
+                image::create_present_image_views(surface, logical_device, &present_images)?;
 
             let depth_image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::D16_UNORM)
-                .extent(surface_info.extent.into())
+                .extent(surface.extent.into())
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -94,19 +88,18 @@ impl Swapchain {
 
 #[inline]
 pub fn create_swapchain(
-    context: &Context,
     swapchain_device: &khr::swapchain::Device,
-    surface_info: SurfaceInfo,
+    surface: &Surface,
     present_mode: vk::PresentModeKHR,
     old_swapchain: Option<vk::SwapchainKHR>,
 ) -> VkResult<vk::SwapchainKHR> {
     let mut swapchain_info = vk::SwapchainCreateInfoKHR::default()
-        .surface(context.surface.inner)
-        .image_format(surface_info.format.format)
-        .image_color_space(surface_info.format.color_space)
-        .image_extent(surface_info.extent)
-        .pre_transform(surface_info.transform_flags)
-        .min_image_count(surface_info.min_image_count)
+        .surface(surface.inner)
+        .image_format(surface.format.format)
+        .image_color_space(surface.format.color_space)
+        .image_extent(surface.extent)
+        .pre_transform(surface.transform_flags)
+        .min_image_count(surface.min_image_count)
         .present_mode(present_mode)
         .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)

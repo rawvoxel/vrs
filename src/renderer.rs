@@ -1,11 +1,12 @@
 use crate::{
     App,
-    adapter::{Adapter, QueueFamily, request_physical_device_type, request_queue_family},
+    adapter::Adapter,
     buffer::Buffer,
     commands::Commands,
-    context::{Context, create_command_pool, create_logical_device, record_submit_commandbuffer},
-    queue::PresentQueue,
-    surface::SurfaceInfo,
+    create_command_pool,
+    queue::{PresentQueue, QueueFamily},
+    record_submit_commandbuffer,
+    surface::Surface,
     swapchain::Swapchain,
     vertex::{Index, Vertex},
 };
@@ -18,104 +19,96 @@ const FRAG_SPV: &[u8] = include_bytes!("../assets/shader/triangle/frag.spv");
 
 #[derive(Clone)]
 pub struct Renderer {
-    pub primary_adapter: Adapter,
-    pub queue_family: QueueFamily,
+    pub discrete_gpu: Adapter,
+    pub graphics_queue_family: QueueFamily,
+
+    pub surface_instance: khr::surface::Instance,
+    pub surface: Surface,
+
     pub render_device: ash::Device,
-    pub command_pool: vk::CommandPool,
-
-    pub surface_info: SurfaceInfo,
-    pub scissors: Vec<vk::Rect2D>,
-    pub viewports: Vec<vk::Viewport>,
-
     pub present_queue: PresentQueue,
-
-    pub swapchain_device: khr::swapchain::Device,
-    pub swapchain: Swapchain,
-
-    pub renderpass: vk::RenderPass,
-    pub framebuffers: Vec<vk::Framebuffer>,
-    pub graphics_pipeline: vk::Pipeline,
+    pub command_pool: vk::CommandPool,
+    pub init_commands: Commands,
+    pub draw_commands: Commands,
 
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
 
-    pub init_commands: Commands,
-    pub draw_commands: Commands,
+    pub swapchain_device: khr::swapchain::Device,
+    pub swapchain: Swapchain,
+
+    pub scissors: Vec<vk::Rect2D>,
+    pub viewports: Vec<vk::Viewport>,
+    pub renderpass: vk::RenderPass,
+    pub framebuffers: Vec<vk::Framebuffer>,
+    pub graphics_pipeline: vk::Pipeline,
 }
 
 impl Renderer {
-    pub fn new(
-        app: &App,
-        context: &Context,
-        window_width: u32,
-        window_height: u32,
-    ) -> VkResult<Self> {
-        let discrete_gpu =
-            request_physical_device_type(&context.adapters, vk::PhysicalDeviceType::DISCRETE_GPU)
-                .expect("No discrete gpu was found!");
-        let queue_family = request_queue_family(
+    pub fn new(app: &App, window_width: u32, window_height: u32) -> VkResult<Self> {
+        // FIXME: Create fallback for integrated GPUs.
+        let discrete_gpu = app
+            .request_physical_device_type(vk::PhysicalDeviceType::DISCRETE_GPU)
+            .expect("No discrete gpu was found!");
+
+        let surface_instance = khr::surface::Instance::new(&app.entry, &app.instance);
+        let surface = Surface::new(
             app,
-            discrete_gpu,
-            context.surface.inner,
-            vk::QueueFlags::GRAPHICS,
-            true,
+            &discrete_gpu,
+            &surface_instance,
+            window_width,
+            window_height,
         )?;
-        let primary_adapter = discrete_gpu.clone();
 
-        let render_device = create_logical_device(&app, &primary_adapter, &queue_family)?;
-        let command_pool = create_command_pool(&render_device, &queue_family)?;
-        let init_commands = Commands::new(&render_device, command_pool)?;
-        let draw_commands = Commands::new(&render_device, command_pool)?;
-
-        let surface_info =
-            SurfaceInfo::new(app, context, discrete_gpu, window_width, window_height)?;
-
-        let scissors: Vec<vk::Rect2D> = vec![surface_info.extent.into()];
-        let viewports: Vec<vk::Viewport> = vec![
-            vk::Viewport::default()
-                .x(0.0)
-                .y(0.0)
-                .width(surface_info.extent.width as f32)
-                .height(surface_info.extent.height as f32)
-                .min_depth(0.0)
-                .max_depth(1.0),
-        ];
-
+        let supports_surface = true;
+        let graphics_queue_family = discrete_gpu.get_queue_family(
+            &surface_instance,
+            &surface,
+            supports_surface,
+            vk::QueueFlags::GRAPHICS,
+        )?;
+        let render_device = app.create_logical_device(&discrete_gpu, &graphics_queue_family)?;
         let present_queue_index = 0;
         let present_queue = PresentQueue::new(
-            app,
-            context,
             &discrete_gpu,
-            &queue_family,
+            &surface_instance,
+            &surface,
+            &graphics_queue_family,
             &render_device,
             present_queue_index,
         )?;
 
+        let command_pool = create_command_pool(&render_device, &graphics_queue_family)?;
+        let init_commands = Commands::new(&render_device, command_pool)?;
+        let draw_commands = Commands::new(&render_device, command_pool)?;
+
+        let vertex_buffer = create_vertex_buffer(&discrete_gpu, &render_device)?;
+        let index_buffer = create_index_buffer(&discrete_gpu, &render_device)?;
+        let vert_shader_module = create_shader_module(&render_device, VERT_SPV)?;
+        let frag_shader_module = create_shader_module(&render_device, FRAG_SPV)?;
+
         let swapchain_device = khr::swapchain::Device::new(&app.instance, &render_device);
         let swapchain = Swapchain::new(
-            context,
             &discrete_gpu,
+            &surface,
             &render_device,
             &swapchain_device,
-            surface_info,
             present_queue.mode,
             None,
         )?;
 
-        let renderpass = create_renderpass(&render_device, surface_info.format)?;
-        let framebuffers = create_framebuffers(
-            &render_device,
-            surface_info,
-            swapchain.present_image_views.clone(),
-            swapchain.depth_image_view,
-            renderpass,
-        )?;
-
-        let vertex_buffer = create_vertex_buffer(discrete_gpu, &render_device)?;
-        let index_buffer = create_index_buffer(discrete_gpu, &render_device)?;
-        let vert_shader_module = create_shader_module(&render_device, VERT_SPV)?;
-        let frag_shader_module = create_shader_module(&render_device, FRAG_SPV)?;
-
+        let scissors: Vec<vk::Rect2D> = vec![surface.extent.into()];
+        let viewports: Vec<vk::Viewport> = vec![
+            vk::Viewport::default()
+                .x(0.0)
+                .y(0.0)
+                .width(surface.extent.width as f32)
+                .height(surface.extent.height as f32)
+                .min_depth(0.0)
+                .max_depth(1.0),
+        ];
+        let renderpass = create_renderpass(&surface, &render_device)?;
+        let framebuffers = create_framebuffers(&surface, &render_device, &swapchain, renderpass)?;
         let pipeline_layout = create_pipeline_layout(&render_device)?;
         let graphics_pipeline = create_graphics_pipeline(
             &render_device,
@@ -151,9 +144,9 @@ impl Renderer {
             &[],
             &[],
             &[],
-            |init_command_buffer| unsafe {
+            |command_buffer| unsafe {
                 render_device.cmd_pipeline_barrier(
-                    init_command_buffer,
+                    command_buffer,
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                     vk::DependencyFlags::empty(),
@@ -171,14 +164,17 @@ impl Renderer {
         }
 
         Ok(Self {
-            primary_adapter,
-            queue_family,
+            discrete_gpu,
+            graphics_queue_family,
+
+            surface_instance,
+            surface,
+
             render_device,
             command_pool,
             init_commands,
             draw_commands,
 
-            surface_info,
             scissors,
             viewports,
 
@@ -198,8 +194,8 @@ impl Renderer {
 
     pub fn submit(&mut self, indices: &[Index], vertices: &[Vertex]) -> Result<()> {
         let Renderer {
+            surface,
             render_device,
-            surface_info,
             scissors,
             viewports,
             present_queue,
@@ -245,7 +241,7 @@ impl Renderer {
             let render_pass_begin_info = vk::RenderPassBeginInfo::default()
                 .render_pass(*renderpass)
                 .framebuffer(framebuffers[image_index as usize])
-                .render_area(surface_info.extent.into())
+                .render_area(surface.extent.into())
                 .clear_values(&clear_values);
 
             record_submit_commandbuffer(
@@ -308,6 +304,7 @@ impl Renderer {
         Ok(())
     }
 
+    #[rustfmt::skip]
     pub fn destroy(&mut self) {
         unsafe {
             self.render_device.device_wait_idle().unwrap();
@@ -315,36 +312,33 @@ impl Renderer {
             self.present_queue.destroy(&self.render_device);
             self.swapchain.destroy(&self);
 
-            self.render_device
-                .destroy_render_pass(self.renderpass, None);
+            self.render_device.destroy_render_pass(self.renderpass, None);
 
             for framebuffer in self.framebuffers.iter() {
                 self.render_device.destroy_framebuffer(*framebuffer, None);
             }
-            self.render_device
-                .destroy_pipeline(self.graphics_pipeline, None);
+            self.render_device.destroy_pipeline(self.graphics_pipeline, None);
 
             self.index_buffer.destroy(&self.render_device);
             self.vertex_buffer.destroy(&self.render_device);
             self.init_commands.destroy(&self.render_device);
             self.draw_commands.destroy(&self.render_device);
-
-            self.render_device.device_wait_idle().unwrap();
-            self.render_device
-                .destroy_command_pool(self.command_pool, None);
+            self.render_device.destroy_command_pool(self.command_pool, None);
             self.render_device.destroy_device(None);
+
+            self.surface.destroy(&self.surface_instance);
         }
     }
 }
 
 #[inline]
 pub fn create_renderpass(
+    surface: &Surface,
     render_device: &ash::Device,
-    surface_format: vk::SurfaceFormatKHR,
 ) -> VkResult<vk::RenderPass> {
     let renderpass_attachments = [
         vk::AttachmentDescription::default()
-            .format(surface_format.format)
+            .format(surface.format.format)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -388,21 +382,21 @@ pub fn create_renderpass(
 
 #[inline]
 pub fn create_framebuffers(
+    surface: &Surface,
     render_device: &ash::Device,
-    surface_info: SurfaceInfo,
-    present_image_views: Vec<vk::ImageView>,
-    depth_image_view: vk::ImageView,
+    swapchain: &Swapchain,
     renderpass: vk::RenderPass,
 ) -> VkResult<Vec<vk::Framebuffer>> {
-    Ok(present_image_views
+    Ok(swapchain
+        .present_image_views
         .iter()
         .map(|&present_image_view| {
-            let attachments = [present_image_view, depth_image_view];
+            let attachments = [present_image_view, swapchain.depth_image_view];
             let create_info = vk::FramebufferCreateInfo::default()
                 .render_pass(renderpass)
                 .attachments(&attachments)
-                .width(surface_info.extent.width)
-                .height(surface_info.extent.height)
+                .width(surface.extent.width)
+                .height(surface.extent.height)
                 .layers(1);
 
             unsafe {

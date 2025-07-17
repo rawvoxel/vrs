@@ -1,10 +1,11 @@
-use crate::{
-    App,
-    adapter::{Adapter, QueueFamily},
-    context::Context,
-    sync,
-};
-use ash::{prelude::VkResult, vk};
+use crate::{adapter::Adapter, surface::Surface, sync};
+use ash::{khr, prelude::VkResult, vk};
+
+#[derive(Clone)]
+pub struct QueueFamily {
+    pub properties: vk::QueueFamilyProperties,
+    pub index: u32,
+}
 
 #[derive(Clone)]
 pub struct PresentQueue {
@@ -16,18 +17,17 @@ pub struct PresentQueue {
 
 impl PresentQueue {
     pub fn new(
-        app: &App,
-        context: &Context,
         adapter: &Adapter,
+        surface_instance: &khr::surface::Instance,
+        surface: &Surface,
         queue_family: &QueueFamily,
         logical_device: &ash::Device,
         queue_index: u32,
     ) -> VkResult<Self> {
         unsafe {
-            let queue = logical_device.get_device_queue(queue_family.queue_index, queue_index);
-            let modes = app
-                .surface_instance
-                .get_physical_device_surface_present_modes(adapter.inner, context.surface.inner)?;
+            let queue = logical_device.get_device_queue(queue_family.index, queue_index);
+            let modes = surface_instance
+                .get_physical_device_surface_present_modes(adapter.inner, surface.inner)?;
             let mode = modes
                 .into_iter()
                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)

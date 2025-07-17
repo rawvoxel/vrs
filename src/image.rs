@@ -1,4 +1,4 @@
-use crate::{adapter::Adapter, alloc, surface::SurfaceInfo};
+use crate::{adapter::Adapter, alloc, surface::Surface};
 use ash::{prelude::VkResult, vk};
 
 pub struct Image {
@@ -54,8 +54,8 @@ pub fn create_image(
 
 #[inline]
 pub fn create_present_image_views(
+    surface: &Surface,
     logical_device: &ash::Device,
-    surface_info: SurfaceInfo,
     images: &Vec<vk::Image>,
 ) -> VkResult<Vec<vk::ImageView>> {
     let image_views = images
@@ -63,7 +63,7 @@ pub fn create_present_image_views(
         .map(|&image| {
             let image_view_info = vk::ImageViewCreateInfo::default()
                 .image(image)
-                .format(surface_info.format.format)
+                .format(surface.format.format)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .components(vk::ComponentMapping {
                     r: vk::ComponentSwizzle::R,

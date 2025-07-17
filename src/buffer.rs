@@ -28,12 +28,15 @@ impl Buffer {
         })
     }
 
-    #[rustfmt::skip]
-    pub fn map_memory<T: Copy>(&self, logical_device: &ash::Device, offset: u64, data: &[T]) -> VkResult<()> {
+    pub fn map_memory<T: Copy>(
+        &self,
+        logical_device: &ash::Device,
+        offset: u64,
+        data: &[T],
+    ) -> VkResult<()> {
         map_buffer_memory(logical_device, self.inner, self.memory, offset, data)
     }
 
-    #[rustfmt::skip]
     pub fn destroy(&self, logical_device: &ash::Device) {
         unsafe {
             logical_device.device_wait_idle().unwrap();
@@ -44,7 +47,6 @@ impl Buffer {
 }
 
 #[inline]
-#[rustfmt::skip]
 fn create_buffer(
     adapter: &Adapter,
     logical_device: &ash::Device,
@@ -55,16 +57,19 @@ fn create_buffer(
     unsafe {
         let buffer = logical_device.create_buffer(&buffer_info, None)?;
         let memory_requirements = logical_device.get_buffer_memory_requirements(buffer);
-        let memory = alloc::vk_alloc(adapter,logical_device, memory_property_flags, memory_requirements)?;
+        let memory = alloc::vk_alloc(
+            adapter,
+            logical_device,
+            memory_property_flags,
+            memory_requirements,
+        )?;
 
         logical_device.bind_buffer_memory(buffer, memory, offset)?;
-
         Ok((buffer, memory))
     }
 }
 
 #[inline]
-#[rustfmt::skip]
 fn map_buffer_memory<T: Copy>(
     logical_device: &ash::Device,
     buffer: vk::Buffer,
@@ -81,7 +86,8 @@ fn map_buffer_memory<T: Copy>(
             vk::MemoryMapFlags::empty(),
         )?;
 
-        util::Align::new(buffer_ptr, align_of::<T>() as u64, memory_req.size).copy_from_slice(&data);
+        util::Align::new(buffer_ptr, align_of::<T>() as u64, memory_req.size)
+            .copy_from_slice(&data);
 
         logical_device.unmap_memory(buffer_memory);
 
