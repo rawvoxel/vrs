@@ -169,6 +169,20 @@ pub fn create_command_pool(
     unsafe { logical_device.create_command_pool(&command_pool_info, None) }
 }
 
+#[inline]
+pub fn create_command_buffers(
+    logical_device: &ash::Device,
+    command_pool: vk::CommandPool,
+    command_buffer_count: u32,
+) -> VkResult<Vec<vk::CommandBuffer>> {
+    let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_buffer_count(command_buffer_count)
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY);
+
+    unsafe { logical_device.allocate_command_buffers(&command_buffer_allocate_info) }
+}
+
 pub fn record_submit_commandbuffer<F: FnOnce(vk::CommandBuffer)>(
     logical_device: &ash::Device,
     command_buffer: vk::CommandBuffer,

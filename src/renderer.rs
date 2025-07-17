@@ -92,8 +92,8 @@ impl Renderer {
             &discrete_gpu,
             &surface,
             &render_device,
+            &present_queue,
             &swapchain_device,
-            present_queue.mode,
             None,
         )?;
 
@@ -196,17 +196,17 @@ impl Renderer {
         let Renderer {
             surface,
             render_device,
-            scissors,
-            viewports,
             present_queue,
+            draw_commands,
+            vertex_buffer,
+            index_buffer,
             swapchain_device,
             swapchain,
+            scissors,
+            viewports,
             renderpass,
             framebuffers,
             graphics_pipeline,
-            vertex_buffer,
-            index_buffer,
-            draw_commands,
             ..
         } = self;
 

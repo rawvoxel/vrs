@@ -1,4 +1,4 @@
-use crate::sync::create_fences;
+use crate::{create_command_buffers, sync::create_fences};
 use ash::{prelude::VkResult, vk};
 
 #[derive(Clone)]
@@ -23,18 +23,4 @@ impl Commands {
             }
         };
     }
-}
-
-#[inline]
-pub fn create_command_buffers(
-    logical_device: &ash::Device,
-    command_pool: vk::CommandPool,
-    command_buffer_count: u32,
-) -> VkResult<Vec<vk::CommandBuffer>> {
-    let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
-        .command_buffer_count(command_buffer_count)
-        .command_pool(command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY);
-
-    unsafe { Ok(logical_device.allocate_command_buffers(&command_buffer_allocate_info)?) }
 }

@@ -10,7 +10,7 @@ pub struct QueueFamily {
 #[derive(Clone)]
 pub struct PresentQueue {
     pub inner: vk::Queue,
-    pub mode: vk::PresentModeKHR,
+    pub present_mode: vk::PresentModeKHR,
     pub presented_semaphores: Vec<vk::Semaphore>,
     pub rendered_semaphores: Vec<vk::Semaphore>,
 }
@@ -38,7 +38,7 @@ impl PresentQueue {
 
             Ok(Self {
                 inner: queue,
-                mode,
+                present_mode: mode,
                 presented_semaphores,
                 rendered_semaphores,
             })

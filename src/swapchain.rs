@@ -1,8 +1,5 @@
 use crate::{
-    adapter::Adapter,
-    image::{self, Image},
-    renderer::Renderer,
-    surface::Surface,
+    adapter::Adapter, image::Image, queue::PresentQueue, renderer::Renderer, surface::Surface,
 };
 use ash::{khr, prelude::VkResult, vk};
 
@@ -25,17 +22,34 @@ impl Swapchain {
         adapter: &Adapter,
         surface: &Surface,
         logical_device: &ash::Device,
+        present_queue: &PresentQueue,
         swapchain_device: &khr::swapchain::Device,
-        present_mode: vk::PresentModeKHR,
         old_swapchain: Option<vk::SwapchainKHR>,
     ) -> VkResult<Self> {
         unsafe {
-            let swapchain =
-                create_swapchain(swapchain_device, surface, present_mode, old_swapchain)?;
+            let mut swapchain_info = vk::SwapchainCreateInfoKHR::default()
+                .surface(surface.inner)
+                .image_format(surface.format.format)
+                .image_color_space(surface.format.color_space)
+                .image_extent(surface.extent)
+                .pre_transform(surface.transform_flags)
+                .min_image_count(surface.min_image_count)
+                .present_mode(present_queue.present_mode)
+                .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .clipped(true)
+                .image_array_layers(1);
+
+            if let Some(old_swapchain) = old_swapchain {
+                swapchain_info.old_swapchain = old_swapchain;
+            }
+
+            let swapchain = swapchain_device.create_swapchain(&swapchain_info, None)?;
 
             let present_images = swapchain_device.get_swapchain_images(swapchain)?;
             let present_image_views =
-                image::create_present_image_views(surface, logical_device, &present_images)?;
+                create_present_image_views(surface, logical_device, &present_images)?;
 
             let depth_image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -54,7 +68,7 @@ impl Swapchain {
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )?;
             let depth_image_view =
-                image::create_depth_image_view(logical_device, &depth_image, depth_image_info)?;
+                create_depth_image_view(logical_device, &depth_image, depth_image_info)?;
 
             Ok(Swapchain {
                 inner: swapchain,
@@ -88,29 +102,58 @@ impl Swapchain {
 }
 
 #[inline]
-pub fn create_swapchain(
-    swapchain_device: &khr::swapchain::Device,
+pub fn create_present_image_views(
     surface: &Surface,
-    present_mode: vk::PresentModeKHR,
-    old_swapchain: Option<vk::SwapchainKHR>,
-) -> VkResult<vk::SwapchainKHR> {
-    let mut swapchain_info = vk::SwapchainCreateInfoKHR::default()
-        .surface(surface.inner)
-        .image_format(surface.format.format)
-        .image_color_space(surface.format.color_space)
-        .image_extent(surface.extent)
-        .pre_transform(surface.transform_flags)
-        .min_image_count(surface.min_image_count)
-        .present_mode(present_mode)
-        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-        .clipped(true)
-        .image_array_layers(1);
+    logical_device: &ash::Device,
+    images: &Vec<vk::Image>,
+) -> VkResult<Vec<vk::ImageView>> {
+    let image_views = images
+        .iter()
+        .map(|&image| {
+            let image_view_info = vk::ImageViewCreateInfo::default()
+                .image(image)
+                .format(surface.format.format)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .components(vk::ComponentMapping {
+                    r: vk::ComponentSwizzle::R,
+                    g: vk::ComponentSwizzle::G,
+                    b: vk::ComponentSwizzle::B,
+                    a: vk::ComponentSwizzle::A,
+                })
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
 
-    if let Some(old_swapchain) = old_swapchain {
-        swapchain_info.old_swapchain = old_swapchain;
-    }
+            unsafe {
+                logical_device
+                    .create_image_view(&image_view_info, None)
+                    .expect("Could not create vk::ImageView")
+            }
+        })
+        .collect();
 
-    unsafe { swapchain_device.create_swapchain(&swapchain_info, None) }
+    Ok(image_views)
+}
+
+#[inline]
+pub fn create_depth_image_view(
+    logical_device: &ash::Device,
+    image: &Image,
+    image_info: vk::ImageCreateInfo,
+) -> VkResult<vk::ImageView> {
+    let image_view_info = vk::ImageViewCreateInfo::default()
+        .image(image.inner)
+        .format(image_info.format)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                .level_count(1)
+                .layer_count(1),
+        );
+
+    unsafe { logical_device.create_image_view(&image_view_info, None) }
 }
