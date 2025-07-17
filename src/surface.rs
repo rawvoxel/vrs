@@ -1,6 +1,6 @@
+use crate::{App, adapter::Adapter, context::Context};
 use ash::{khr, prelude::VkResult, vk};
 use ash_window::create_surface;
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 
 #[derive(Clone)]
 pub struct Surface {
@@ -8,14 +8,16 @@ pub struct Surface {
 }
 
 impl Surface {
-    pub fn new(
-        vk_entry: &ash::Entry,
-        vk_instance: &ash::Instance,
-        display_handle: RawDisplayHandle,
-        window_handle: RawWindowHandle,
-    ) -> VkResult<Self> {
-        let surface =
-            unsafe { create_surface(vk_entry, vk_instance, display_handle, window_handle, None)? };
+    pub fn new(app: &App) -> VkResult<Self> {
+        let surface = unsafe {
+            create_surface(
+                &app.entry,
+                &app.instance,
+                app.display_handle,
+                app.window_handle,
+                None,
+            )?
+        };
         Ok(Self { inner: surface })
     }
 
@@ -37,42 +39,44 @@ pub struct SurfaceInfo {
 
 impl SurfaceInfo {
     pub fn new(
-        surface_instance: &khr::surface::Instance,
-        surface: vk::SurfaceKHR,
-        physical_device: vk::PhysicalDevice,
+        app: &App,
+        context: &Context,
+        adapter: &Adapter,
         window_width: u32,
         window_height: u32,
     ) -> VkResult<Self> {
         unsafe {
-            let surface_format =
-                surface_instance.get_physical_device_surface_formats(physical_device, surface)?[0];
-            let surface_capabilities = surface_instance
-                .get_physical_device_surface_capabilities(physical_device, surface)?;
-            let extent = match surface_capabilities.current_extent.width {
+            let format = app
+                .surface_instance
+                .get_physical_device_surface_formats(adapter.inner, context.surface.inner)?[0];
+            let capabilities = app
+                .surface_instance
+                .get_physical_device_surface_capabilities(adapter.inner, context.surface.inner)?;
+            let extent = match capabilities.current_extent.width {
                 u32::MAX => vk::Extent2D {
                     width: window_width,
                     height: window_height,
                 },
-                _ => surface_capabilities.current_extent,
+                _ => capabilities.current_extent,
             };
 
-            let pre_transform = if surface_capabilities
+            let transform_flags = if capabilities
                 .supported_transforms
                 .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
             {
                 vk::SurfaceTransformFlagsKHR::IDENTITY
             } else {
-                surface_capabilities.current_transform
+                capabilities.current_transform
             };
 
-            let min_image_count = (surface_capabilities.min_image_count + 1)
-                .min(surface_capabilities.max_image_count);
+            let min_image_count =
+                (capabilities.min_image_count + 1).min(capabilities.max_image_count);
 
             Ok(Self {
-                format: surface_format,
-                capabilities: surface_capabilities,
+                format,
+                capabilities,
                 extent,
-                transform_flags: pre_transform,
+                transform_flags,
                 min_image_count,
             })
         }

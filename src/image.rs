@@ -1,62 +1,60 @@
-use crate::{alloc, context::Context, surface::SurfaceInfo};
+use crate::{adapter::Adapter, alloc, surface::SurfaceInfo};
 use ash::{prelude::VkResult, vk};
 
 pub struct Image {
-    pub inner: vk::Image,
     pub memory: vk::DeviceMemory,
+    pub inner: vk::Image,
 }
 
 impl Image {
     pub fn new(
-        context: &Context,
-        memory_property_flags: vk::MemoryPropertyFlags,
+        adapter: &Adapter,
+        logical_device: &ash::Device,
         image_info: vk::ImageCreateInfo,
+        memory_property_flags: vk::MemoryPropertyFlags,
     ) -> VkResult<Self> {
-        let (image, memory) = create_image(
-            &context.vk_device,
-            context.physical_device_memory_properties,
-            memory_property_flags,
-            image_info,
-        )?;
+        let (image, memory) =
+            create_image(adapter, logical_device, image_info, memory_property_flags)?;
         Ok(Self {
             inner: image,
             memory,
         })
     }
 
-    pub fn destroy(&self, vk_device: &ash::Device) {
+    #[rustfmt::skip]
+    pub fn destroy(&self, logical_device: &ash::Device) {
         unsafe {
-            vk_device.device_wait_idle().unwrap();
-            vk_device.free_memory(self.memory, None);
-            vk_device.destroy_image(self.inner, None);
+            logical_device.device_wait_idle().unwrap();
+            logical_device.free_memory(self.memory, None);
+            logical_device.destroy_image(self.inner, None);
         }
     }
 }
 
 #[inline]
 pub fn create_image(
-    vk_device: &ash::Device,
-    memory_properties: vk::PhysicalDeviceMemoryProperties,
-    memory_property_flags: vk::MemoryPropertyFlags,
+    adapter: &Adapter,
+    logical_device: &ash::Device,
     image_info: vk::ImageCreateInfo,
+    memory_property_flags: vk::MemoryPropertyFlags,
 ) -> VkResult<(vk::Image, vk::DeviceMemory)> {
     unsafe {
-        let image = vk_device.create_image(&image_info, None)?;
-        let memory_requirements = vk_device.get_image_memory_requirements(image);
+        let image = logical_device.create_image(&image_info, None)?;
+        let memory_requirements = logical_device.get_image_memory_requirements(image);
         let memory = alloc::vk_alloc(
-            &vk_device,
-            memory_properties,
+            adapter,
+            logical_device,
             memory_property_flags,
             memory_requirements,
         )?;
-        vk_device.bind_image_memory(image, memory, 0)?;
+        logical_device.bind_image_memory(image, memory, 0)?;
         Ok((image, memory))
     }
 }
 
 #[inline]
 pub fn create_present_image_views(
-    context: &Context,
+    logical_device: &ash::Device,
     surface_info: SurfaceInfo,
     images: &Vec<vk::Image>,
 ) -> VkResult<Vec<vk::ImageView>> {
@@ -81,8 +79,7 @@ pub fn create_present_image_views(
                 );
 
             unsafe {
-                context
-                    .vk_device
+                logical_device
                     .create_image_view(&image_view_info, None)
                     .expect("Could not create vk::ImageView")
             }
@@ -94,7 +91,7 @@ pub fn create_present_image_views(
 
 #[inline]
 pub fn create_depth_image_view(
-    context: &Context,
+    logical_device: &ash::Device,
     image: vk::Image,
     image_info: vk::ImageCreateInfo,
 ) -> VkResult<vk::ImageView> {
@@ -109,5 +106,5 @@ pub fn create_depth_image_view(
                 .layer_count(1),
         );
 
-    unsafe { context.vk_device.create_image_view(&image_view_info, None) }
+    unsafe { logical_device.create_image_view(&image_view_info, None) }
 }

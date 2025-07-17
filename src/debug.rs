@@ -2,11 +2,11 @@ use ash::{ext::debug_utils, prelude::VkResult, vk};
 use std::{borrow::Cow, ffi};
 
 #[derive(Clone)]
-pub struct DebugUtils {
+pub struct Debug {
     messenger: vk::DebugUtilsMessengerEXT,
 }
 
-impl DebugUtils {
+impl Debug {
     pub fn new(debug_utils_instance: &debug_utils::Instance) -> VkResult<Self> {
         let messenger = create_messenger(debug_utils_instance)?;
         Ok(Self { messenger })

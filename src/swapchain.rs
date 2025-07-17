@@ -1,4 +1,4 @@
-use crate::{context::Context, image, surface::SurfaceInfo};
+use crate::{adapter::Adapter, context::Context, image, renderer::Renderer, surface::SurfaceInfo};
 use ash::{khr, prelude::VkResult, vk};
 
 #[derive(Clone)]
@@ -19,6 +19,8 @@ pub struct Swapchain {
 impl Swapchain {
     pub fn new(
         context: &Context,
+        adapter: &Adapter,
+        logical_device: &ash::Device,
         swapchain_device: &khr::swapchain::Device,
         surface_info: SurfaceInfo,
         present_mode: vk::PresentModeKHR,
@@ -35,7 +37,7 @@ impl Swapchain {
 
             let present_images = swapchain_device.get_swapchain_images(swapchain)?;
             let present_image_views =
-                image::create_present_image_views(&context, surface_info, &present_images)?;
+                image::create_present_image_views(logical_device, surface_info, &present_images)?;
 
             let depth_image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -49,13 +51,13 @@ impl Swapchain {
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let memory_property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
             let (depth_image, depth_image_memory) = image::create_image(
-                &context.vk_device,
-                context.physical_device_memory_properties,
-                memory_property_flags,
+                adapter,
+                logical_device,
                 depth_image_info,
+                memory_property_flags,
             )?;
             let depth_image_view =
-                image::create_depth_image_view(&context, depth_image, depth_image_info)?;
+                image::create_depth_image_view(logical_device, depth_image, depth_image_info)?;
 
             Ok(Swapchain {
                 inner: swapchain,
@@ -75,16 +77,17 @@ impl Swapchain {
         self.current_frame = (self.current_frame + 1) % self.frames_in_flight;
     }
 
-    pub fn destroy(&self, vk_device: &ash::Device, swapchain_device: &khr::swapchain::Device) {
+    #[rustfmt::skip]
+    pub fn destroy(&self, renderer: &Renderer) {
         unsafe {
-            vk_device.device_wait_idle().unwrap();
+            renderer.render_device.device_wait_idle().unwrap();
             for &image_view in self.present_image_views.iter() {
-                vk_device.destroy_image_view(image_view, None);
+                renderer.render_device.destroy_image_view(image_view, None);
             }
-            vk_device.free_memory(self.depth_image_memory, None);
-            vk_device.destroy_image(self.depth_image, None);
-            vk_device.destroy_image_view(self.depth_image_view, None);
-            swapchain_device.destroy_swapchain(self.inner, None);
+            renderer.render_device.free_memory(self.depth_image_memory, None);
+            renderer.render_device.destroy_image(self.depth_image, None);
+            renderer.render_device.destroy_image_view(self.depth_image_view, None);
+            renderer.swapchain_device.destroy_swapchain(self.inner, None);
         }
     }
 }
