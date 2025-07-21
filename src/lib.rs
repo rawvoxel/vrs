@@ -5,12 +5,11 @@ use anyhow::Result;
 use ash::{ext, khr, prelude::VkResult, vk};
 use queue::QueueFamily;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use std::ffi;
+use std::{ffi, slice};
 
 pub mod adapter;
 pub mod alloc;
 pub mod buffer;
-pub mod commands;
 pub mod debug;
 pub mod image;
 pub mod queue;
@@ -45,7 +44,7 @@ impl App {
         let instance = create_instance(&entry, display_handle, app_info)?;
         let debug_instance = ext::debug_utils::Instance::new(&entry, &instance);
         let debug = Debug::new(&debug_instance)?;
-        let adapters: Vec<Adapter> = unsafe {
+        let adapters = unsafe {
             instance
                 .enumerate_physical_devices()?
                 .into_iter()
@@ -96,14 +95,22 @@ impl App {
                 khr::portability_subset::NAME.as_ptr(),
             ];
 
+            // NOTE: Keep in mind proper ordering when adding features.
             let features = vk::PhysicalDeviceFeatures::default().shader_clip_distance(true);
+            let mut synchronization2 =
+                vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+            let mut dynamic_rendering =
+                vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+
             let device_info = vk::DeviceCreateInfo::default()
-                .queue_create_infos(std::slice::from_ref(&device_queue_info))
+                .queue_create_infos(slice::from_ref(&device_queue_info))
                 .enabled_extension_names(&extension_names_raw)
-                .enabled_features(&features);
+                .enabled_features(&features)
+                .push_next(&mut synchronization2)
+                .push_next(&mut dynamic_rendering);
 
             self.instance
-                .create_device(adapter.inner, &device_info, None)
+                .create_device(adapter.handle, &device_info, None)
         }
     }
 }
@@ -170,17 +177,57 @@ pub fn create_command_pool(
 }
 
 #[inline]
-pub fn create_command_buffers(
+pub fn create_command_pools(
+    logical_device: &ash::Device,
+    queue_family: &QueueFamily,
+    pool_count: u32,
+) -> Vec<vk::CommandPool> {
+    let command_pool_info = vk::CommandPoolCreateInfo::default()
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+        .queue_family_index(queue_family.index);
+
+    (0..pool_count)
+        .map(|_| unsafe {
+            logical_device
+                .create_command_pool(&command_pool_info, None)
+                .expect("Could not create vk::CommandPool.")
+        })
+        .collect()
+}
+
+#[inline]
+pub fn create_command_buffer(
     logical_device: &ash::Device,
     command_pool: vk::CommandPool,
-    command_buffer_count: u32,
-) -> VkResult<Vec<vk::CommandBuffer>> {
+) -> VkResult<vk::CommandBuffer> {
     let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
-        .command_buffer_count(command_buffer_count)
         .command_pool(command_pool)
+        .command_buffer_count(1)
         .level(vk::CommandBufferLevel::PRIMARY);
 
-    unsafe { logical_device.allocate_command_buffers(&command_buffer_allocate_info) }
+    unsafe { Ok(logical_device.allocate_command_buffers(&command_buffer_allocate_info)?[0]) }
+}
+
+#[inline]
+pub fn create_command_buffers(
+    logical_device: &ash::Device,
+    command_pools: &Vec<vk::CommandPool>,
+) -> Vec<vk::CommandBuffer> {
+    command_pools
+        .iter()
+        .map(|cmd_pool| {
+            let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_pool(*cmd_pool)
+                .command_buffer_count(1)
+                .level(vk::CommandBufferLevel::PRIMARY);
+
+            unsafe {
+                logical_device
+                    .allocate_command_buffers(&command_buffer_allocate_info)
+                    .expect("Could not create vk::CommandBuffer.")[0]
+            }
+        })
+        .collect()
 }
 
 pub fn record_submit_commandbuffer<F: FnOnce(vk::CommandBuffer)>(
@@ -193,27 +240,24 @@ pub fn record_submit_commandbuffer<F: FnOnce(vk::CommandBuffer)>(
     signal_semaphores: &[vk::Semaphore],
     op: F,
 ) -> VkResult<()> {
-    let command_buffers = vec![command_buffer];
     let command_buffer_begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
-    let submit_info = vk::SubmitInfo::default()
-        .command_buffers(&command_buffers)
+    let submit_info = [vk::SubmitInfo::default()
+        .command_buffers(slice::from_ref(&command_buffer))
         .wait_dst_stage_mask(wait_dst_stage_mask)
         .wait_semaphores(wait_semaphores)
-        .signal_semaphores(signal_semaphores);
-
-    let reset_flags = vk::CommandBufferResetFlags::RELEASE_RESOURCES;
+        .signal_semaphores(signal_semaphores)];
 
     unsafe {
         logical_device.wait_for_fences(&[command_buffer_fence], true, u64::MAX)?;
         logical_device.reset_fences(&[command_buffer_fence])?;
-        logical_device.reset_command_buffer(command_buffer, reset_flags)?;
+
         logical_device.begin_command_buffer(command_buffer, &command_buffer_begin_info)?;
 
         op(command_buffer);
 
         logical_device.end_command_buffer(command_buffer)?;
-        logical_device.queue_submit(submit_queue, &[submit_info], command_buffer_fence)
+        logical_device.queue_submit(submit_queue, &submit_info, command_buffer_fence)
     }
 }

@@ -4,11 +4,11 @@ use ash_window::create_surface;
 
 #[derive(Clone)]
 pub struct Surface {
-    pub inner: vk::SurfaceKHR,
-    pub format: vk::SurfaceFormatKHR,
-    pub capabilities: vk::SurfaceCapabilitiesKHR,
+    pub handle: vk::SurfaceKHR,
+    pub present_mode: vk::PresentModeKHR,
+    pub format: vk::Format,
+    pub color_space: vk::ColorSpaceKHR,
     pub transform_flags: vk::SurfaceTransformFlagsKHR,
-    pub extent: vk::Extent2D,
     pub min_image_count: u32,
 }
 
@@ -17,8 +17,6 @@ impl Surface {
         app: &App,
         adapter: &Adapter,
         surface_instance: &khr::surface::Instance,
-        window_width: u32,
-        window_height: u32,
     ) -> VkResult<Self> {
         unsafe {
             let surface = create_surface(
@@ -28,18 +26,16 @@ impl Surface {
                 app.window_handle,
                 None,
             )?;
+            let modes = surface_instance
+                .get_physical_device_surface_present_modes(adapter.handle, surface)?;
+            let present_mode = modes
+                .into_iter()
+                .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
+                .unwrap_or(vk::PresentModeKHR::FIFO);
             let format =
-                surface_instance.get_physical_device_surface_formats(adapter.inner, surface)?[0];
+                surface_instance.get_physical_device_surface_formats(adapter.handle, surface)?[0];
             let capabilities = surface_instance
-                .get_physical_device_surface_capabilities(adapter.inner, surface)?;
-            let extent = match capabilities.current_extent.width {
-                u32::MAX => vk::Extent2D {
-                    width: window_width,
-                    height: window_height,
-                },
-                _ => capabilities.current_extent,
-            };
-
+                .get_physical_device_surface_capabilities(adapter.handle, surface)?;
             let transform_flags = if capabilities
                 .supported_transforms
                 .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
@@ -49,23 +45,38 @@ impl Surface {
                 capabilities.current_transform
             };
 
-            let min_image_count =
-                (capabilities.min_image_count + 1).min(capabilities.max_image_count);
+            // FIXME: Investigate why this makes or breaks swapchain recreation.
+            // let min_image_count = capabilities.min_image_count + 1;
+            let min_image_count = 2;
 
             Ok(Self {
-                inner: surface,
-                format,
-                capabilities,
+                handle: surface,
+                present_mode,
+                format: format.format,
+                color_space: format.color_space,
                 transform_flags,
-                extent,
                 min_image_count,
             })
         }
     }
 
-    pub fn destroy(&self, surface_instance: &khr::surface::Instance) {
+    pub fn extent(
+        &self,
+        window_width: u32,
+        window_height: u32,
+        adapter: &Adapter,
+        surface_instance: &khr::surface::Instance,
+    ) -> VkResult<vk::Extent2D> {
         unsafe {
-            surface_instance.destroy_surface(self.inner, None);
+            let capabilities = surface_instance
+                .get_physical_device_surface_capabilities(adapter.handle, self.handle)?;
+            Ok(match capabilities.current_extent.width {
+                u32::MAX => vk::Extent2D {
+                    width: window_width,
+                    height: window_height,
+                },
+                _ => capabilities.current_extent,
+            })
         }
     }
 }

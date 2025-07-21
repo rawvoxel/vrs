@@ -3,7 +3,7 @@ use ash::{khr, prelude::VkResult, vk};
 
 #[derive(Clone)]
 pub struct Adapter {
-    pub inner: vk::PhysicalDevice,
+    pub handle: vk::PhysicalDevice,
     pub features: vk::PhysicalDeviceFeatures,
     pub properties: vk::PhysicalDeviceProperties,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -16,18 +16,10 @@ impl Adapter {
             let features = instance.get_physical_device_features(physical_device);
             let properties = instance.get_physical_device_properties(physical_device);
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
-            let queue_families = instance
-                .get_physical_device_queue_family_properties(physical_device)
-                .into_iter()
-                .enumerate()
-                .map(|(index, properties)| QueueFamily {
-                    properties,
-                    index: index as u32,
-                })
-                .collect();
+            let queue_families = get_queue_families(&instance, physical_device);
 
             Ok(Self {
-                inner: physical_device,
+                handle: physical_device,
                 features,
                 properties,
                 memory_properties,
@@ -51,9 +43,9 @@ impl Adapter {
                 let supports_surface = supports_surface
                     == surface_instance
                         .get_physical_device_surface_support(
-                            self.inner,
+                            self.handle,
                             queue_family.index,
-                            surface.inner,
+                            surface.handle,
                         )
                         .expect("Could not get physical device surface support.");
 
@@ -64,5 +56,22 @@ impl Adapter {
                 }
             })
             .expect("Could not find suitable queue family.")
+    }
+}
+
+pub fn get_queue_families(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Vec<QueueFamily> {
+    unsafe {
+        instance
+            .get_physical_device_queue_family_properties(physical_device)
+            .into_iter()
+            .enumerate()
+            .map(|(index, properties)| QueueFamily {
+                properties,
+                index: index as u32,
+            })
+            .collect()
     }
 }

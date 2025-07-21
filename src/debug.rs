@@ -1,7 +1,7 @@
 use ash::{ext::debug_utils, prelude::VkResult, vk};
 use std::{borrow::Cow, ffi};
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Debug {
     messenger: vk::DebugUtilsMessengerEXT,
 }

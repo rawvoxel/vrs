@@ -1,10 +1,10 @@
-use crate::{adapter::Adapter, alloc, surface::Surface};
+use crate::{adapter::Adapter, alloc};
 use ash::{prelude::VkResult, vk};
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Image {
     pub memory: vk::DeviceMemory,
-    pub inner: vk::Image,
+    pub handle: vk::Image,
 }
 
 impl Image {
@@ -26,17 +26,42 @@ impl Image {
             logical_device.bind_image_memory(image, memory, 0)?;
 
             Ok(Self {
-                inner: image,
+                handle: image,
                 memory,
             })
         }
     }
 
-    pub fn destroy(&self, logical_device: &ash::Device) {
+    pub fn destroy(&self, logical_device: &ash::Device) -> VkResult<()> {
         unsafe {
-            logical_device.device_wait_idle().unwrap();
+            logical_device.device_wait_idle()?;
             logical_device.free_memory(self.memory, None);
-            logical_device.destroy_image(self.inner, None);
+            logical_device.destroy_image(self.handle, None);
+
+            Ok(())
         }
     }
+}
+
+#[inline]
+pub fn create_image_view(
+    logical_device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+    aspect_mask: vk::ImageAspectFlags,
+    components: vk::ComponentMapping,
+) -> VkResult<vk::ImageView> {
+    let image_view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .format(format)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .components(components)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(aspect_mask)
+                .level_count(1)
+                .layer_count(1),
+        );
+
+    unsafe { logical_device.create_image_view(&image_view_info, None) }
 }

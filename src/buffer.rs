@@ -4,7 +4,7 @@ use ash::{prelude::VkResult, util, vk};
 #[derive(Clone)]
 pub struct Buffer {
     pub memory: vk::DeviceMemory,
-    pub inner: vk::Buffer,
+    pub handle: vk::Buffer,
 }
 
 impl Buffer {
@@ -27,7 +27,7 @@ impl Buffer {
             logical_device.bind_buffer_memory(buffer, memory, buffer_offset)?;
 
             Ok(Self {
-                inner: buffer,
+                handle: buffer,
                 memory,
             })
         }
@@ -36,11 +36,11 @@ impl Buffer {
     pub fn map_memory<T: Copy>(
         &self,
         logical_device: &ash::Device,
-        offset: u64,
         data: &[T],
+        offset: u64,
     ) -> VkResult<()> {
         unsafe {
-            let memory_req = logical_device.get_buffer_memory_requirements(self.inner);
+            let memory_req = logical_device.get_buffer_memory_requirements(self.handle);
             let buffer_ptr = logical_device.map_memory(
                 self.memory,
                 offset,
@@ -55,11 +55,13 @@ impl Buffer {
         }
     }
 
-    pub fn destroy(&self, logical_device: &ash::Device) {
+    pub fn destroy(&self, logical_device: &ash::Device) -> VkResult<()> {
         unsafe {
-            logical_device.device_wait_idle().unwrap();
+            logical_device.device_wait_idle()?;
             logical_device.free_memory(self.memory, None);
-            logical_device.destroy_buffer(self.inner, None);
+            logical_device.destroy_buffer(self.handle, None);
+
+            Ok(())
         }
     }
 }
