@@ -105,8 +105,8 @@ impl Renderer {
         let available = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
         let rendered = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
 
-        let vertex_buffer = create_vertex_buffer(&discrete_gpu, &render_device)?;
-        let index_buffer = create_index_buffer(&discrete_gpu, &render_device)?;
+        let vertex_buffer = create_vertex_buffer(&discrete_gpu, &render_device, 3)?;
+        let index_buffer = create_index_buffer(&discrete_gpu, &render_device, 3)?;
 
         record_submit_commandbuffer(
             &render_device,
@@ -259,6 +259,7 @@ impl Renderer {
             self.render_device.cmd_set_viewport(cmd_buffer, 0, &viewports);
             self.render_device.cmd_set_scissor(cmd_buffer, 0, &scissors);
 
+            // FIXME: Resize buffers dynamically.
             self.index_buffer.map_memory(&self.render_device, indices, 0)?;
             self.vertex_buffer.map_memory(&self.render_device, vertices, 0)?;
 
@@ -323,28 +324,6 @@ impl Renderer {
     pub fn rebuild_swapchain(&mut self, surface_extent: vk::Extent2D) -> VkResult<()> {
         unsafe {
             self.render_device.device_wait_idle()?;
-
-            // FIXME: Investigate whether the sync objects and commands need to
-            // be destroyed, or just reset.
-
-            for f in self.in_flight.iter() {
-                self.render_device.destroy_fence(*f, None);
-            }
-            for s in self.available.iter() {
-                self.render_device.destroy_semaphore(*s, None);
-            }
-            for s in self.rendered.iter() {
-                self.render_device.destroy_semaphore(*s, None);
-            }
-            for pool in self.cmd_pools.iter() {
-                self.render_device.destroy_command_pool(*pool, None);
-            }
-
-            self.cmd_pools = create_command_pools(&self.render_device, &self.graphics_queue_family, FRAMES_IN_FLIGHT);
-            self.cmd_buffers = create_command_buffers(&self.render_device, &self.cmd_pools);
-            self.in_flight = create_fences(&self.render_device, FRAMES_IN_FLIGHT);
-            self.available = create_semaphores(&self.render_device, FRAMES_IN_FLIGHT);
-            self.rendered = create_semaphores(&self.render_device, FRAMES_IN_FLIGHT);
 
             self.swapchain.rebuild(
                 &self.discrete_gpu,
@@ -528,9 +507,9 @@ pub fn create_graphics_pipeline(
 }
 
 #[inline]
-pub fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device) -> VkResult<Buffer> {
+pub fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(3 * size_of::<Index>() as u64)
+        .size(element_count * size_of::<Index>() as u64)
         .usage(vk::BufferUsageFlags::INDEX_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer_offset = 0;
@@ -545,9 +524,9 @@ pub fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device) -> Vk
 }
 
 #[inline]
-pub fn create_vertex_buffer(adapter: &Adapter, render_device: &ash::Device) -> VkResult<Buffer> {
+pub fn create_vertex_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(3 * size_of::<Vertex>() as u64)
+        .size(element_count * size_of::<Vertex>() as u64)
         .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer_offset = 0;
@@ -565,7 +544,7 @@ pub fn create_vertex_buffer(adapter: &Adapter, render_device: &ash::Device) -> V
 pub fn transition_image_layout(
     render_device: &ash::Device,
     image: vk::Image,
-    command_buffer: vk::CommandBuffer,
+    cmd_buffer: vk::CommandBuffer,
     old_layout: vk::ImageLayout,
     new_layout: vk::ImageLayout,
     src_access_mask: vk::AccessFlags2,
@@ -591,6 +570,6 @@ pub fn transition_image_layout(
     let dependency_info =
         vk::DependencyInfo::default().image_memory_barriers(&image_memory_barrier);
     unsafe {
-        render_device.cmd_pipeline_barrier2(command_buffer, &dependency_info);
+        render_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
     }
 }

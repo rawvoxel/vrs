@@ -141,9 +141,7 @@ fn create_instance(
         .collect();
 
     let mut extensions = ash_window::enumerate_required_extensions(display_handle)?.to_vec();
-
     extensions.push(ext::debug_utils::NAME.as_ptr());
-
     if cfg!(any(target_os = "macos", target_os = "ios")) {
         extensions.push(khr::portability_enumeration::NAME.as_ptr());
         extensions.push(khr::get_physical_device_properties2::NAME.as_ptr());
@@ -154,7 +152,6 @@ fn create_instance(
     } else {
         vk::InstanceCreateFlags::default()
     };
-
     let instance_info = vk::InstanceCreateInfo::default()
         .application_info(&application_info)
         .enabled_layer_names(&layers)
