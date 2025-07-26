@@ -5,12 +5,11 @@ use ash::{prelude::VkResult, vk};
 pub fn vk_alloc(
     adapter: &Adapter,
     logical_device: &ash::Device,
-    memory_property_flags: vk::MemoryPropertyFlags,
     memory_requirements: vk::MemoryRequirements,
+    memory_property_flags: vk::MemoryPropertyFlags,
 ) -> VkResult<vk::DeviceMemory> {
     let memory_type_index =
-        find_memory_type_index(adapter, memory_property_flags, memory_requirements);
-
+        find_memory_type_index(adapter, memory_requirements, memory_property_flags);
     let memory_allocate_info = vk::MemoryAllocateInfo::default()
         .allocation_size(memory_requirements.size)
         .memory_type_index(memory_type_index);
@@ -21,8 +20,8 @@ pub fn vk_alloc(
 #[inline]
 fn find_memory_type_index(
     adapter: &Adapter,
-    memory_property_flags: vk::MemoryPropertyFlags,
     memory_requirements: vk::MemoryRequirements,
+    memory_property_flags: vk::MemoryPropertyFlags,
 ) -> u32 {
     adapter.memory_properties.memory_types[..adapter.memory_properties.memory_type_count as _]
         .iter()

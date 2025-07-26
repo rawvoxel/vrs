@@ -40,7 +40,7 @@ impl App {
         window_handle: RawWindowHandle,
         app_info: vk::ApplicationInfo,
     ) -> Result<App> {
-        let entry = create_entry()?;
+        let entry = unsafe { ash::Entry::load()? };
         let instance = create_instance(&entry, display_handle, app_info)?;
         let debug_instance = ext::debug_utils::Instance::new(&entry, &instance);
         let debug = Debug::new(&debug_instance)?;
@@ -83,32 +83,32 @@ impl App {
         adapter: &Adapter,
         queue_family: &QueueFamily,
     ) -> VkResult<ash::Device> {
+        let queue_priorities = [1.0];
+        let device_queue_info = vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family.index)
+            .queue_priorities(&queue_priorities);
+
+        let extension_names_raw = [
+            khr::swapchain::NAME.as_ptr(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            khr::portability_subset::NAME.as_ptr(),
+        ];
+
+        // NOTE: Keep in mind proper ordering when adding features.
+        let features = vk::PhysicalDeviceFeatures::default().shader_clip_distance(true);
+        let mut synchronization2 =
+            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut dynamic_rendering =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+
+        let device_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(slice::from_ref(&device_queue_info))
+            .enabled_extension_names(&extension_names_raw)
+            .enabled_features(&features)
+            .push_next(&mut synchronization2)
+            .push_next(&mut dynamic_rendering);
+
         unsafe {
-            let queue_priorities = [1.0];
-            let device_queue_info = vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(queue_family.index)
-                .queue_priorities(&queue_priorities);
-
-            let extension_names_raw = [
-                khr::swapchain::NAME.as_ptr(),
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                khr::portability_subset::NAME.as_ptr(),
-            ];
-
-            // NOTE: Keep in mind proper ordering when adding features.
-            let features = vk::PhysicalDeviceFeatures::default().shader_clip_distance(true);
-            let mut synchronization2 =
-                vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-            let mut dynamic_rendering =
-                vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-
-            let device_info = vk::DeviceCreateInfo::default()
-                .queue_create_infos(slice::from_ref(&device_queue_info))
-                .enabled_extension_names(&extension_names_raw)
-                .enabled_features(&features)
-                .push_next(&mut synchronization2)
-                .push_next(&mut dynamic_rendering);
-
             self.instance
                 .create_device(adapter.handle, &device_info, None)
         }
@@ -122,11 +122,6 @@ impl Drop for App {
             self.instance.destroy_instance(None);
         }
     }
-}
-
-#[inline]
-fn create_entry() -> Result<ash::Entry, ash::LoadingError> {
-    unsafe { ash::Entry::load() }
 }
 
 #[inline]
@@ -227,6 +222,7 @@ pub fn create_command_buffers(
         .collect()
 }
 
+#[inline]
 pub fn record_submit_commandbuffer<F: FnOnce(vk::CommandBuffer)>(
     logical_device: &ash::Device,
     command_buffer: vk::CommandBuffer,
@@ -249,7 +245,6 @@ pub fn record_submit_commandbuffer<F: FnOnce(vk::CommandBuffer)>(
     unsafe {
         logical_device.wait_for_fences(&[command_buffer_fence], true, u64::MAX)?;
         logical_device.reset_fences(&[command_buffer_fence])?;
-
         logical_device.begin_command_buffer(command_buffer, &command_buffer_begin_info)?;
 
         op(command_buffer);

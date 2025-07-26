@@ -183,7 +183,7 @@ impl Renderer {
     ) -> VkResult<()> {
         let surface_extent = self.surface
             .extent(window_width, window_height, &self.discrete_gpu, &self.surface_instance)?;
-        if surface_extent != self.swapchain.extent {
+        if self.swapchain.extent != surface_extent {
             self.rebuild_swapchain(surface_extent)?;
         }
         
@@ -244,7 +244,7 @@ impl Renderer {
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(clear_value);
             let rendering_info = vk::RenderingInfo::default()
-                .render_area(surface_extent.into())
+                .render_area(extent.into())
                 .color_attachments(slice::from_ref(&color_attachment_info))
                 .layer_count(1);
             self.render_device
@@ -259,7 +259,7 @@ impl Renderer {
             self.render_device.cmd_set_viewport(cmd_buffer, 0, &viewports);
             self.render_device.cmd_set_scissor(cmd_buffer, 0, &scissors);
 
-            // FIXME: Resize buffers dynamically.
+            // FIXME: THIS IS BAD, MAP MEMORY ONCE.
             self.index_buffer.map_memory(&self.render_device, indices, 0)?;
             self.vertex_buffer.map_memory(&self.render_device, vertices, 0)?;
 
@@ -295,13 +295,21 @@ impl Renderer {
             self.render_device.end_command_buffer(cmd_buffer)?;
 
             // Submit
-            let submit_info = vk::SubmitInfo::default()
-                .command_buffers(slice::from_ref(&cmd_buffer))
-                .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
-                .wait_semaphores(slice::from_ref(&available))
-                .signal_semaphores(slice::from_ref(&rendered));
+            // NOTE: This may require `device_mask` to be filled at a later date.
+            let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default()
+                .command_buffer(cmd_buffer);
+            let wait_sem_submit_info = vk::SemaphoreSubmitInfo::default()
+                .semaphore(available)
+                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+            let signal_sem_submit_info = vk::SemaphoreSubmitInfo::default()
+                .semaphore(rendered)
+                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+            let submit_info = vk::SubmitInfo2::default()
+                .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info))
+                .wait_semaphore_infos(slice::from_ref(&wait_sem_submit_info))
+                .signal_semaphore_infos(slice::from_ref(&signal_sem_submit_info));
 
-            self.render_device.queue_submit(
+            self.render_device.queue_submit2(
                 self.graphics_queue.handle,
                 slice::from_ref(&submit_info),
                 in_flight,

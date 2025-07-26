@@ -21,8 +21,8 @@ impl Buffer {
             let memory = alloc::vk_alloc(
                 adapter,
                 logical_device,
-                memory_property_flags,
                 memory_requirements,
+                memory_property_flags,
             )?;
             logical_device.bind_buffer_memory(buffer, memory, buffer_offset)?;
 
