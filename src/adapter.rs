@@ -1,5 +1,5 @@
 use crate::{queue::QueueFamily, surface::Surface};
-use ash::{khr, prelude::VkResult, vk};
+use ash::{khr, vk};
 
 #[derive(Clone)]
 pub struct Adapter {
@@ -11,20 +11,20 @@ pub struct Adapter {
 }
 
 impl Adapter {
-    pub fn new(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> VkResult<Self> {
+    pub fn new(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Self {
         unsafe {
             let features = instance.get_physical_device_features(physical_device);
             let properties = instance.get_physical_device_properties(physical_device);
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
             let queue_families = get_queue_families(&instance, physical_device);
 
-            Ok(Self {
+            Self {
                 handle: physical_device,
                 features,
                 properties,
                 memory_properties,
                 queue_families,
-            })
+            }
         }
     }
 
@@ -35,7 +35,7 @@ impl Adapter {
         surface: &Surface,
         supports_surface: bool,
         queue_flags: vk::QueueFlags,
-    ) -> VkResult<QueueFamily> {
+    ) -> QueueFamily {
         self.queue_families
             .iter()
             .find_map(|queue_family| unsafe {
@@ -50,7 +50,7 @@ impl Adapter {
                         .expect("Could not get physical device surface support.");
 
                 if contains_flags && supports_surface {
-                    Some(Ok(queue_family.clone()))
+                    Some(queue_family.clone())
                 } else {
                     None
                 }
@@ -59,7 +59,7 @@ impl Adapter {
     }
 }
 
-pub fn get_queue_families(
+fn get_queue_families(
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
 ) -> Vec<QueueFamily> {

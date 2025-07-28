@@ -1,5 +1,3 @@
-use std::slice;
-
 use crate::{
     adapter::Adapter,
     image::{Image, create_image_view},
@@ -7,6 +5,7 @@ use crate::{
     surface::Surface,
 };
 use ash::{khr, prelude::VkResult, vk};
+use std::slice;
 
 #[derive(Clone)]
 pub struct Swapchain {
@@ -22,7 +21,7 @@ impl Swapchain {
     pub fn new(
         adapter: &Adapter,
         surface: &Surface,
-        surface_extent: vk::Extent2D,
+        extent: vk::Extent2D,
         queue_family: &QueueFamily,
         logical_device: &ash::Device,
         swapchain_device: &khr::swapchain::Device,
@@ -31,10 +30,10 @@ impl Swapchain {
         unsafe {
             let mut swapchain_info = vk::SwapchainCreateInfoKHR::default()
                 .surface(surface.handle)
-                .min_image_count(surface.min_image_count)
+                .min_image_count(surface.image_count)
                 .image_format(surface.format)
                 .image_color_space(surface.color_space)
-                .image_extent(surface_extent)
+                .image_extent(extent)
                 .image_array_layers(1)
                 .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -57,13 +56,13 @@ impl Swapchain {
                         logical_device,
                         image,
                         surface.format,
-                        vk::ImageAspectFlags::COLOR,
                         vk::ComponentMapping {
                             r: vk::ComponentSwizzle::R,
                             g: vk::ComponentSwizzle::G,
                             b: vk::ComponentSwizzle::B,
                             a: vk::ComponentSwizzle::A,
                         },
+                        vk::ImageAspectFlags::COLOR,
                     )
                     .expect("Could not create vk::ImageView")
                 })
@@ -71,7 +70,7 @@ impl Swapchain {
             let depth_image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::D16_UNORM)
-                .extent(surface_extent.into())
+                .extent(extent.into())
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -88,13 +87,13 @@ impl Swapchain {
                 logical_device,
                 depth_image.handle,
                 depth_image_info.format,
-                vk::ImageAspectFlags::DEPTH,
                 vk::ComponentMapping::default(),
+                vk::ImageAspectFlags::DEPTH,
             )?;
 
             Ok(Swapchain {
                 handle: swapchain,
-                extent: surface_extent,
+                extent,
                 present_images,
                 present_image_views,
                 depth_image,
@@ -113,14 +112,9 @@ impl Swapchain {
         swapchain_device: &khr::swapchain::Device,
     ) -> VkResult<()> {
         unsafe {
-            logical_device.device_wait_idle().unwrap();
+            logical_device.device_wait_idle()?;
 
-            let old_handle = self.handle;
-            self.depth_image.destroy(logical_device)?;
-            logical_device.destroy_image_view(self.depth_image_view, None);
-            for &image_view in self.present_image_views.iter() {
-                logical_device.destroy_image_view(image_view, None);
-            }
+            let old_swapchain = self.clone();
 
             *self = Self::new(
                 adapter,
@@ -132,24 +126,26 @@ impl Swapchain {
                 Some(self.handle),
             )?;
 
-            swapchain_device.destroy_swapchain(old_handle, None);
+            old_swapchain.destroy(logical_device, swapchain_device);
             Ok(())
         }
     }
 
-    #[rustfmt::skip]
-    pub fn destroy(&self, logical_device: &ash::Device, swapchain_device: &khr::swapchain::Device) -> VkResult<()>{
+    /// Before freeing an object, an application must ensure the object is no longer in use by the device.
+    #[inline]
+    pub unsafe fn destroy(
+        &self,
+        logical_device: &ash::Device,
+        swapchain_device: &khr::swapchain::Device,
+    ) {
         unsafe {
-            logical_device.device_wait_idle().unwrap();
-
-            self.depth_image.destroy(logical_device)?;
+            self.depth_image.destroy(logical_device);
             logical_device.destroy_image_view(self.depth_image_view, None);
             for &image_view in self.present_image_views.iter() {
                 logical_device.destroy_image_view(image_view, None);
             }
 
             swapchain_device.destroy_swapchain(self.handle, None);
-            Ok(())
         }
     }
 }

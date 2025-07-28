@@ -1,14 +1,5 @@
 use crate::{
-    App,
-    adapter::Adapter,
-    buffer::Buffer,
-    create_command_buffer, create_command_buffers, create_command_pool, create_command_pools,
-    queue::{Queue, QueueFamily},
-    record_submit_commandbuffer,
-    surface::Surface,
-    swapchain::Swapchain,
-    sync::{create_fence, create_fences, create_semaphores},
-    vertex::{Index, Vertex},
+    adapter::Adapter, buffer::Buffer, create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, image, queue::{Queue, QueueFamily}, record_submit_commandbuffer, surface::Surface, swapchain::Swapchain, sync::{create_fence, create_fences, create_semaphores}, vertex::{Index, Vertex}, App
 };
 use ash::{khr, prelude::VkResult, util, vk};
 use std::{default::Default, io::Cursor, slice};
@@ -50,7 +41,7 @@ impl Renderer {
     pub fn new(app: &App, window_width: u32, window_height: u32) -> VkResult<Self> {
         // FIXME: Create fallback for integrated GPUs.
         let discrete_gpu = app
-            .request_physical_device_type(vk::PhysicalDeviceType::DISCRETE_GPU)
+            .request_adapter_type(vk::PhysicalDeviceType::DISCRETE_GPU)
             .expect("No discrete gpu was found!");
 
         let surface_instance = khr::surface::Instance::new(&app.entry, &app.instance);
@@ -67,9 +58,9 @@ impl Renderer {
             &surface,
             true,
             vk::QueueFlags::GRAPHICS,
-        )?;
+        );
 
-        let render_device = app.create_logical_device(&discrete_gpu, &graphics_queue_family)?;
+        let render_device = create_render_device(app, &discrete_gpu, &graphics_queue_family)?;
         let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0)?;
 
         let vert_shader_module = create_shader_module(&render_device, VERT_SPV)?;
@@ -117,7 +108,7 @@ impl Renderer {
             &[],
             &[],
             |command_buffer| {
-                transition_image_layout(
+                image::transition_layout(
                     &render_device,
                     swapchain.depth_image.handle,
                     command_buffer,
@@ -224,7 +215,7 @@ impl Renderer {
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
 
-            transition_image_layout(
+            image::transition_layout(
                 &self.render_device,
                 present_image,
                 cmd_buffer,
@@ -279,7 +270,7 @@ impl Renderer {
 
             self.render_device.cmd_end_rendering(cmd_buffer);
 
-            transition_image_layout(
+            image::transition_layout(
                 &self.render_device,
                 present_image,
                 cmd_buffer,
@@ -296,6 +287,7 @@ impl Renderer {
 
             // Submit
             // NOTE: This may require `device_mask` to be filled at a later date.
+            // NOTE: Not sure it's necessary since we're only using one device.
             let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default()
                 .command_buffer(cmd_buffer);
             let wait_sem_submit_info = vk::SemaphoreSubmitInfo::default()
@@ -351,7 +343,7 @@ impl Renderer {
                 &[],
                 &[],
                 |command_buffer| {
-                    transition_image_layout(
+                    image::transition_layout(
                         &self.render_device,
                         self.swapchain.depth_image.handle,
                         command_buffer,
@@ -369,13 +361,15 @@ impl Renderer {
         }
     }
 
-    #[rustfmt::skip]
+    #[inline]
     pub fn destroy(&mut self) -> VkResult<()> {
         unsafe {
+            // NOTE: This call is the only reason this destroy
+            // NOTE: method is safe where all others are not.
             self.render_device.device_wait_idle()?;
 
-            self.index_buffer.destroy(&self.render_device)?;
-            self.vertex_buffer.destroy(&self.render_device)?;
+            self.index_buffer.destroy(&self.render_device);
+            self.vertex_buffer.destroy(&self.render_device);
 
             for f in self.in_flight.iter() {
                 self.render_device.destroy_fence(*f, None);
@@ -386,10 +380,11 @@ impl Renderer {
             for s in self.rendered.iter() {
                 self.render_device.destroy_semaphore(*s, None);
             }
-            for pool in self.cmd_pools.iter() {
-                self.render_device.destroy_command_pool(*pool, None);
+            for p in self.cmd_pools.iter() {
+                self.render_device.destroy_command_pool(*p, None);
             }
-            self.swapchain.destroy(&self.render_device, &self.swapchain_device)?;
+
+            self.swapchain.destroy(&self.render_device, &self.swapchain_device);
 
             self.render_device.destroy_fence(self.init_cmd_fence, None);
             self.render_device.destroy_command_pool(self.init_cmd_pool, None);
@@ -405,8 +400,45 @@ impl Renderer {
 }
 
 #[inline]
+fn create_render_device(
+    app: &App,
+    adapter: &Adapter,
+    queue_family: &QueueFamily,
+) -> VkResult<ash::Device> {
+    let queue_priorities = [1.0];
+    let device_queue_info = vk::DeviceQueueCreateInfo::default()
+        .queue_family_index(queue_family.index)
+        .queue_priorities(&queue_priorities);
+
+    let extension_names_raw = [
+        khr::swapchain::NAME.as_ptr(),
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        khr::portability_subset::NAME.as_ptr(),
+    ];
+
+    // NOTE: Keep in mind proper ordering when adding features.
+    let features = vk::PhysicalDeviceFeatures::default().shader_clip_distance(true);
+    let mut synchronization2 =
+        vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+    let mut dynamic_rendering =
+        vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+
+    let device_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(slice::from_ref(&device_queue_info))
+        .enabled_extension_names(&extension_names_raw)
+        .enabled_features(&features)
+        .push_next(&mut synchronization2)
+        .push_next(&mut dynamic_rendering);
+
+    unsafe {
+        app.instance
+            .create_device(adapter.handle, &device_info, None)
+    }
+}
+
+#[inline]
 #[rustfmt::skip]
-pub fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> VkResult<vk::ShaderModule> {
+fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> VkResult<vk::ShaderModule> {
     let mut spv_file = Cursor::new(&spv_bytes);
     let shader_code = util::read_spv(&mut spv_file).expect("Failed to read shader spv file.");
     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
@@ -415,13 +447,13 @@ pub fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> Vk
 
 #[inline]
 #[rustfmt::skip]
-pub fn create_pipeline_layout(render_device: &ash::Device) -> VkResult<vk::PipelineLayout> {
+fn create_pipeline_layout(render_device: &ash::Device) -> VkResult<vk::PipelineLayout> {
     let layout_create_info = vk::PipelineLayoutCreateInfo::default();
     unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
 }
 
 #[inline]
-pub fn create_graphics_pipeline(
+fn create_graphics_pipeline(
     surface: &Surface,
     render_device: &ash::Device,
     vert_shader_module: vk::ShaderModule,
@@ -515,7 +547,7 @@ pub fn create_graphics_pipeline(
 }
 
 #[inline]
-pub fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
+fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
     let buffer_info = vk::BufferCreateInfo::default()
         .size(element_count * size_of::<Index>() as u64)
         .usage(vk::BufferUsageFlags::INDEX_BUFFER)
@@ -526,58 +558,62 @@ pub fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device, eleme
         adapter,
         render_device,
         buffer_info,
-        buffer_offset,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        buffer_offset,
     )
 }
 
 #[inline]
-pub fn create_vertex_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
-    let buffer_info = vk::BufferCreateInfo::default()
+fn create_vertex_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
+    let info = vk::BufferCreateInfo::default()
         .size(element_count * size_of::<Vertex>() as u64)
         .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer_offset = 0;
+    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let offset = 0;
 
     Buffer::new(
         adapter,
         render_device,
-        buffer_info,
-        buffer_offset,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        info,
+        flags,
+        offset,
     )
 }
 
 #[inline]
-pub fn transition_image_layout(
-    render_device: &ash::Device,
-    image: vk::Image,
-    cmd_buffer: vk::CommandBuffer,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_access_mask: vk::AccessFlags2,
-    dst_access_mask: vk::AccessFlags2,
-    src_stage_mask: vk::PipelineStageFlags2,
-    dst_stage_mask: vk::PipelineStageFlags2,
-    aspect_mask: vk::ImageAspectFlags,
-) {
-    let image_memory_barrier = [vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(src_stage_mask)
-        .src_access_mask(src_access_mask)
-        .dst_stage_mask(dst_stage_mask)
-        .dst_access_mask(dst_access_mask)
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(aspect_mask)
-                .layer_count(1)
-                .level_count(1),
-        )];
-    let dependency_info =
-        vk::DependencyInfo::default().image_memory_barriers(&image_memory_barrier);
-    unsafe {
-        render_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
-    }
+fn create_vertex_src_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
+    let info = vk::BufferCreateInfo::default()
+        .size(element_count * size_of::<Vertex>() as u64)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let offset = 0;
+
+    Buffer::new(
+        adapter,
+        render_device,
+        info,
+        flags,
+        offset,
+    )
 }
+
+#[inline]
+fn create_vertex_dst_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
+    let info = vk::BufferCreateInfo::default()
+        .size(element_count * size_of::<Vertex>() as u64)
+        .usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let offset = 0;
+
+    Buffer::new(
+        adapter,
+        render_device,
+        info,
+        flags,
+        offset,
+    )
+}
+

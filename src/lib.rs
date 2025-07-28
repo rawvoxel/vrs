@@ -48,7 +48,7 @@ impl App {
             instance
                 .enumerate_physical_devices()?
                 .into_iter()
-                .map(|physical_device| Adapter::new(&instance, physical_device).unwrap())
+                .map(|physical_device| Adapter::new(&instance, physical_device))
                 .collect()
         };
 
@@ -64,12 +64,12 @@ impl App {
     }
 
     #[inline]
-    pub fn request_physical_device_type(
+    pub fn request_adapter_type(
         &self,
-        device_type: vk::PhysicalDeviceType,
+        physical_device_type: vk::PhysicalDeviceType,
     ) -> Option<Adapter> {
         self.adapters.iter().find_map(|adapter| {
-            if adapter.properties.device_type == device_type {
+            if adapter.properties.device_type == physical_device_type {
                 Some(adapter.clone())
             } else {
                 None
@@ -78,45 +78,7 @@ impl App {
     }
 
     #[inline]
-    pub fn create_logical_device(
-        &self,
-        adapter: &Adapter,
-        queue_family: &QueueFamily,
-    ) -> VkResult<ash::Device> {
-        let queue_priorities = [1.0];
-        let device_queue_info = vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family.index)
-            .queue_priorities(&queue_priorities);
-
-        let extension_names_raw = [
-            khr::swapchain::NAME.as_ptr(),
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            khr::portability_subset::NAME.as_ptr(),
-        ];
-
-        // NOTE: Keep in mind proper ordering when adding features.
-        let features = vk::PhysicalDeviceFeatures::default().shader_clip_distance(true);
-        let mut synchronization2 =
-            vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-        let mut dynamic_rendering =
-            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-
-        let device_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(slice::from_ref(&device_queue_info))
-            .enabled_extension_names(&extension_names_raw)
-            .enabled_features(&features)
-            .push_next(&mut synchronization2)
-            .push_next(&mut dynamic_rendering);
-
-        unsafe {
-            self.instance
-                .create_device(adapter.handle, &device_info, None)
-        }
-    }
-}
-
-impl Drop for App {
-    fn drop(&mut self) {
+    pub fn destroy(&mut self) {
         unsafe {
             self.debug.destroy(&self.debug_instance);
             self.instance.destroy_instance(None);

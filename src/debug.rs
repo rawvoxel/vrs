@@ -12,7 +12,9 @@ impl Debug {
         Ok(Self { messenger })
     }
 
-    pub fn destroy(&self, debug_utils_instance: &debug_utils::Instance) {
+    /// Before freeing an object, an application must ensure the object is no longer in use by the device.
+    #[inline]
+    pub unsafe fn destroy(&self, debug_utils_instance: &debug_utils::Instance) {
         unsafe {
             debug_utils_instance.destroy_debug_utils_messenger(self.messenger, None);
         }

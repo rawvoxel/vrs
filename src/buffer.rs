@@ -12,18 +12,14 @@ impl Buffer {
         adapter: &Adapter,
         logical_device: &ash::Device,
         buffer_info: vk::BufferCreateInfo,
-        buffer_offset: u64,
         memory_property_flags: vk::MemoryPropertyFlags,
+        buffer_offset: u64,
     ) -> VkResult<Self> {
         unsafe {
             let buffer = logical_device.create_buffer(&buffer_info, None)?;
-            let memory_requirements = logical_device.get_buffer_memory_requirements(buffer);
-            let memory = alloc::vk_alloc(
-                adapter,
-                logical_device,
-                memory_requirements,
-                memory_property_flags,
-            )?;
+            let memory_req = logical_device.get_buffer_memory_requirements(buffer);
+            let memory =
+                alloc::vk_alloc(adapter, logical_device, memory_req, memory_property_flags)?;
             logical_device.bind_buffer_memory(buffer, memory, buffer_offset)?;
 
             Ok(Self {
@@ -55,13 +51,29 @@ impl Buffer {
         }
     }
 
-    pub fn destroy(&self, logical_device: &ash::Device) -> VkResult<()> {
+    /// Before freeing an object, an application must ensure the object is no longer in use by the device.
+    #[inline]
+    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
         unsafe {
-            logical_device.device_wait_idle()?;
             logical_device.free_memory(self.memory, None);
             logical_device.destroy_buffer(self.handle, None);
-
-            Ok(())
         }
     }
+}
+
+#[inline]
+pub fn create_buffer_view(
+    logical_device: &ash::Device,
+    buffer: vk::Buffer,
+    format: vk::Format,
+    offset: vk::DeviceSize,
+    range: vk::DeviceSize,
+) -> VkResult<vk::BufferView> {
+    let info = vk::BufferViewCreateInfo::default()
+        .buffer(buffer)
+        .format(format)
+        .offset(offset)
+        .range(range);
+
+    unsafe { logical_device.create_buffer_view(&info, None) }
 }

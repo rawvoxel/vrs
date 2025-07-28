@@ -9,7 +9,7 @@ pub struct Surface {
     pub format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
     pub transform_flags: vk::SurfaceTransformFlagsKHR,
-    pub min_image_count: u32,
+    pub image_count: u32,
 }
 
 impl Surface {
@@ -26,9 +26,8 @@ impl Surface {
                 app.window_handle,
                 None,
             )?;
-            let modes = surface_instance
-                .get_physical_device_surface_present_modes(adapter.handle, surface)?;
-            let present_mode = modes
+            let present_mode = surface_instance
+                .get_physical_device_surface_present_modes(adapter.handle, surface)?
                 .into_iter()
                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
@@ -55,7 +54,7 @@ impl Surface {
                 format: format.format,
                 color_space: format.color_space,
                 transform_flags,
-                min_image_count,
+                image_count: min_image_count,
             })
         }
     }
