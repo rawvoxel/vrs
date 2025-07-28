@@ -61,7 +61,7 @@ impl Renderer {
         );
 
         let render_device = create_render_device(app, &discrete_gpu, &graphics_queue_family)?;
-        let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0)?;
+        let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0);
 
         let vert_shader_module = create_shader_module(&render_device, VERT_SPV)?;
         let frag_shader_module = create_shader_module(&render_device, FRAG_SPV)?;
@@ -437,7 +437,6 @@ fn create_render_device(
 }
 
 #[inline]
-#[rustfmt::skip]
 fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> VkResult<vk::ShaderModule> {
     let mut spv_file = Cursor::new(&spv_bytes);
     let shader_code = util::read_spv(&mut spv_file).expect("Failed to read shader spv file.");
@@ -446,7 +445,6 @@ fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> VkResu
 }
 
 #[inline]
-#[rustfmt::skip]
 fn create_pipeline_layout(render_device: &ash::Device) -> VkResult<vk::PipelineLayout> {
     let layout_create_info = vk::PipelineLayoutCreateInfo::default();
     unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }

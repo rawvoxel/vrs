@@ -1,11 +1,8 @@
-#![warn(unused_qualifications)]
-
 use adapter::Adapter;
 use anyhow::Result;
 use ash::{ext, khr, prelude::VkResult, vk};
-use queue::QueueFamily;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-use std::{ffi, slice};
+use std::ffi;
 
 pub mod adapter;
 pub mod alloc;
