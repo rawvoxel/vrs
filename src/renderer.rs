@@ -98,10 +98,11 @@ impl Renderer {
         let available = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
         let rendered = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
 
-        let vertex_src_buffer = create_vertex_src_buffer(&discrete_gpu, &render_device, 3)?;
-        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 3)?;
-        let index_src_buffer = create_index_src_buffer(&discrete_gpu, &render_device, 3)?;
-        let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 3)?;
+        // FIXME: Figure out where to put this, or how to initialize an upper limit for size.
+        let vertex_src_buffer = create_vertex_src_buffer(&discrete_gpu, &render_device, 12)?;
+        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
+        let index_src_buffer = create_index_src_buffer(&discrete_gpu, &render_device, 12)?;
+        let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 12)?;
 
         record_submit_commandbuffer(
             &render_device,
@@ -334,7 +335,7 @@ impl Renderer {
                 &[0],
             );
 
-            self.render_device.cmd_draw_indexed(cmd_buffer, indices.len() as u32, 1, 0, 0, 1);
+            self.render_device.cmd_draw_indexed(cmd_buffer, indices.len() as u32, 1, 0, 0, 0);
             self.render_device.cmd_end_rendering(cmd_buffer);
 
             // Present image transition
