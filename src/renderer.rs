@@ -215,6 +215,7 @@ impl Renderer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
 
+            // Buffer transfer
             // FIXME: THIS IS BAD, MAP MEMORY ONCE.
             self.index_buffer.map_memory(&self.render_device, indices, 0)?;
             self.vertex_src_buffer.map_memory(&self.render_device, vertices, 0)?;
@@ -232,6 +233,7 @@ impl Renderer {
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
 
+            // Color image transition
             image::transition_layout(
                 &self.render_device,
                 present_image,
@@ -245,6 +247,7 @@ impl Renderer {
                 vk::ImageAspectFlags::COLOR,
             );
 
+            // Render commands
             let color_attachment_info = vk::RenderingAttachmentInfo::default()
                 .image_view(present_image_view)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -283,6 +286,7 @@ impl Renderer {
             self.render_device.cmd_draw_indexed(cmd_buffer, indices.len() as u32, 1, 0, 0, 1);
             self.render_device.cmd_end_rendering(cmd_buffer);
 
+            // Present image transition
             image::transition_layout(
                 &self.render_device,
                 present_image,
@@ -298,7 +302,7 @@ impl Renderer {
 
             self.render_device.end_command_buffer(cmd_buffer)?;
 
-            // Submit
+            // Queue submit
             // NOTE: This may require `device_mask` to be filled at a later date.
             // NOTE: Not sure it's necessary since we're only using one device.
             let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default()
@@ -320,7 +324,7 @@ impl Renderer {
                 in_flight,
             )?;
 
-            // Present
+            // Queue present
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(slice::from_ref(&rendered))
                 .swapchains(slice::from_ref(&self.swapchain.handle))
