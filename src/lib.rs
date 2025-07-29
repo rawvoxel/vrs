@@ -15,6 +15,7 @@ pub mod renderer;
 pub mod surface;
 pub mod swapchain;
 pub mod sync;
+pub mod uniforms;
 pub mod vertex;
 
 use debug::Debug;
