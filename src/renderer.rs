@@ -12,7 +12,8 @@ const FRAMES_IN_FLIGHT: u32 = 2;
 pub struct Renderer {
     pub vertex_src_buffer: Buffer,
     pub vertex_dst_buffer: Buffer,
-    pub index_buffer: Buffer,
+    pub index_src_buffer: Buffer,
+    pub index_dst_buffer: Buffer,
 
     pub current_frame: usize,
     pub in_flight: Vec<vk::Fence>,
@@ -99,7 +100,8 @@ impl Renderer {
 
         let vertex_src_buffer = create_vertex_src_buffer(&discrete_gpu, &render_device, 3)?;
         let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 3)?;
-        let index_buffer = create_index_buffer(&discrete_gpu, &render_device, 3)?;
+        let index_src_buffer = create_index_src_buffer(&discrete_gpu, &render_device, 3)?;
+        let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 3)?;
 
         record_submit_commandbuffer(
             &render_device,
@@ -135,7 +137,8 @@ impl Renderer {
         Ok(Self {
             vertex_src_buffer,
             vertex_dst_buffer,
-            index_buffer,
+            index_src_buffer,
+            index_dst_buffer,
 
             current_frame: 0,
             in_flight,
@@ -189,13 +192,49 @@ impl Renderer {
             .command_buffer(cmd_buffer);
         let submit_info = vk::SubmitInfo2::default()
             .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info));
-
         self.render_device.queue_submit2(
             self.graphics_queue.handle,
             slice::from_ref(&submit_info),
             vk::Fence::null(),
         )?;
         
+        // NOTE: Is this wait really necessary?
+        // NOTE: It may be wise to use a fence here for multiple simultaneous transfers.
+        self.render_device.queue_wait_idle(self.graphics_queue.handle)?;
+
+        Ok(())
+    }}
+
+    pub fn transfer_index_buffer(&self, indices: &[Index], cmd_buffer: vk::CommandBuffer) -> VkResult<()> {unsafe {
+        let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
+
+        let size = (indices.len() * size_of::<Index>()) as vk::DeviceSize;
+        let regions = vk::BufferCopy2::default()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(size);
+        let copy_buffer_info = vk::CopyBufferInfo2::default()
+            .src_buffer(self.index_src_buffer.handle)
+            .dst_buffer(self.index_dst_buffer.handle)
+            .regions(slice::from_ref(&regions));
+        self.render_device.cmd_copy_buffer2(cmd_buffer, &copy_buffer_info);
+
+        self.render_device.end_command_buffer(cmd_buffer)?;
+
+        let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default()
+            .command_buffer(cmd_buffer);
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info));
+        self.render_device.queue_submit2(
+            self.graphics_queue.handle,
+            slice::from_ref(&submit_info),
+            vk::Fence::null(),
+        )?;
+        
+        // NOTE: Is this wait really necessary?
+        // NOTE: It may be wise to use a fence here for multiple simultaneous transfers.
         self.render_device.queue_wait_idle(self.graphics_queue.handle)?;
 
         Ok(())
@@ -247,9 +286,10 @@ impl Renderer {
 
             // Buffer transfer
             // FIXME: THIS IS BAD, MAP MEMORY ONCE.
-            self.index_buffer.map_memory(&self.render_device, indices, 0)?;
+            self.index_src_buffer.map_memory(&self.render_device, indices, 0)?;
             self.vertex_src_buffer.map_memory(&self.render_device, vertices, 0)?;
             // NOTE: It may be wise to create a dedicated command buffer for transfers.
+            self.transfer_index_buffer(indices, cmd_buffer)?;
             self.transfer_vertex_buffer(vertices, cmd_buffer)?;
 
             // Commands
@@ -299,7 +339,7 @@ impl Renderer {
 
             self.render_device.cmd_bind_index_buffer(
                 cmd_buffer,
-                self.index_buffer.handle,
+                self.index_dst_buffer.handle,
                 0,
                 vk::IndexType::UINT32,
             );
@@ -350,8 +390,6 @@ impl Renderer {
                 slice::from_ref(&submit_info),
                 in_flight,
             )?;
-            
-            // self.render_device.queue_wait_idle(self.graphics_queue);
 
             // Queue present
             let present_info = vk::PresentInfoKHR::default()
@@ -414,7 +452,8 @@ impl Renderer {
             // NOTE: method is safe where all others are not.
             self.render_device.device_wait_idle()?;
 
-            self.index_buffer.destroy(&self.render_device);
+            self.index_src_buffer.destroy(&self.render_device);
+            self.index_dst_buffer.destroy(&self.render_device);
             self.vertex_src_buffer.destroy(&self.render_device);
             self.vertex_dst_buffer.destroy(&self.render_device);
 
@@ -592,10 +631,14 @@ fn create_graphics_pipeline(
 }
 
 #[inline]
-fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
+fn create_index_src_buffer(
+    adapter: &Adapter,
+    render_device: &ash::Device,
+    element_count: vk::DeviceSize,
+) -> VkResult<Buffer> {
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Index>() as u64)
-        .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+        .size(element_count * size_of::<Index>() as vk::DeviceSize)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer_offset = 0;
 
@@ -609,9 +652,34 @@ fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device, element_c
 }
 
 #[inline]
-fn create_vertex_src_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
+fn create_index_dst_buffer(
+    adapter: &Adapter,
+    render_device: &ash::Device,
+    element_count: vk::DeviceSize,
+) -> VkResult<Buffer> {
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(element_count * size_of::<Index>() as vk::DeviceSize)
+        .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer_offset = 0;
+
+    Buffer::new(
+        adapter,
+        render_device,
+        buffer_info,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        buffer_offset,
+    )
+}
+
+#[inline]
+fn create_vertex_src_buffer(
+    adapter: &Adapter,
+    render_device: &ash::Device,
+    element_count: vk::DeviceSize,
+) -> VkResult<Buffer> {
     let info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Vertex>() as u64)
+        .size(element_count * size_of::<Vertex>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -627,9 +695,13 @@ fn create_vertex_src_buffer(adapter: &Adapter, render_device: &ash::Device, elem
 }
 
 #[inline]
-fn create_vertex_dst_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
+fn create_vertex_dst_buffer(
+    adapter: &Adapter,
+    render_device: &ash::Device,
+    element_count: vk::DeviceSize
+) -> VkResult<Buffer> {
     let info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Vertex>() as u64)
+        .size(element_count * size_of::<Vertex>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
