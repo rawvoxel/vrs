@@ -166,6 +166,40 @@ impl Renderer {
     pub fn advance_current_frame(&mut self) {
         self.current_frame = (self.current_frame + 1) % self.in_flight.len();
     }
+    
+    pub fn transfer_vertex_buffer(&self, vertices: &[Vertex], cmd_buffer: vk::CommandBuffer) -> VkResult<()> {unsafe {
+        let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
+
+        let size = (vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
+        let regions = vk::BufferCopy2::default()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(size);
+        let copy_buffer_info = vk::CopyBufferInfo2::default()
+            .src_buffer(self.vertex_src_buffer.handle)
+            .dst_buffer(self.vertex_dst_buffer.handle)
+            .regions(slice::from_ref(&regions));
+        self.render_device.cmd_copy_buffer2(cmd_buffer, &copy_buffer_info);
+
+        self.render_device.end_command_buffer(cmd_buffer)?;
+
+        let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default()
+            .command_buffer(cmd_buffer);
+        let submit_info = vk::SubmitInfo2::default()
+            .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info));
+
+        self.render_device.queue_submit2(
+            self.graphics_queue.handle,
+            slice::from_ref(&submit_info),
+            vk::Fence::null(),
+        )?;
+        
+        self.render_device.queue_wait_idle(self.graphics_queue.handle)?;
+
+        Ok(())
+    }}
 
     #[rustfmt::skip]
     pub fn submit(
@@ -175,6 +209,7 @@ impl Renderer {
         indices: &[Index],
         vertices: &[Vertex],
     ) -> VkResult<()> {
+
         let surface_extent = self.surface
             .extent(window_width, window_height, &self.discrete_gpu, &self.surface_instance)?;
         if self.swapchain.extent != surface_extent {
@@ -210,25 +245,17 @@ impl Renderer {
                 vk::Fence::null(),
             )?;
 
-            // Commands
-            let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
-
             // Buffer transfer
             // FIXME: THIS IS BAD, MAP MEMORY ONCE.
             self.index_buffer.map_memory(&self.render_device, indices, 0)?;
             self.vertex_src_buffer.map_memory(&self.render_device, vertices, 0)?;
-            let size = (vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
-            let regions = vk::BufferCopy2::default()
-                .src_offset(0)
-                .dst_offset(0)
-                .size(size);
-            let copy_buffer_info = vk::CopyBufferInfo2::default()
-                .src_buffer(self.vertex_src_buffer.handle)
-                .dst_buffer(self.vertex_dst_buffer.handle)
-                .regions(slice::from_ref(&regions));
-            self.render_device.cmd_copy_buffer2(cmd_buffer, &copy_buffer_info);
+            // NOTE: It may be wise to create a dedicated command buffer for transfers.
+            self.transfer_vertex_buffer(vertices, cmd_buffer)?;
+
+            // Commands
+            let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
 
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
@@ -323,6 +350,8 @@ impl Renderer {
                 slice::from_ref(&submit_info),
                 in_flight,
             )?;
+            
+            // self.render_device.queue_wait_idle(self.graphics_queue);
 
             // Queue present
             let present_info = vk::PresentInfoKHR::default()
