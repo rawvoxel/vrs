@@ -10,7 +10,8 @@ const FRAMES_IN_FLIGHT: u32 = 2;
 
 #[derive(Clone)]
 pub struct Renderer {
-    pub vertex_buffer: Buffer,
+    pub vertex_src_buffer: Buffer,
+    pub vertex_dst_buffer: Buffer,
     pub index_buffer: Buffer,
 
     pub current_frame: usize,
@@ -96,7 +97,8 @@ impl Renderer {
         let available = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
         let rendered = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
 
-        let vertex_buffer = create_vertex_buffer(&discrete_gpu, &render_device, 3)?;
+        let vertex_src_buffer = create_vertex_src_buffer(&discrete_gpu, &render_device, 3)?;
+        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 3)?;
         let index_buffer = create_index_buffer(&discrete_gpu, &render_device, 3)?;
 
         record_submit_commandbuffer(
@@ -131,7 +133,8 @@ impl Renderer {
         }
 
         Ok(Self {
-            vertex_buffer,
+            vertex_src_buffer,
+            vertex_dst_buffer,
             index_buffer,
 
             current_frame: 0,
@@ -212,6 +215,20 @@ impl Renderer {
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
 
+            // FIXME: THIS IS BAD, MAP MEMORY ONCE.
+            self.index_buffer.map_memory(&self.render_device, indices, 0)?;
+            self.vertex_src_buffer.map_memory(&self.render_device, vertices, 0)?;
+            let size = (vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
+            let regions = vk::BufferCopy2::default()
+                .src_offset(0)
+                .dst_offset(0)
+                .size(size);
+            let copy_buffer_info = vk::CopyBufferInfo2::default()
+                .src_buffer(self.vertex_src_buffer.handle)
+                .dst_buffer(self.vertex_dst_buffer.handle)
+                .regions(slice::from_ref(&regions));
+            self.render_device.cmd_copy_buffer2(cmd_buffer, &copy_buffer_info);
+
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
 
@@ -250,24 +267,20 @@ impl Renderer {
             self.render_device.cmd_set_viewport(cmd_buffer, 0, &viewports);
             self.render_device.cmd_set_scissor(cmd_buffer, 0, &scissors);
 
-            // FIXME: THIS IS BAD, MAP MEMORY ONCE.
-            self.index_buffer.map_memory(&self.render_device, indices, 0)?;
-            self.vertex_buffer.map_memory(&self.render_device, vertices, 0)?;
-
-            self.render_device.cmd_bind_vertex_buffers(
-                cmd_buffer,
-                0,
-                &[self.vertex_buffer.handle],
-                &[0],
-            );
             self.render_device.cmd_bind_index_buffer(
                 cmd_buffer,
                 self.index_buffer.handle,
                 0,
                 vk::IndexType::UINT32,
             );
-            self.render_device.cmd_draw_indexed(cmd_buffer, indices.len() as u32, 1, 0, 0, 1);
+            self.render_device.cmd_bind_vertex_buffers(
+                cmd_buffer,
+                0,
+                &[self.vertex_dst_buffer.handle],
+                &[0],
+            );
 
+            self.render_device.cmd_draw_indexed(cmd_buffer, indices.len() as u32, 1, 0, 0, 1);
             self.render_device.cmd_end_rendering(cmd_buffer);
 
             image::transition_layout(
@@ -321,14 +334,14 @@ impl Renderer {
     }
 
     #[rustfmt::skip]
-    pub fn rebuild_swapchain(&mut self, surface_extent: vk::Extent2D) -> VkResult<()> {
+    pub fn rebuild_swapchain(&mut self, extent: vk::Extent2D) -> VkResult<()> {
         unsafe {
             self.render_device.device_wait_idle()?;
 
             self.swapchain.rebuild(
                 &self.discrete_gpu,
                 &self.surface,
-                surface_extent,
+                extent,
                 &self.graphics_queue_family,
                 &self.render_device,
                 &self.swapchain_device,
@@ -369,7 +382,8 @@ impl Renderer {
             self.render_device.device_wait_idle()?;
 
             self.index_buffer.destroy(&self.render_device);
-            self.vertex_buffer.destroy(&self.render_device);
+            self.vertex_src_buffer.destroy(&self.render_device);
+            self.vertex_dst_buffer.destroy(&self.render_device);
 
             for f in self.in_flight.iter() {
                 self.render_device.destroy_fence(*f, None);
@@ -558,24 +572,6 @@ fn create_index_buffer(adapter: &Adapter, render_device: &ash::Device, element_c
         buffer_info,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         buffer_offset,
-    )
-}
-
-#[inline]
-fn create_vertex_buffer(adapter: &Adapter, render_device: &ash::Device, element_count: u64) -> VkResult<Buffer> {
-    let info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Vertex>() as u64)
-        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let offset = 0;
-
-    Buffer::new(
-        adapter,
-        render_device,
-        info,
-        flags,
-        offset,
     )
 }
 
