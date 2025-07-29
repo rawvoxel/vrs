@@ -624,14 +624,15 @@ fn create_index_src_buffer(
         .size(element_count * size_of::<Index>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer_offset = 0;
+    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let offset = 0;
 
     Buffer::new(
         adapter,
         render_device,
         buffer_info,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        buffer_offset,
+        flags,
+        offset,
     )
 }
 
@@ -645,14 +646,15 @@ fn create_index_dst_buffer(
         .size(element_count * size_of::<Index>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let buffer_offset = 0;
+    let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let offset = 0;
 
     Buffer::new(
         adapter,
         render_device,
         buffer_info,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        buffer_offset,
+        flags,
+        offset,
     )
 }
 
