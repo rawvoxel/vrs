@@ -1,5 +1,5 @@
 use crate::{
-    adapter::Adapter, buffer::Buffer, commands::{create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, record_submit_commandbuffer}, descriptors::create_ubo_descriptor_pool, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, sync::{create_fence, create_fences, create_semaphores}, uniforms::TransformUniforms, vertex::{Index, Vertex}, App
+    adapter::Adapter, buffer::Buffer, commands::{create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, record_submit_commandbuffer}, descriptors::create_descriptor_pool, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, sync::{create_fence, create_fences, create_semaphores}, uniforms::TransformUniforms, vertex::{Index, Vertex}, App
 };
 use ash::{khr, prelude::VkResult, util, vk};
 use std::{default::Default, io::Cursor, slice};
@@ -71,8 +71,8 @@ impl Renderer {
         let vert_shader_module = create_shader_module(&render_device, VERT_SPV)?;
         let frag_shader_module = create_shader_module(&render_device, FRAG_SPV)?;
 
-        let ubo_desc_pool = create_ubo_descriptor_pool(&render_device, 1)?;
-        let ubo_desc_set_layout = create_transform_ubo_layout(&render_device)?;
+        let ubo_desc_pool = create_descriptor_pool(&render_device, vk::DescriptorType::UNIFORM_BUFFER, 1)?;
+        let ubo_desc_set_layout = create_ubo_layout(&render_device)?;
         let pipeline_layout = create_pipeline_layout(&render_device, slice::from_ref(&ubo_desc_set_layout))?;
         let graphics_pipeline = create_graphics_pipeline(
             &surface,
@@ -713,7 +713,7 @@ fn create_vertex_dst_buffer(
 }
 
 #[inline]
-fn create_transform_ubo_layout(render_device: &ash::Device) -> VkResult<vk::DescriptorSetLayout> {
+fn create_ubo_layout(render_device: &ash::Device) -> VkResult<vk::DescriptorSetLayout> {
     let descriptor_set_layout_binding = vk::DescriptorSetLayoutBinding::default()
         .binding(0)
         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
