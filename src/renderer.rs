@@ -1,5 +1,5 @@
 use crate::{
-    adapter::Adapter, buffer::Buffer, commands::{create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, record_submit_commandbuffer}, image, queue::{Queue, QueueFamily},  surface::Surface, swapchain::Swapchain, sync::{create_fence, create_fences, create_semaphores}, vertex::{Index, Vertex}, App
+    adapter::Adapter, buffer::Buffer, commands::{create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, record_submit_commandbuffer}, descriptors::create_ubo_descriptor_pool, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, sync::{create_fence, create_fences, create_semaphores}, uniforms::TransformUniforms, vertex::{Index, Vertex}, App
 };
 use ash::{khr, prelude::VkResult, util, vk};
 use std::{default::Default, io::Cursor, slice};
@@ -21,13 +21,16 @@ pub struct Renderer {
     pub rendered: Vec<vk::Semaphore>,
     pub cmd_buffers: Vec<vk::CommandBuffer>,
     pub cmd_pools: Vec<vk::CommandPool>,
-
+    
     pub init_cmd_fence: vk::Fence,
     pub init_cmd_buffer: vk::CommandBuffer,
     pub init_cmd_pool: vk::CommandPool,
 
     pub swapchain: Swapchain,
     pub swapchain_device: khr::swapchain::Device,
+
+    pub ubo_desc_pool: vk::DescriptorPool,
+    pub uniform_buffers: Vec<Buffer>,
 
     pub graphics_pipeline: vk::Pipeline,
     pub graphics_queue: Queue,
@@ -67,7 +70,10 @@ impl Renderer {
 
         let vert_shader_module = create_shader_module(&render_device, VERT_SPV)?;
         let frag_shader_module = create_shader_module(&render_device, FRAG_SPV)?;
-        let pipeline_layout = create_pipeline_layout(&render_device)?;
+
+        let ubo_desc_pool = create_ubo_descriptor_pool(&render_device, 1)?;
+        let ubo_desc_set_layout = create_transform_ubo_layout(&render_device)?;
+        let pipeline_layout = create_pipeline_layout(&render_device, slice::from_ref(&ubo_desc_set_layout))?;
         let graphics_pipeline = create_graphics_pipeline(
             &surface,
             &render_device,
@@ -91,8 +97,7 @@ impl Renderer {
         let init_cmd_buffer = create_command_buffer(&render_device, init_cmd_pool)?;
         let init_cmd_fence = create_fence(&render_device)?;
 
-        let cmd_pools =
-            create_command_pools(&render_device, &graphics_queue_family, FRAMES_IN_FLIGHT);
+        let cmd_pools = create_command_pools(&render_device, &graphics_queue_family, FRAMES_IN_FLIGHT);
         let cmd_buffers = create_command_buffers(&render_device, &cmd_pools);
         let in_flight = create_fences(&render_device, FRAMES_IN_FLIGHT);
         let available = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
@@ -103,6 +108,7 @@ impl Renderer {
         let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
         let index_src_buffer = create_index_src_buffer(&discrete_gpu, &render_device, 12)?;
         let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 12)?;
+        let uniform_buffers = create_uniform_buffers(&discrete_gpu, &render_device, FRAMES_IN_FLIGHT);
 
         record_submit_commandbuffer(
             &render_device,
@@ -147,6 +153,9 @@ impl Renderer {
             rendered,
             cmd_buffers,
             cmd_pools,
+
+            ubo_desc_pool,
+            uniform_buffers,
 
             init_cmd_fence,
             init_cmd_buffer,
@@ -516,8 +525,8 @@ fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> VkResu
 }
 
 #[inline]
-fn create_pipeline_layout(render_device: &ash::Device) -> VkResult<vk::PipelineLayout> {
-    let layout_create_info = vk::PipelineLayoutCreateInfo::default();
+fn create_pipeline_layout(render_device: &ash::Device, set_layouts: & [vk::DescriptorSetLayout]) -> VkResult<vk::PipelineLayout> {
+    let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(set_layouts);
     unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
 }
 
@@ -704,6 +713,32 @@ fn create_vertex_dst_buffer(
 }
 
 #[inline]
-fn create_transform_ubo() -> VkResult<Buffer> {
-    todo!()
+fn create_transform_ubo_layout(render_device: &ash::Device) -> VkResult<vk::DescriptorSetLayout> {
+    let descriptor_set_layout_binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::VERTEX);
+    
+    let descriptor_set_layout_info = vk:: DescriptorSetLayoutCreateInfo::default()
+        .bindings(slice::from_ref(&descriptor_set_layout_binding));
+    
+    unsafe { render_device.create_descriptor_set_layout(&descriptor_set_layout_info, None) }
+}
+
+#[inline]
+fn create_uniform_buffers(
+    adapter: &Adapter,
+    render_device: &ash::Device,
+    buffer_count: u32
+) -> Vec<Buffer> {
+    let info = vk::BufferCreateInfo::default()
+        .size(size_of::<TransformUniforms>() as vk::DeviceSize)
+        .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    (0..buffer_count).map(|_|{
+     Buffer::new(adapter, render_device, info, flags, 0).expect("Could not create uniform buffer.")
+        
+    }).collect()
 }

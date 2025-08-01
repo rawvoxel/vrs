@@ -9,6 +9,7 @@ pub mod alloc;
 pub mod buffer;
 pub mod commands;
 pub mod debug;
+pub mod descriptors;
 pub mod image;
 pub mod queue;
 pub mod renderer;
