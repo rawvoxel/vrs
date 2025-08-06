@@ -1,8 +1,10 @@
 use crate::{adapter::Adapter, alloc};
 use ash::{prelude::VkResult, util, vk};
+use std::ffi::c_void;
 
 #[derive(Clone)]
 pub struct Buffer {
+    pub memory_req: vk::MemoryRequirements,
     pub memory: vk::DeviceMemory,
     pub handle: vk::Buffer,
 }
@@ -25,30 +27,35 @@ impl Buffer {
             Ok(Self {
                 handle: buffer,
                 memory,
+                memory_req,
             })
         }
     }
 
-    pub fn map_memory<T: Copy>(
+    pub fn mem_map(
         &self,
         logical_device: &ash::Device,
-        data: &[T],
-        offset: u64,
-    ) -> VkResult<()> {
+        buffer_offset: u64,
+    ) -> VkResult<*mut c_void> {
         unsafe {
-            let memory_req = logical_device.get_buffer_memory_requirements(self.handle);
-            let buffer_ptr = logical_device.map_memory(
+            logical_device.map_memory(
                 self.memory,
-                offset,
-                memory_req.size,
+                buffer_offset,
+                self.memory_req.size,
                 vk::MemoryMapFlags::empty(),
-            )?;
-
-            util::Align::new(buffer_ptr, align_of::<T>() as u64, memory_req.size)
-                .copy_from_slice(&data);
-
-            Ok(logical_device.unmap_memory(self.memory))
+            )
         }
+    }
+
+    pub fn mem_write<T: Copy>(&self, buffer_ptr: *mut c_void, data: &[T]) {
+        unsafe {
+            util::Align::new(buffer_ptr, align_of::<T>() as u64, self.memory_req.size)
+                .copy_from_slice(&data);
+        }
+    }
+
+    pub fn mem_unmap(&self, logical_device: &ash::Device) {
+        unsafe { logical_device.unmap_memory(self.memory) }
     }
 
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.

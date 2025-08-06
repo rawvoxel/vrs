@@ -1,19 +1,17 @@
-use std::slice;
-
-use ash::{prelude::VkResult, vk};
-
 use crate::queue::QueueFamily;
+use ash::{prelude::VkResult, vk};
+use std::slice;
 
 #[inline]
 pub fn create_command_pool(
     logical_device: &ash::Device,
     queue_family: &QueueFamily,
 ) -> VkResult<vk::CommandPool> {
-    let command_pool_info = vk::CommandPoolCreateInfo::default()
+    let info = vk::CommandPoolCreateInfo::default()
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
         .queue_family_index(queue_family.index);
 
-    unsafe { logical_device.create_command_pool(&command_pool_info, None) }
+    unsafe { logical_device.create_command_pool(&info, None) }
 }
 
 #[inline]
@@ -22,14 +20,9 @@ pub fn create_command_pools(
     queue_family: &QueueFamily,
     pool_count: u32,
 ) -> Vec<vk::CommandPool> {
-    let command_pool_info = vk::CommandPoolCreateInfo::default()
-        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-        .queue_family_index(queue_family.index);
-
     (0..pool_count)
-        .map(|_| unsafe {
-            logical_device
-                .create_command_pool(&command_pool_info, None)
+        .map(|_| {
+            create_command_pool(logical_device, queue_family)
                 .expect("Could not create vk::CommandPool.")
         })
         .collect()
@@ -39,33 +32,27 @@ pub fn create_command_pools(
 pub fn create_command_buffer(
     logical_device: &ash::Device,
     command_pool: vk::CommandPool,
+    level: vk::CommandBufferLevel,
 ) -> VkResult<vk::CommandBuffer> {
-    let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(command_pool)
         .command_buffer_count(1)
-        .level(vk::CommandBufferLevel::PRIMARY);
+        .level(level);
 
-    unsafe { Ok(logical_device.allocate_command_buffers(&command_buffer_allocate_info)?[0]) }
+    unsafe { Ok(logical_device.allocate_command_buffers(&allocate_info)?[0]) }
 }
 
 #[inline]
 pub fn create_command_buffers(
     logical_device: &ash::Device,
     command_pools: &Vec<vk::CommandPool>,
+    level: vk::CommandBufferLevel,
 ) -> Vec<vk::CommandBuffer> {
     command_pools
         .iter()
-        .map(|cmd_pool| {
-            let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
-                .command_pool(*cmd_pool)
-                .command_buffer_count(1)
-                .level(vk::CommandBufferLevel::PRIMARY);
-
-            unsafe {
-                logical_device
-                    .allocate_command_buffers(&command_buffer_allocate_info)
-                    .expect("Could not create vk::CommandBuffer.")[0]
-            }
+        .map(|&command_pool| {
+            create_command_buffer(logical_device, command_pool, level)
+                .expect("Could not create vk::CommandBuffer.")
         })
         .collect()
 }

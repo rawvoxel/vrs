@@ -4,6 +4,7 @@ name = "vulkan"
 version = "0.1.0"
 authors = ["Robert A Ware"]
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 # -- External crates
@@ -11,7 +12,7 @@ anyhow = "1.0.98"
 ash = "0.38.0"
 ash-window = "0.13.0"
 raw-window-handle = "0.6.2"
-mint = "0.5.9"
+glam = "0.30.5"
 
 [dev-dependencies]
 # -- External crates

@@ -1,26 +1,28 @@
 use crate::{
-    adapter::Adapter, buffer::Buffer, commands::{create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, record_submit_commandbuffer}, descriptors::create_descriptor_pool, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, sync::{create_fence, create_fences, create_semaphores}, uniforms::TransformUniforms, vertex::{Index, Vertex}, App
+    adapter::Adapter, buffer::Buffer, descriptors::{create_descriptor_set, create_descriptor_set_layout}, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, uniforms::MvpMatrices, vertex::{Index, Vertex}, App
 };
+use crate::sync::{create_fence, create_fences, create_semaphores};
+use crate::descriptors::create_descriptor_pool;
+use crate::commands::{create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, record_submit_commandbuffer};
 use ash::{khr, prelude::VkResult, util, vk};
-use std::{default::Default, io::Cursor, slice};
+use std::{default::Default, ffi::c_void, io::Cursor, slice};
 
-const VERT_SPV: &[u8] = include_bytes!("../assets/shader/triangle/vert.spv");
-const FRAG_SPV: &[u8] = include_bytes!("../assets/shader/triangle/frag.spv");
+const SLANG_SPV: &[u8] = include_bytes!("../assets/shader/slang.spv");
 const FRAMES_IN_FLIGHT: u32 = 2;
 
 #[derive(Clone)]
 pub struct Renderer {
-    pub vertex_src_buffer: Buffer,
-    pub vertex_dst_buffer: Buffer,
     pub index_src_buffer: Buffer,
     pub index_dst_buffer: Buffer,
+    pub vertex_src_buffer: Buffer,
+    pub vertex_dst_buffer: Buffer,
 
     pub current_frame: usize,
-    pub in_flight: Vec<vk::Fence>,
-    pub available: Vec<vk::Semaphore>,
-    pub rendered: Vec<vk::Semaphore>,
-    pub cmd_buffers: Vec<vk::CommandBuffer>,
-    pub cmd_pools: Vec<vk::CommandPool>,
+    pub in_flight_frames: Vec<vk::Fence>,
+    pub available_frames: Vec<vk::Semaphore>,
+    pub rendered_frames: Vec<vk::Semaphore>,
+    pub frame_cmd_buffers: Vec<vk::CommandBuffer>,
+    pub frame_cmd_pools: Vec<vk::CommandPool>,
     
     pub init_cmd_fence: vk::Fence,
     pub init_cmd_buffer: vk::CommandBuffer,
@@ -30,17 +32,24 @@ pub struct Renderer {
     pub swapchain_device: khr::swapchain::Device,
 
     pub ubo_desc_pool: vk::DescriptorPool,
+    pub ubo_desc_set_layout: vk::DescriptorSetLayout,
+    pub ubo_desc_set: vk::DescriptorSet,
     pub uniform_buffers: Vec<Buffer>,
+    pub uniform_buffer_ptrs: Vec<*mut c_void>,
 
     pub graphics_pipeline: vk::Pipeline,
+    pub graphics_pipeline_layout: vk::PipelineLayout,
     pub graphics_queue: Queue,
+    pub graphics_queue_family: QueueFamily,
     pub render_device: ash::Device,
+
     pub surface: Surface,
     pub surface_instance: khr::surface::Instance,
-
-    pub graphics_queue_family: QueueFamily,
     pub discrete_gpu: Adapter,
 }
+
+unsafe impl Send for Renderer {}
+unsafe impl Sync for Renderer {}
 
 impl Renderer {
     pub fn new(app: &App, window_width: u32, window_height: u32) -> VkResult<Self> {
@@ -49,6 +58,7 @@ impl Renderer {
             .request_adapter_type(vk::PhysicalDeviceType::DISCRETE_GPU)
             .expect("No discrete gpu was found!");
 
+        // Surface
         let surface_instance = khr::surface::Instance::new(&app.entry, &app.instance);
         let surface = Surface::new(app, &discrete_gpu, &surface_instance)?;
         let surface_extent = surface.extent(
@@ -58,30 +68,42 @@ impl Renderer {
             &surface_instance,
         )?;
 
+        // Render Device
         let graphics_queue_family = discrete_gpu.get_queue_family(
             &surface_instance,
             &surface,
             true,
             vk::QueueFlags::GRAPHICS,
         );
-
         let render_device = create_render_device(app, &discrete_gpu, &graphics_queue_family)?;
         let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0);
 
-        let vert_shader_module = create_shader_module(&render_device, VERT_SPV)?;
-        let frag_shader_module = create_shader_module(&render_device, FRAG_SPV)?;
+        // Uniform Buffers
+        let ubo_desc_pool = create_descriptor_pool(&render_device, vk::DescriptorType::UNIFORM_BUFFER, 1, 1)?;
+        let ubo_desc_set_layout = create_descriptor_set_layout(
+            &render_device,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::ShaderStageFlags::VERTEX,
+        )?;
+        let ubo_desc_set = create_descriptor_set(&render_device, ubo_desc_pool, ubo_desc_set_layout)?;
+        let uniform_buffers = create_uniform_buffers(&discrete_gpu, &render_device, FRAMES_IN_FLIGHT);
+        let uniform_buffer_ptrs = uniform_buffers.iter()
+            .map(|b| {
+                b.mem_map(&render_device, 0).expect("Could not memory map buffers.")
+            })
+            .collect();
 
-        let ubo_desc_pool = create_descriptor_pool(&render_device, vk::DescriptorType::UNIFORM_BUFFER, 1)?;
-        let ubo_desc_set_layout = create_ubo_layout(&render_device)?;
-        let pipeline_layout = create_pipeline_layout(&render_device, slice::from_ref(&ubo_desc_set_layout))?;
+        // Graphics Pipeline
+        let shader_module = create_shader_module(&render_device, SLANG_SPV)?;
+        let graphics_pipeline_layout = create_pipeline_layout(&render_device, slice::from_ref(&ubo_desc_set_layout))?;
         let graphics_pipeline = create_graphics_pipeline(
             &surface,
             &render_device,
-            vert_shader_module,
-            frag_shader_module,
-            pipeline_layout,
+            shader_module,
+            graphics_pipeline_layout,
         )?;
 
+        // Swapchain
         let swapchain_device = khr::swapchain::Device::new(&app.instance, &render_device);
         let swapchain = Swapchain::new(
             &discrete_gpu,
@@ -93,22 +115,40 @@ impl Renderer {
             None,
         )?;
 
+        // Global Commands
         let init_cmd_pool = create_command_pool(&render_device, &graphics_queue_family)?;
-        let init_cmd_buffer = create_command_buffer(&render_device, init_cmd_pool)?;
+        let init_cmd_buffer = create_command_buffer(&render_device, init_cmd_pool, vk::CommandBufferLevel::PRIMARY)?;
         let init_cmd_fence = create_fence(&render_device)?;
 
-        let cmd_pools = create_command_pools(&render_device, &graphics_queue_family, FRAMES_IN_FLIGHT);
-        let cmd_buffers = create_command_buffers(&render_device, &cmd_pools);
-        let in_flight = create_fences(&render_device, FRAMES_IN_FLIGHT);
-        let available = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
-        let rendered = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
+        // Frames in Flight Commands
+        let frame_cmd_pools = create_command_pools(
+            &render_device,
+            &graphics_queue_family,
+            FRAMES_IN_FLIGHT
+        );
+        let frame_cmd_buffers = create_command_buffers(
+            &render_device,
+            &frame_cmd_pools,
+            vk::CommandBufferLevel::PRIMARY
+        );
+        let in_flight_frames = create_fences(&render_device, FRAMES_IN_FLIGHT);
+        let available_frames = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
+        let rendered_frames = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
 
+        // Mesh Buffers
         // FIXME: Figure out where to put this, or how to initialize an upper limit for size.
-        let vertex_src_buffer = create_vertex_src_buffer(&discrete_gpu, &render_device, 12)?;
-        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
-        let index_src_buffer = create_index_src_buffer(&discrete_gpu, &render_device, 12)?;
+        let index_src_buffer = create_transfer_src_buffer(
+            &discrete_gpu,
+            &render_device,
+            12 * size_of::<Index>() as vk::DeviceSize
+        )?;
+        let vertex_src_buffer = create_transfer_src_buffer(
+            &discrete_gpu,
+            &render_device,
+            12 * size_of::<Vertex>() as vk::DeviceSize
+        )?;
         let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 12)?;
-        let uniform_buffers = create_uniform_buffers(&discrete_gpu, &render_device, FRAMES_IN_FLIGHT);
+        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
 
         record_submit_commandbuffer(
             &render_device,
@@ -136,26 +176,27 @@ impl Renderer {
         )?;
 
         unsafe {
-            render_device.destroy_shader_module(vert_shader_module, None);
-            render_device.destroy_shader_module(frag_shader_module, None);
-            render_device.destroy_pipeline_layout(pipeline_layout, None);
+            render_device.destroy_shader_module(shader_module, None);
         }
 
         Ok(Self {
-            vertex_src_buffer,
-            vertex_dst_buffer,
             index_src_buffer,
             index_dst_buffer,
+            vertex_src_buffer,
+            vertex_dst_buffer,
 
             current_frame: 0,
-            in_flight,
-            available,
-            rendered,
-            cmd_buffers,
-            cmd_pools,
+            in_flight_frames,
+            available_frames,
+            rendered_frames,
+            frame_cmd_buffers,
+            frame_cmd_pools,
 
             ubo_desc_pool,
+            ubo_desc_set_layout,
+            ubo_desc_set,
             uniform_buffers,
+            uniform_buffer_ptrs,
 
             init_cmd_fence,
             init_cmd_buffer,
@@ -165,19 +206,20 @@ impl Renderer {
             swapchain_device,
 
             graphics_pipeline,
+            graphics_pipeline_layout,
             graphics_queue,
+            graphics_queue_family,
             render_device,
+
             surface,
             surface_instance,
-
-            graphics_queue_family,
             discrete_gpu,
         })
     }
 
     #[inline]
     pub fn advance_current_frame(&mut self) {
-        self.current_frame = (self.current_frame + 1) % self.in_flight.len();
+        self.current_frame = (self.current_frame + 1) % self.in_flight_frames.len();
     }
     
     pub fn transfer_mesh_buffers(
@@ -228,7 +270,7 @@ impl Renderer {
             )?;
         
             // NOTE: Is this wait really necessary?
-            // NOTE: It may be wise to use a fence here for multiple simultaneous transfers.
+            // TODO: It may be wise to use a fence here for multiple simultaneous transfers.
             self.render_device.queue_wait_idle(self.graphics_queue.handle)?;
 
             Ok(())
@@ -243,7 +285,6 @@ impl Renderer {
         indices: &[Index],
         vertices: &[Vertex],
     ) -> VkResult<()> {
-
         let surface_extent = self.surface
             .extent(window_width, window_height, &self.discrete_gpu, &self.surface_instance)?;
         if self.swapchain.extent != surface_extent {
@@ -260,36 +301,48 @@ impl Renderer {
             .min_depth(0.0)
             .max_depth(1.0)];
         let clear_value = vk::ClearValue {
-            color: vk::ClearColorValue { float32: [0.0; 4] },
+            color: vk::ClearColorValue { float32: [0.1; 4] },
         };
 
-        let in_flight = self.in_flight[self.current_frame];
-        let available = self.available[self.current_frame];
-        let rendered = self.rendered[self.current_frame];
-        let cmd_buffer = self.cmd_buffers[self.current_frame];
+        let frame_in_flight = self.in_flight_frames[self.current_frame];
+        let frame_available = self.available_frames[self.current_frame];
+        let frame_rendered = self.rendered_frames[self.current_frame];
+        let frame_cmd_buffer = self.frame_cmd_buffers[self.current_frame];
 
         unsafe {
-            self.render_device.wait_for_fences(&[in_flight], true, u64::MAX)?;
-            self.render_device.reset_fences(&[in_flight])?;
+            self.render_device.wait_for_fences(&[frame_in_flight], true, u64::MAX)?;
+            self.render_device.reset_fences(&[frame_in_flight])?;
 
             let (image_index, _suboptimal) = self.swapchain_device.acquire_next_image(
                 self.swapchain.handle,
                 u64::MAX,
-                available,
+                frame_available,
                 vk::Fence::null(),
             )?;
 
-            // Buffer transfer
+            // Mesh buffer transfers
             // FIXME: THIS IS BAD, MAP MEMORY ONCE.
-            self.index_src_buffer.map_memory(&self.render_device, indices, 0)?;
-            self.vertex_src_buffer.map_memory(&self.render_device, vertices, 0)?;
+            let i_ptr = self.index_src_buffer.mem_map(&self.render_device, 0)?;
+            let v_ptr = self.vertex_src_buffer.mem_map(&self.render_device, 0)?;
+            self.index_src_buffer.mem_write(i_ptr, indices);
+            self.vertex_src_buffer.mem_write(v_ptr, vertices);
+            self.index_src_buffer.mem_unmap(&self.render_device);
+            self.vertex_src_buffer.mem_unmap(&self.render_device);
             // NOTE: It may be wise to create a dedicated command buffer for transfers.
-            self.transfer_mesh_buffers(indices, vertices, cmd_buffer)?;
+            self.transfer_mesh_buffers(indices, vertices, frame_cmd_buffer)?;
+
+            // Uniform buffers
+            let mvp_identity = MvpMatrices::default();
+            let u_ptr = self.uniform_buffer_ptrs[self.current_frame];
+            self.uniform_buffers[self.current_frame].mem_write(u_ptr, slice::from_ref(&mvp_identity));
+            // TODO
+            // self.render_device.update_descriptor_sets(descriptor_writes, descriptor_copies);
 
             // Commands
             let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
+            self.render_device.begin_command_buffer(frame_cmd_buffer, &command_buffer_begin_info)?;
+            
 
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
@@ -298,7 +351,7 @@ impl Renderer {
             image::transition_layout(
                 &self.render_device,
                 present_image,
-                cmd_buffer,
+                frame_cmd_buffer,
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::AccessFlags2::empty(),
@@ -320,38 +373,47 @@ impl Renderer {
                 .color_attachments(slice::from_ref(&color_attachment_info))
                 .layer_count(1);
             self.render_device
-                .cmd_begin_rendering(cmd_buffer, &rendering_info);
+                .cmd_begin_rendering(frame_cmd_buffer, &rendering_info);
 
             self.render_device.cmd_bind_pipeline(
-                cmd_buffer,
+                frame_cmd_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
 
-            self.render_device.cmd_set_viewport(cmd_buffer, 0, &viewports);
-            self.render_device.cmd_set_scissor(cmd_buffer, 0, &scissors);
+            self.render_device.cmd_set_viewport(frame_cmd_buffer, 0, &viewports);
+            self.render_device.cmd_set_scissor(frame_cmd_buffer, 0, &scissors);
 
+            // Buffer Bindings
             self.render_device.cmd_bind_index_buffer(
-                cmd_buffer,
+                frame_cmd_buffer,
                 self.index_dst_buffer.handle,
                 0,
                 vk::IndexType::UINT32,
             );
             self.render_device.cmd_bind_vertex_buffers(
-                cmd_buffer,
+                frame_cmd_buffer,
                 0,
                 &[self.vertex_dst_buffer.handle],
                 &[0],
             );
+            self.render_device.cmd_bind_descriptor_sets(
+                frame_cmd_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline_layout,
+                0,
+                &[self.ubo_desc_set],
+                &[1]
+            );
 
-            self.render_device.cmd_draw_indexed(cmd_buffer, indices.len() as u32, 1, 0, 0, 0);
-            self.render_device.cmd_end_rendering(cmd_buffer);
+            self.render_device.cmd_draw_indexed(frame_cmd_buffer, indices.len() as u32, 1, 0, 0, 0);
+            self.render_device.cmd_end_rendering(frame_cmd_buffer);
 
             // Present image transition
             image::transition_layout(
                 &self.render_device,
                 present_image,
-                cmd_buffer,
+                frame_cmd_buffer,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::ImageLayout::PRESENT_SRC_KHR,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
@@ -361,18 +423,18 @@ impl Renderer {
                 vk::ImageAspectFlags::COLOR,
             );
 
-            self.render_device.end_command_buffer(cmd_buffer)?;
+            self.render_device.end_command_buffer(frame_cmd_buffer)?;
 
             // Queue submit
             // NOTE: This may require `device_mask` to be filled at a later date.
             // NOTE: Not sure it's necessary since we're only using one device.
             let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default()
-                .command_buffer(cmd_buffer);
+                .command_buffer(frame_cmd_buffer);
             let wait_sem_submit_info = vk::SemaphoreSubmitInfo::default()
-                .semaphore(available)
+                .semaphore(frame_available)
                 .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
             let signal_sem_submit_info = vk::SemaphoreSubmitInfo::default()
-                .semaphore(rendered)
+                .semaphore(frame_rendered)
                 .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
             let submit_info = vk::SubmitInfo2::default()
                 .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info))
@@ -382,12 +444,12 @@ impl Renderer {
             self.render_device.queue_submit2(
                 self.graphics_queue.handle,
                 slice::from_ref(&submit_info),
-                in_flight,
+                frame_in_flight,
             )?;
 
             // Queue present
             let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(slice::from_ref(&rendered))
+                .wait_semaphores(slice::from_ref(&frame_rendered))
                 .swapchains(slice::from_ref(&self.swapchain.handle))
                 .image_indices(slice::from_ref(&image_index));
 
@@ -398,7 +460,6 @@ impl Renderer {
         }
     }
 
-    #[rustfmt::skip]
     pub fn rebuild_swapchain(&mut self, extent: vk::Extent2D) -> VkResult<()> {
         unsafe {
             self.render_device.device_wait_idle()?;
@@ -443,24 +504,30 @@ impl Renderer {
     pub fn destroy(&mut self) -> VkResult<()> {
         unsafe {
             // NOTE: This call is the only reason this destroy
-            // NOTE: method is safe where all others are not.
+            // NOTE: method is not unsafe where all others are.
             self.render_device.device_wait_idle()?;
 
             self.index_src_buffer.destroy(&self.render_device);
             self.index_dst_buffer.destroy(&self.render_device);
             self.vertex_src_buffer.destroy(&self.render_device);
             self.vertex_dst_buffer.destroy(&self.render_device);
+            for ubo in self.uniform_buffers.iter() {
+                ubo.destroy(&self.render_device);
+            }
+            
+            self.render_device.destroy_descriptor_set_layout(self.ubo_desc_set_layout, None);
+            self.render_device.destroy_descriptor_pool(self.ubo_desc_pool, None);
 
-            for f in self.in_flight.iter() {
+            for f in self.in_flight_frames.iter() {
                 self.render_device.destroy_fence(*f, None);
             }
-            for s in self.available.iter() {
+            for s in self.available_frames.iter() {
                 self.render_device.destroy_semaphore(*s, None);
             }
-            for s in self.rendered.iter() {
+            for s in self.rendered_frames.iter() {
                 self.render_device.destroy_semaphore(*s, None);
             }
-            for p in self.cmd_pools.iter() {
+            for p in self.frame_cmd_pools.iter() {
                 self.render_device.destroy_command_pool(*p, None);
             }
 
@@ -469,6 +536,7 @@ impl Renderer {
             self.render_device.destroy_fence(self.init_cmd_fence, None);
             self.render_device.destroy_command_pool(self.init_cmd_pool, None);
 
+            self.render_device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             self.render_device.destroy_pipeline(self.graphics_pipeline, None);
             self.render_device.destroy_device(None);
 
@@ -534,19 +602,17 @@ fn create_pipeline_layout(render_device: &ash::Device, set_layouts: & [vk::Descr
 fn create_graphics_pipeline(
     surface: &Surface,
     render_device: &ash::Device,
-    vert_shader_module: vk::ShaderModule,
-    frag_shader_module: vk::ShaderModule,
+    shader_module: vk::ShaderModule,
     pipeline_layout: vk::PipelineLayout,
 ) -> VkResult<vk::Pipeline> {
-    let shader_entry_name = c"main";
-    let shader_stage_create_infos = [
+    let shader_stage_infos = [
         vk::PipelineShaderStageCreateInfo::default()
-            .module(vert_shader_module)
-            .name(shader_entry_name)
+            .module(shader_module)
+            .name(c"vertMain")
             .stage(vk::ShaderStageFlags::VERTEX),
         vk::PipelineShaderStageCreateInfo::default()
-            .module(frag_shader_module)
-            .name(shader_entry_name)
+            .module(shader_module)
+            .name(c"fragMain")
             .stage(vk::ShaderStageFlags::FRAGMENT),
     ];
 
@@ -601,10 +667,10 @@ fn create_graphics_pipeline(
 
     let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(slice::from_ref(&surface.format));
-
+    
     let graphics_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .push_next(&mut pipeline_rendering_info)
-        .stages(&shader_stage_create_infos)
+        .stages(&shader_stage_infos)
         .vertex_input_state(&vertex_input_state_info)
         .input_assembly_state(&vertex_input_assembly_state_info)
         .viewport_state(&viewport_state_info)
@@ -625,13 +691,13 @@ fn create_graphics_pipeline(
 }
 
 #[inline]
-fn create_index_src_buffer(
+fn create_transfer_src_buffer(
     adapter: &Adapter,
     render_device: &ash::Device,
-    element_count: vk::DeviceSize,
+    size: vk::DeviceSize,
 ) -> VkResult<Buffer> {
     let buffer_info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Index>() as vk::DeviceSize)
+        .size(size)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -669,28 +735,6 @@ fn create_index_dst_buffer(
 }
 
 #[inline]
-fn create_vertex_src_buffer(
-    adapter: &Adapter,
-    render_device: &ash::Device,
-    element_count: vk::DeviceSize,
-) -> VkResult<Buffer> {
-    let info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Vertex>() as vk::DeviceSize)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let offset = 0;
-
-    Buffer::new(
-        adapter,
-        render_device,
-        info,
-        flags,
-        offset,
-    )
-}
-
-#[inline]
 fn create_vertex_dst_buffer(
     adapter: &Adapter,
     render_device: &ash::Device,
@@ -713,32 +757,21 @@ fn create_vertex_dst_buffer(
 }
 
 #[inline]
-fn create_ubo_layout(render_device: &ash::Device) -> VkResult<vk::DescriptorSetLayout> {
-    let descriptor_set_layout_binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::VERTEX);
-    
-    let descriptor_set_layout_info = vk:: DescriptorSetLayoutCreateInfo::default()
-        .bindings(slice::from_ref(&descriptor_set_layout_binding));
-    
-    unsafe { render_device.create_descriptor_set_layout(&descriptor_set_layout_info, None) }
-}
-
-#[inline]
 fn create_uniform_buffers(
     adapter: &Adapter,
     render_device: &ash::Device,
     buffer_count: u32
 ) -> Vec<Buffer> {
     let info = vk::BufferCreateInfo::default()
-        .size(size_of::<TransformUniforms>() as vk::DeviceSize)
+        .size(size_of::<MvpMatrices>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    (0..buffer_count).map(|_|{
-     Buffer::new(adapter, render_device, info, flags, 0).expect("Could not create uniform buffer.")
-        
-    }).collect()
+
+    (0..buffer_count)
+        .map(|_| {
+            Buffer::new(adapter, render_device, info, flags, 0)
+                .expect("Could not create uniform buffer.")
+    })
+    .collect()
 }
