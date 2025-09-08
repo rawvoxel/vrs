@@ -144,15 +144,16 @@ impl Renderer {
             &render_device,
             12 * size_of::<Index>() as vk::DeviceSize
         )?;
+        let index_src_buffer_ptr = index_src_buffer.mem_map(&render_device, 0)?;
+        let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 12)?;
+
         let vertex_src_buffer = create_transfer_src_buffer(
             &discrete_gpu,
             &render_device,
             12 * size_of::<Vertex>() as vk::DeviceSize
         )?;
-        let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 12)?;
-        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
-        let index_src_buffer_ptr = index_src_buffer.mem_map(&render_device, 0)?;
         let vertex_src_buffer_ptr = vertex_src_buffer.mem_map(&render_device, 0)?;
+        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
 
         // Transition Depth Image Layout
         record_submit_commandbuffer(
@@ -320,6 +321,7 @@ impl Renderer {
             self.render_device.wait_for_fences(&[frame_in_flight], true, u64::MAX)?;
             self.render_device.reset_fences(&[frame_in_flight])?;
 
+            // Swapchain
             let (image_index, _suboptimal) = self.swapchain_device.acquire_next_image(
                 self.swapchain.handle,
                 u64::MAX,
@@ -327,7 +329,7 @@ impl Renderer {
                 vk::Fence::null(),
             )?;
 
-            // Mesh buffer transfers
+            // Mesh buffers
             self.index_src_buffer.mem_write(self.index_src_buffer_ptr, indices);
             self.vertex_src_buffer.mem_write(self.vertex_src_buffer_ptr, vertices);
             // NOTE: It may be wise to create a dedicated command buffer for transfers.
@@ -335,12 +337,14 @@ impl Renderer {
 
             // Uniform buffers
             let mvp_identity = MvpMatrices::default();
-            let u_ptr = self.uniform_buffer_ptrs[self.current_frame];
-            self.uniform_buffers[self.current_frame].mem_write(u_ptr, slice::from_ref(&mvp_identity));
-            // TODO
-            // self.render_device.update_descriptor_sets(descriptor_writes, descriptor_copies);
+            let uniform_buffer_ptr = self.uniform_buffer_ptrs[self.current_frame];
+            self.uniform_buffers[self.current_frame].mem_write(uniform_buffer_ptr, slice::from_ref(&mvp_identity));
 
-            // Commands
+            // Descriptor sets
+            // TODO
+            self.render_device.update_descriptor_sets(descriptor_writes, descriptor_copies);
+
+            // Command buffer
             let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.render_device.begin_command_buffer(frame_cmd_buffer, &command_buffer_begin_info)?;
@@ -442,7 +446,6 @@ impl Renderer {
                 .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info))
                 .wait_semaphore_infos(slice::from_ref(&wait_sem_submit_info))
                 .signal_semaphore_infos(slice::from_ref(&signal_sem_submit_info));
-
             self.render_device.queue_submit2(
                 self.graphics_queue.handle,
                 slice::from_ref(&submit_info),
@@ -454,7 +457,6 @@ impl Renderer {
                 .wait_semaphores(slice::from_ref(&frame_rendered))
                 .swapchains(slice::from_ref(&self.swapchain.handle))
                 .image_indices(slice::from_ref(&image_index));
-
             self.swapchain_device
                 .queue_present(self.graphics_queue.handle, &present_info)?;
             
@@ -475,7 +477,7 @@ impl Renderer {
                 &self.swapchain_device,
             )?;
 
-            // Depth Image Layout Transition
+            // Depth image layout transition
             record_submit_commandbuffer(
                 &self.render_device,
                 self.init_cmd_buffer,
