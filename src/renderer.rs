@@ -12,8 +12,10 @@ const FRAMES_IN_FLIGHT: u32 = 2;
 
 #[derive(Clone)]
 pub struct Renderer {
+    pub index_src_buffer_ptr: *mut c_void,
     pub index_src_buffer: Buffer,
     pub index_dst_buffer: Buffer,
+    pub vertex_src_buffer_ptr: *mut c_void,
     pub vertex_src_buffer: Buffer,
     pub vertex_dst_buffer: Buffer,
 
@@ -120,7 +122,7 @@ impl Renderer {
         let init_cmd_buffer = create_command_buffer(&render_device, init_cmd_pool, vk::CommandBufferLevel::PRIMARY)?;
         let init_cmd_fence = create_fence(&render_device)?;
 
-        // Frames in Flight Commands
+        // Frames in Flight
         let frame_cmd_pools = create_command_pools(
             &render_device,
             &graphics_queue_family,
@@ -136,7 +138,7 @@ impl Renderer {
         let rendered_frames = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
 
         // Mesh Buffers
-        // FIXME: Figure out where to put this, or how to initialize an upper limit for size.
+        // FIXME: Figure out how to initialize an upper limit for size.
         let index_src_buffer = create_transfer_src_buffer(
             &discrete_gpu,
             &render_device,
@@ -149,7 +151,10 @@ impl Renderer {
         )?;
         let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 12)?;
         let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
+        let index_src_buffer_ptr = index_src_buffer.mem_map(&render_device, 0)?;
+        let vertex_src_buffer_ptr = vertex_src_buffer.mem_map(&render_device, 0)?;
 
+        // Transition Depth Image Layout
         record_submit_commandbuffer(
             &render_device,
             init_cmd_buffer,
@@ -180,8 +185,10 @@ impl Renderer {
         }
 
         Ok(Self {
+            index_src_buffer_ptr,
             index_src_buffer,
             index_dst_buffer,
+            vertex_src_buffer_ptr,
             vertex_src_buffer,
             vertex_dst_buffer,
 
@@ -321,13 +328,8 @@ impl Renderer {
             )?;
 
             // Mesh buffer transfers
-            // FIXME: THIS IS BAD, MAP MEMORY ONCE.
-            let i_ptr = self.index_src_buffer.mem_map(&self.render_device, 0)?;
-            let v_ptr = self.vertex_src_buffer.mem_map(&self.render_device, 0)?;
-            self.index_src_buffer.mem_write(i_ptr, indices);
-            self.vertex_src_buffer.mem_write(v_ptr, vertices);
-            self.index_src_buffer.mem_unmap(&self.render_device);
-            self.vertex_src_buffer.mem_unmap(&self.render_device);
+            self.index_src_buffer.mem_write(self.index_src_buffer_ptr, indices);
+            self.vertex_src_buffer.mem_write(self.vertex_src_buffer_ptr, vertices);
             // NOTE: It may be wise to create a dedicated command buffer for transfers.
             self.transfer_mesh_buffers(indices, vertices, frame_cmd_buffer)?;
 
@@ -473,6 +475,7 @@ impl Renderer {
                 &self.swapchain_device,
             )?;
 
+            // Depth Image Layout Transition
             record_submit_commandbuffer(
                 &self.render_device,
                 self.init_cmd_buffer,
@@ -507,10 +510,13 @@ impl Renderer {
             // NOTE: method is not unsafe where all others are.
             self.render_device.device_wait_idle()?;
 
+            self.index_src_buffer.mem_unmap(&self.render_device);
             self.index_src_buffer.destroy(&self.render_device);
             self.index_dst_buffer.destroy(&self.render_device);
+            self.vertex_src_buffer.mem_unmap(&self.render_device);
             self.vertex_src_buffer.destroy(&self.render_device);
             self.vertex_dst_buffer.destroy(&self.render_device);
+
             for ubo in self.uniform_buffers.iter() {
                 ubo.destroy(&self.render_device);
             }
