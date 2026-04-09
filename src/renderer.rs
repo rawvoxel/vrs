@@ -342,7 +342,7 @@ impl Renderer {
 
             // Descriptor sets
             // TODO
-            self.render_device.update_descriptor_sets(descriptor_writes, descriptor_copies);
+            // self.render_device.update_descriptor_sets(descriptor_writes, descriptor_copies);
 
             // Command buffer
             let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
