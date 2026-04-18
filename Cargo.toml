@@ -1,5 +1,5 @@
 [package]
-name = "vulkan"
+name = "vrs"
 version = "0.1.0"
 authors = ["Robert A Ware"]
 edition = "2024"
