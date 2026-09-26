@@ -29,11 +29,8 @@ fn compile_slang_spv() {
     };
 
     if !needs_compilation {
-        println!("Slang shader is up-to-date. Skipping compilation.");
         return;
     }
-    
-    println!("Compiling Slang shader to SPIR-V...");
 
     // Run `slangc` with both entry points
     let status = Command::new("slangc")
@@ -50,6 +47,4 @@ fn compile_slang_spv() {
     if !status.success() {
         panic!("Shader compilation failed.");
     }
-
-    println!("Slang shader compiled successfully.");
 }

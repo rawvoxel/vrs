@@ -1,5 +1,5 @@
 use crate::{
-    adapter::Adapter, buffer::Buffer, descriptors::{create_descriptor_set, create_descriptor_set_layout}, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, uniforms::MvpMatrices, vertex::{Index, Vertex}, App
+    adapter::Adapter, buffer::Buffer, descriptors::{create_descriptor_set_layout, create_descriptor_sets}, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, uniforms::MvpMatrices, vertex::{Index, Vertex}, App
 };
 use crate::sync::{create_fence, create_fences, create_semaphores};
 use crate::descriptors::create_descriptor_pool;
@@ -35,7 +35,7 @@ pub struct Renderer {
 
     pub ubo_desc_pool: vk::DescriptorPool,
     pub ubo_desc_set_layout: vk::DescriptorSetLayout,
-    pub ubo_desc_set: vk::DescriptorSet,
+    pub ubo_desc_sets: Vec<vk::DescriptorSet>,
     pub uniform_buffers: Vec<Buffer>,
     pub uniform_buffer_ptrs: Vec<*mut c_void>,
 
@@ -81,14 +81,24 @@ impl Renderer {
         let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0);
 
         // Uniform Buffers
-        let ubo_desc_pool = create_descriptor_pool(&render_device, vk::DescriptorType::UNIFORM_BUFFER, 1, 1)?;
+        let ubo_desc_pool = create_descriptor_pool(
+            &render_device,
+            vk::DescriptorType::UNIFORM_BUFFER,
+            FRAMES_IN_FLIGHT,
+            FRAMES_IN_FLIGHT,
+        )?;
         let ubo_desc_set_layout = create_descriptor_set_layout(
             &render_device,
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::ShaderStageFlags::VERTEX,
         )?;
-        let ubo_desc_set = create_descriptor_set(&render_device, ubo_desc_pool, ubo_desc_set_layout)?;
+        let ubo_desc_sets = create_descriptor_sets(
+            &render_device,
+            ubo_desc_pool,
+            &vec![ubo_desc_set_layout; FRAMES_IN_FLIGHT as usize],
+        )?;
         let uniform_buffers = create_uniform_buffers(&discrete_gpu, &render_device, FRAMES_IN_FLIGHT);
+        write_uniform_descriptor_sets(&render_device, &ubo_desc_sets, &uniform_buffers);
         let uniform_buffer_ptrs = uniform_buffers.iter()
             .map(|b| {
                 b.mem_map(&render_device, 0).expect("Could not memory map buffers.")
@@ -202,7 +212,7 @@ impl Renderer {
 
             ubo_desc_pool,
             ubo_desc_set_layout,
-            ubo_desc_set,
+            ubo_desc_sets,
             uniform_buffers,
             uniform_buffer_ptrs,
 
@@ -340,10 +350,6 @@ impl Renderer {
             let uniform_buffer_ptr = self.uniform_buffer_ptrs[self.current_frame];
             self.uniform_buffers[self.current_frame].mem_write(uniform_buffer_ptr, slice::from_ref(&mvp_identity));
 
-            // Descriptor sets
-            // TODO
-            // self.render_device.update_descriptor_sets(descriptor_writes, descriptor_copies);
-
             // Command buffer
             let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -408,8 +414,8 @@ impl Renderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline_layout,
                 0,
-                &[self.ubo_desc_set],
-                &[1]
+                slice::from_ref(&self.ubo_desc_sets[self.current_frame]),
+                &[],
             );
 
             self.render_device.cmd_draw_indexed(frame_cmd_buffer, indices.len() as u32, 1, 0, 0, 0);
@@ -782,4 +788,35 @@ fn create_uniform_buffers(
                 .expect("Could not create uniform buffer.")
     })
     .collect()
+}
+
+/// Points each frame's descriptor set at that frame's uniform buffer.
+#[inline]
+fn write_uniform_descriptor_sets(
+    render_device: &ash::Device,
+    descriptor_sets: &[vk::DescriptorSet],
+    uniform_buffers: &[Buffer],
+) {
+    let buffer_infos: Vec<vk::DescriptorBufferInfo> = uniform_buffers
+        .iter()
+        .map(|buffer| {
+            vk::DescriptorBufferInfo::default()
+                .buffer(buffer.handle)
+                .offset(0)
+                .range(size_of::<MvpMatrices>() as vk::DeviceSize)
+        })
+        .collect();
+    let writes: Vec<vk::WriteDescriptorSet> = descriptor_sets
+        .iter()
+        .zip(buffer_infos.iter())
+        .map(|(&set, buffer_info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(slice::from_ref(buffer_info))
+        })
+        .collect();
+
+    unsafe { render_device.update_descriptor_sets(&writes, &[]) }
 }
