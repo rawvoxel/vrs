@@ -19,4 +19,4 @@ vk-mem = "0.3.0"
 criterion = "0.5"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 rand = "0.8"
-winit.workspace = true
+winit = "0.30.11"
