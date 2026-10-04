@@ -41,21 +41,19 @@ static const uint PHASE_OCCLUSION = 2;
 struct CullParams {
     // Rows of the view projection matrix.
     float4 viewProj[4];
-    uint candidateCount;
-    // Non-zero appends visible draws and counts them, otherwise every candidate
-    // keeps its own slot and culled draws get zero instances.
-    uint compact;
-    uint phase;
-    uint pyramidLevels;
     // Size of the depth buffer the pyramid was built from.
     uint2 depthSize;
+    uint candidateCount;
+    uint phase;
+    uint pyramidLevels;
 };
 
 [[vk::push_constant]] ConstantBuffer<CullParams> params;
 
 [[vk::binding(0, 0)]] RWStructuredBuffer<MeshInfo> meshes;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> candidates;
-// Phase 2 writes after phase 1's `candidateCount` draws, and counts in `drawCount[1]`.
+// Visible draws are appended and counted. Phase 2 writes after phase 1's `candidateCount`
+// draws, and counts in `drawCount[1]`.
 [[vk::binding(2, 0)]] RWStructuredBuffer<DrawIndexedIndirectCommand> draws;
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint> drawCount;
 // Each level's texels hold the farthest depth they cover, level 0 is half the depth size.
@@ -155,20 +153,19 @@ void cullMain(uint3 threadId: SV_DispatchThreadID) {
         meshes[meshIndex].visible = visibleNow ? 1 : 0;
     }
 
+    if (!visible) {
+        return;
+    }
     DrawIndexedIndirectCommand draw;
     draw.indexCount = mesh.indexCount;
-    draw.instanceCount = visible ? 1 : 0;
+    draw.instanceCount = 1;
     draw.firstIndex = mesh.firstIndex;
     // The mesh shaders pull vertices themselves, finding the mesh by its instance.
     draw.vertexOffset = 0;
     draw.firstInstance = meshIndex;
 
     uint firstDraw = params.phase == PHASE_OCCLUSION ? params.candidateCount : 0;
-    if (params.compact == 0) {
-        draws[firstDraw + candidate] = draw;
-    } else if (visible) {
-        uint slot;
-        InterlockedAdd(drawCount[params.phase == PHASE_OCCLUSION ? 1 : 0], 1, slot);
-        draws[firstDraw + slot] = draw;
-    }
+    uint slot;
+    InterlockedAdd(drawCount[params.phase == PHASE_OCCLUSION ? 1 : 0], 1, slot);
+    draws[firstDraw + slot] = draw;
 }

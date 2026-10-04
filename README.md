@@ -86,9 +86,9 @@ drop(renderer);
 
 - A GPU and driver supporting Vulkan 1.3. The renderer picks a discrete GPU first, then
   integrated, then anything else, that can also present to the window.
-- `drawIndirectFirstInstance` and `shaderDrawParameters`, which nearly every GPU has: each
-  indirect draw names its mesh by its first instance, which the mesh shaders read.
-- `multiDrawIndirect` and `drawIndirectCount` are used when supported, with fallbacks when not.
+- `drawIndirectFirstInstance`, `shaderDrawParameters`, `multiDrawIndirect` and
+  `drawIndirectCount`, which every desktop GPU has: each indirect draw names its mesh by its
+  first instance, which the mesh shaders read, and culling writes how many draws there are.
 - The compiled shaders in `assets/shader` are committed, so building only needs `slangc`, from
   the Vulkan SDK, after editing a `.slang` file.
 - Debug builds turn on the Vulkan validation layer when it's installed.
@@ -104,10 +104,8 @@ cargo run -p vrs --example stress -- --headless
 `triangle` is the classic Vulkan triangle. `stress` checks the renderer the way a voxel game
 uses it and exits with a failure code if anything's wrong:
 
-- Voxel chunks behind a wall, greedy and packed, are culled with different cameras and draw
-  paths, including the
-  fallbacks for devices without `multiDrawIndirect` or `drawIndirectCount`. Draw counts read
-  back from the GPU must match the meshes in view, and with occlusion culling, at least every
+- Voxel chunks behind a wall, greedy and packed, are culled with different cameras. Draw
+  counts read back from the GPU must match the meshes in view, and with occlusion culling, at least every
   mesh the wall can't hide.
 - A wall facing away from the camera must be skipped by backface culling.
 - Chunks are remeshed every frame against a nearly full mesh pool, while the window is
@@ -138,7 +136,6 @@ For tests and tools, these stall the GPU:
 
 - `Renderer::debug_frame_stats` reads back how many meshes the last frame drew.
 - `Renderer::debug_capture_next_frame` and `debug_read_capture` copy a frame back.
-- `Renderer::debug_limit_draw_paths` draws as if the device lacked features.
 - `Renderer::debug_mesh_pool_stats` reports the mesh pool's size and how often it repacked.
 - `debug::message_counts` counts validation errors and warnings.
 

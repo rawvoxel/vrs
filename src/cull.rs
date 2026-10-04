@@ -47,19 +47,16 @@ impl Phase {
 #[derive(Clone, Copy, Debug)]
 pub struct CullParams {
     pub view_proj_rows: [[f32; 4]; 4],
+    pub depth_size: [u32; 2],
     pub candidate_count: u32,
-    pub compact: u32,
     pub phase: u32,
     pub pyramid_levels: u32,
-    pub depth_size: [u32; 2],
 }
 
 /// Culls a frame's meshes on the device, writing indirect draws for the visible ones.
 ///
-/// Each frame's draw buffer has room for two phases of draws, see `Phase`.
-/// Compacted draws are counted on the device for `cmd_draw_indexed_indirect_count`, which
-/// needs the `drawIndirectCount` feature. Otherwise every mesh keeps a draw, with
-/// culled ones drawing zero instances.
+/// Each frame's draw buffer has room for two phases of draws, see `Phase`. Visible draws
+/// are packed together and counted on the device, for `cmd_draw_indexed_indirect_count`.
 pub struct Culler {
     pub pipeline: vk::Pipeline,
     pub pipeline_layout: vk::PipelineLayout,
@@ -71,8 +68,6 @@ pub struct Culler {
     pub frame_draw_buffers: Vec<DynamicBuffer>,
     /// One draw count per phase region.
     pub frame_count_buffers: Vec<Buffer>,
-    /// Whether the device supports counting draws, see `Culler`.
-    pub can_compact: bool,
 }
 
 impl Culler {
@@ -80,9 +75,8 @@ impl Culler {
         adapter: &Adapter,
         logical_device: &ash::Device,
         frames_in_flight: u32,
-        can_compact: bool,
     ) -> VkResult<Self> {
-        let mut culler = Self::null(can_compact);
+        let mut culler = Self::null();
         if let Err(err) = culler.create(adapter, logical_device, frames_in_flight) {
             unsafe { culler.destroy(logical_device) };
             return Err(err);
@@ -91,7 +85,7 @@ impl Culler {
     }
 
     /// Owns nothing, destroying it does nothing.
-    pub fn null(can_compact: bool) -> Self {
+    pub fn null() -> Self {
         Self {
             pipeline: vk::Pipeline::null(),
             pipeline_layout: vk::PipelineLayout::null(),
@@ -101,7 +95,6 @@ impl Culler {
             frame_candidate_buffers: Vec::new(),
             frame_draw_buffers: Vec::new(),
             frame_count_buffers: Vec::new(),
-            can_compact,
         }
     }
 
@@ -246,7 +239,7 @@ impl Culler {
             logical_device.update_descriptor_sets(&writes, &[]);
 
             // Last frame's phase 2 updated mesh visibility, which this frame reads.
-            // The draw counts are reset for compacting.
+            // The draw counts are reset.
             logical_device.cmd_fill_buffer(cmd_buffer, count_buffer, 0, vk::WHOLE_SIZE, 0);
             let barrier = vk::MemoryBarrier2::default()
                 .src_stage_mask(
@@ -272,7 +265,7 @@ impl Culler {
     /// pyramid built and ready for compute reads.
     ///
     /// # Safety
-    /// `prepare` must have been called this frame, and `compact` needs `can_compact`.
+    /// `prepare` must have been called this frame.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn cmd_cull(
         &self,
@@ -283,23 +276,20 @@ impl Culler {
         candidate_count: u32,
         view_proj: Mat4,
         phase: Phase,
-        compact: bool,
     ) {
-        debug_assert!(!compact || self.can_compact);
         if candidate_count == 0 {
             return;
         }
 
         let params = CullParams {
             view_proj_rows: [0, 1, 2, 3].map(|row| view_proj.row(row).to_array()),
-            candidate_count,
-            compact: compact as u32,
-            phase: phase as u32,
-            pyramid_levels: depth_pyramid.levels,
             depth_size: [
                 depth_pyramid.depth_extent.width,
                 depth_pyramid.depth_extent.height,
             ],
+            candidate_count,
+            phase: phase as u32,
+            pyramid_levels: depth_pyramid.levels,
         };
 
         unsafe {

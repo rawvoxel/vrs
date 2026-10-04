@@ -8,7 +8,6 @@ use ash::{prelude::VkResult, vk};
 pub(super) struct LastFrame {
     pub frame: usize,
     pub meshes: u32,
-    pub compact: bool,
 }
 
 /// How many of a frame's meshes were drawn, read back from the device.
@@ -18,10 +17,7 @@ pub struct FrameStats {
     pub meshes: u32,
     /// Meshes each pass drew: what was visible last frame, then what occlusion culling
     /// found newly visible. Without occlusion culling there's only the first pass.
-    ///
-    /// `None` when the frame's draws weren't counted on the device, which needs the
-    /// `drawIndirectCount` feature and at most `maxDrawIndirectCount` meshes.
-    pub drawn: Option<[u32; 2]>,
+    pub drawn: [u32; 2],
 }
 
 /// The mesh pool's size and how often it's been repacked.
@@ -39,8 +35,8 @@ pub struct MeshPoolStats {
 impl FrameStats {
     /// Meshes drawn across both passes.
     #[inline]
-    pub fn total_drawn(&self) -> Option<u32> {
-        self.drawn.map(|[first, second]| first + second)
+    pub fn total_drawn(&self) -> u32 {
+        self.drawn[0] + self.drawn[1]
     }
 }
 
@@ -52,18 +48,12 @@ impl Renderer {
         let Some(last) = &self.last_frame else {
             return Ok(None);
         };
-        let (frame, meshes, compact) = (last.frame, last.meshes, last.compact);
+        let (frame, meshes) = (last.frame, last.meshes);
         // Culling didn't run, so the counts were never reset.
         if meshes == 0 {
             return Ok(Some(FrameStats {
                 meshes,
-                drawn: Some([0, 0]),
-            }));
-        }
-        if !compact {
-            return Ok(Some(FrameStats {
-                meshes,
-                drawn: None,
+                drawn: [0, 0],
             }));
         }
 
@@ -107,7 +97,7 @@ impl Renderer {
 
         Ok(Some(FrameStats {
             meshes,
-            drawn: Some(read?),
+            drawn: read?,
         }))
     }
 
@@ -120,16 +110,5 @@ impl Renderer {
             defrags: repacks.defrags,
             growths: repacks.growths,
         }
-    }
-
-    /// Draws as if the device lacked features, to test the fallbacks on any device.
-    ///
-    /// `compact` off stops counting draws on the device, and `max_batch` limits the draws
-    /// per indirect call, 1 being what a device without `multiDrawIndirect` does.
-    /// Neither can enable more than the device supports.
-    pub fn debug_limit_draw_paths(&mut self, compact: bool, max_batch: u32) {
-        let (device_compact, device_batch) = self.device_draw_paths;
-        self.culler.can_compact = compact && device_compact;
-        self.indirect_draw_batch = max_batch.clamp(1, device_batch);
     }
 }

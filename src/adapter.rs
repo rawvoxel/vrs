@@ -24,12 +24,6 @@ impl Adapter {
         &self.features
     }
 
-    /// The Vulkan 1.2 `drawIndirectCount` feature.
-    #[inline]
-    pub fn supports_draw_indirect_count(&self) -> bool {
-        self.draw_indirect_count
-    }
-
     #[inline]
     pub fn properties(&self) -> &vk::PhysicalDeviceProperties {
         &self.properties
@@ -104,11 +98,14 @@ impl Adapter {
     }
 
     /// Whether it has every feature the renderer needs: Vulkan 1.3, for dynamic rendering and
-    /// synchronization2, and indirect draws that name their mesh by their first instance.
+    /// synchronization2, indirect draws that name their mesh by their first instance, and
+    /// indirect draws whose count the device writes.
     #[inline]
     pub fn supports_renderer(&self) -> bool {
         self.supports_vulkan_1_3()
             && self.features.draw_indirect_first_instance == vk::TRUE
+            && self.features.multi_draw_indirect == vk::TRUE
+            && self.draw_indirect_count
             && self.shader_draw_parameters
     }
 

@@ -23,7 +23,6 @@ impl Renderer {
         let candidate_count = data.candidate_count();
         let culling = candidate_count > 0;
         let occlusion = culling && self.occlusion_culling;
-        let compact = self.compacts(candidate_count);
         let first_phase = match occlusion {
             true => Phase::LastVisible,
             false => Phase::Frustum,
@@ -49,7 +48,7 @@ impl Renderer {
                     cmd_buffer,
                     &data.candidates,
                 )?;
-                self.cmd_cull(cmd_buffer, frame, data, first_phase, compact);
+                self.cmd_cull(cmd_buffer, frame, data, first_phase);
             }
 
             self.cmd_begin_attachments(cmd_buffer, image_index);
@@ -58,7 +57,7 @@ impl Renderer {
             self.cmd_begin_rendering(cmd_buffer, color_view, vk::AttachmentLoadOp::CLEAR);
             self.cmd_bind_graphics(cmd_buffer, frame);
             if culling {
-                self.cmd_draw_meshes(cmd_buffer, frame, first_phase, candidate_count, compact);
+                self.cmd_draw_meshes(cmd_buffer, frame, first_phase, candidate_count);
             }
             if data.dynamic_index_count > 0 {
                 self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
@@ -67,19 +66,13 @@ impl Renderer {
 
             if occlusion {
                 self.cmd_build_depth_pyramid(cmd_buffer);
-                self.cmd_cull(cmd_buffer, frame, data, Phase::Occlusion, compact);
+                self.cmd_cull(cmd_buffer, frame, data, Phase::Occlusion);
                 self.cmd_resume_attachments(cmd_buffer);
 
                 // Pass 2, what phase 2 found newly visible
                 self.cmd_begin_rendering(cmd_buffer, color_view, vk::AttachmentLoadOp::LOAD);
                 self.cmd_bind_graphics(cmd_buffer, frame);
-                self.cmd_draw_meshes(
-                    cmd_buffer,
-                    frame,
-                    Phase::Occlusion,
-                    candidate_count,
-                    compact,
-                );
+                self.cmd_draw_meshes(cmd_buffer, frame, Phase::Occlusion, candidate_count);
                 self.render_device.cmd_end_rendering(cmd_buffer);
             }
 
@@ -125,7 +118,6 @@ impl Renderer {
         frame: usize,
         data: &FrameData,
         phase: Phase,
-        compact: bool,
     ) {
         unsafe {
             self.culler.cmd_cull(
@@ -136,7 +128,6 @@ impl Renderer {
                 data.candidate_count(),
                 data.view_proj,
                 phase,
-                compact,
             )
         };
     }
@@ -337,7 +328,6 @@ impl Renderer {
         frame: usize,
         phase: Phase,
         candidate_count: u32,
-        compact: bool,
     ) {
         // The mesh shaders pull vertices themselves, there's no vertex buffer.
         self.cmd_bind_pipeline(cmd_buffer, self.mesh_pipeline);
@@ -353,30 +343,16 @@ impl Renderer {
         let region = phase.draw_region();
         let first_draw_offset =
             region as vk::DeviceSize * candidate_count as vk::DeviceSize * DRAW_STRIDE;
-        let stride = DRAW_STRIDE as u32;
         unsafe {
-            if compact {
-                self.render_device.cmd_draw_indexed_indirect_count(
-                    cmd_buffer,
-                    draw_buffer,
-                    first_draw_offset,
-                    self.culler.frame_count_buffers[frame].handle,
-                    region as vk::DeviceSize * size_of::<u32>() as vk::DeviceSize,
-                    candidate_count,
-                    stride,
-                );
-            } else {
-                // Culled meshes still have a draw, of zero instances.
-                for first_draw in (0..candidate_count).step_by(self.indirect_draw_batch as usize) {
-                    self.render_device.cmd_draw_indexed_indirect(
-                        cmd_buffer,
-                        draw_buffer,
-                        first_draw_offset + first_draw as vk::DeviceSize * DRAW_STRIDE,
-                        self.indirect_draw_batch.min(candidate_count - first_draw),
-                        stride,
-                    );
-                }
-            }
+            self.render_device.cmd_draw_indexed_indirect_count(
+                cmd_buffer,
+                draw_buffer,
+                first_draw_offset,
+                self.culler.frame_count_buffers[frame].handle,
+                region as vk::DeviceSize * size_of::<u32>() as vk::DeviceSize,
+                candidate_count,
+                DRAW_STRIDE as u32,
+            );
         }
     }
 }

@@ -54,15 +54,10 @@ impl Renderer {
             surface.extent(window_width, window_height, &adapter, &surface_instance)?;
 
         // Render Device
-        let multi_draw_indirect = adapter.features.multi_draw_indirect == vk::TRUE;
-        // Compacting needs to draw every visible mesh in one counted call.
-        let draw_indirect_count = adapter.draw_indirect_count && multi_draw_indirect;
         let render_device = create_render_device(
             app,
             &adapter,
             &graphics_queue_family,
-            multi_draw_indirect,
-            draw_indirect_count,
             !surface.is_offscreen(),
         )?;
 
@@ -75,13 +70,8 @@ impl Renderer {
             clear_color: DEFAULT_CLEAR_COLOR,
 
             mesh_pool: MeshPool::null(config.mesh_capacity, FRAMES_IN_FLIGHT as usize),
-            culler: Culler::null(draw_indirect_count),
+            culler: Culler::null(),
             depth_pyramid: DepthPyramid::null(),
-            indirect_draw_batch: match multi_draw_indirect {
-                true => adapter.properties.limits.max_draw_indirect_count,
-                false => 1,
-            },
-            device_draw_paths: (draw_indirect_count, 1),
             last_frame: None,
             capture_requested: false,
             capture_buffers: Vec::new(),
@@ -124,7 +114,6 @@ impl Renderer {
             surface_instance,
             adapter,
         };
-        renderer.device_draw_paths.1 = renderer.indirect_draw_batch;
         renderer.create(surface_extent, config.mesh_capacity)?;
         Ok(renderer)
     }
@@ -240,7 +229,7 @@ impl Renderer {
         // Meshes
         self.mesh_pool =
             MeshPool::new(&adapter, &device, mesh_capacity, FRAMES_IN_FLIGHT as usize)?;
-        self.culler = Culler::new(&adapter, &device, FRAMES_IN_FLIGHT, self.culler.can_compact)?;
+        self.culler = Culler::new(&adapter, &device, FRAMES_IN_FLIGHT)?;
         self.depth_pyramid = DepthPyramid::new(
             &adapter,
             &device,

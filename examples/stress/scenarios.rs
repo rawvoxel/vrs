@@ -35,8 +35,6 @@ pub enum Expect {
     Occluded,
     /// Only the wall, which hides everything else.
     OnlyWall,
-    /// The draw path doesn't count draws, so only validation is checked.
-    Uncounted,
 }
 
 /// Forcing the mesh pool to repack, after the scene is filled.
@@ -60,14 +58,10 @@ pub struct Scenario {
     pub occlusion: bool,
     /// Remesh chunks every frame, and resize and minimize the window.
     pub remesh: bool,
-    /// See `Renderer::debug_limit_draw_paths`.
-    pub draw_paths: (bool, u32),
     /// The pool only grows for `PoolTest::Grow`.
     pub pool: PoolTest,
     pub expect: Expect,
 }
-
-pub const ALL_PATHS: (bool, u32) = (true, u32::MAX);
 
 pub const SCENARIOS: &[Scenario] = &[
     Scenario {
@@ -78,7 +72,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: false,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::None,
         expect: Expect::FrustumOnly,
     },
@@ -90,7 +83,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: false,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::None,
         expect: Expect::FrustumOnly,
     },
@@ -102,7 +94,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: true,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::None,
         expect: Expect::Occluded,
     },
@@ -114,7 +105,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: true,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::None,
         expect: Expect::Occluded,
     },
@@ -126,7 +116,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: true,
         occlusion: true,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::None,
         expect: Expect::Occluded,
     },
@@ -138,7 +127,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: true,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::None,
         expect: Expect::OnlyWall,
     },
@@ -150,33 +138,8 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: true,
         remesh: true,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::None,
         expect: Expect::Occluded,
-    },
-    Scenario {
-        name: "remeshing, uncounted draws",
-        frames: 240,
-        camera: Camera::Perspective,
-        wall: true,
-        wall_faces_away: false,
-        occlusion: true,
-        remesh: true,
-        draw_paths: (false, u32::MAX),
-        pool: PoolTest::None,
-        expect: Expect::Uncounted,
-    },
-    Scenario {
-        name: "remeshing, 7 draws per call",
-        frames: 240,
-        camera: Camera::Perspective,
-        wall: true,
-        wall_faces_away: false,
-        occlusion: true,
-        remesh: true,
-        draw_paths: (true, 7),
-        pool: PoolTest::None,
-        expect: Expect::Uncounted,
     },
     Scenario {
         name: "defragmenting the mesh pool",
@@ -186,7 +149,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: true,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::Defragment,
         expect: Expect::Occluded,
     },
@@ -198,7 +160,6 @@ pub const SCENARIOS: &[Scenario] = &[
         wall_faces_away: false,
         occlusion: true,
         remesh: false,
-        draw_paths: ALL_PATHS,
         pool: PoolTest::Grow,
         expect: Expect::Occluded,
     },

@@ -65,10 +65,6 @@ pub struct Renderer {
     culler: Culler,
     /// Built from each frame's depth between its two culling phases.
     depth_pyramid: DepthPyramid,
-    /// Most draws one indirect call can make, 1 without the `multiDrawIndirect` feature.
-    indirect_draw_batch: u32,
-    /// What the device supports, which `debug_limit_draw_paths` limits the above to.
-    device_draw_paths: (bool, u32),
     /// What `debug_frame_stats` reads back.
     last_frame: Option<debug::LastFrame>,
     /// Whether the next frame is copied into `capture_buffers`.
@@ -150,6 +146,9 @@ impl Renderer {
     }
 
     /// Renders and presents a frame, skipping it while the window is minimized.
+    ///
+    /// Fails with `ERROR_TOO_MANY_OBJECTS` when `draws` lists more meshes than the device's
+    /// `maxDrawIndirectCount`, which is `u32::MAX` on desktop drivers.
     pub fn submit(
         &mut self,
         window_width: u32,
@@ -170,6 +169,11 @@ impl Renderer {
             self.rebuild_swapchain(surface_extent)?;
         }
 
+        // Every visible mesh is drawn by one counted indirect call.
+        if draws.meshes.len() > self.adapter.properties.limits.max_draw_indirect_count as usize {
+            return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+        }
+
         let frame = self.current_frame;
         let Some(image_index) = self.acquire_image(frame, surface_extent)? else {
             return Ok(());
@@ -180,18 +184,10 @@ impl Renderer {
         self.last_frame = Some(debug::LastFrame {
             frame,
             meshes: data.candidates.len() as u32,
-            compact: self.compacts(data.candidates.len() as u32),
         });
 
         self.current_frame = (self.current_frame + 1) % self.in_flight_frames.len();
         Ok(())
-    }
-
-    /// Whether a frame with `candidate_count` meshes compacts and counts its draws.
-    /// A counted draw can't be split, so too many meshes fall back to one draw each.
-    #[inline]
-    fn compacts(&self, candidate_count: u32) -> bool {
-        self.culler.can_compact && candidate_count <= self.indirect_draw_batch
     }
 
     fn rebuild_swapchain(&mut self, extent: vk::Extent2D) -> VkResult<()> {

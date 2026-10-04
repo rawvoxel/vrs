@@ -6,8 +6,6 @@ pub(super) fn create_render_device(
     app: &App,
     adapter: &Adapter,
     queue_family: &QueueFamily,
-    multi_draw_indirect: bool,
-    draw_indirect_count: bool,
     swapchain: bool,
 ) -> VkResult<ash::Device> {
     let queue_priorities = [1.0];
@@ -24,9 +22,10 @@ pub(super) fn create_render_device(
     extension_names_raw.push(khr::portability_subset::NAME.as_ptr());
 
     // NOTE: Keep in mind proper ordering when adding features.
-    // Indirect draws name their mesh by their first instance, which the mesh shaders read.
+    // Indirect draws name their mesh by their first instance, which the mesh shaders read,
+    // and culling writes how many draws there are.
     let features = vk::PhysicalDeviceFeatures::default()
-        .multi_draw_indirect(multi_draw_indirect)
+        .multi_draw_indirect(true)
         .draw_indirect_first_instance(true);
     let mut vulkan_11_features =
         vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
@@ -35,7 +34,7 @@ pub(super) fn create_render_device(
     let mut dynamic_rendering =
         vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
     let mut vulkan_12_features =
-        vk::PhysicalDeviceVulkan12Features::default().draw_indirect_count(draw_indirect_count);
+        vk::PhysicalDeviceVulkan12Features::default().draw_indirect_count(true);
 
     let device_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(slice::from_ref(&device_queue_info))

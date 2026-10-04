@@ -4,8 +4,8 @@
 //! `-- --headless` renders without a window, such as on a CI machine with a software
 //! Vulkan driver like lavapipe.
 //!
-//! A grid of chunk meshes sits behind a wall mesh. Scenarios cull it with different cameras
-//! and draw paths, remesh chunks every frame against a nearly full mesh pool, and resize and
+//! A grid of chunk meshes sits behind a wall mesh. Scenarios cull it with different cameras,
+//! remesh chunks every frame against a nearly full mesh pool, and resize and
 //! minimize the window. Each one compares the draw counts read back from the device with the
 //! meshes that are actually in view, and with occlusion culling, those the wall can't hide.
 //! Then it captures the last frame and checks each chunk shows the color it should, which
@@ -155,8 +155,6 @@ impl Stress {
         scene.renderer.occlusion_culling = scenario.occlusion;
         scene.renderer.grow_mesh_pool = scenario.pool == PoolTest::Grow;
         self.pool_at_start = Some(scene.renderer.debug_mesh_pool_stats());
-        let (compact, max_batch) = scenario.draw_paths;
-        scene.renderer.debug_limit_draw_paths(compact, max_batch);
         self.target.as_mut().unwrap().resize(START_SIZE);
         self.frame = 0;
         self.out_of_room = 0;
@@ -289,17 +287,12 @@ impl Stress {
 
         let drawn = stats.total_drawn();
         let failure =
-            match (scenario.expect, drawn) {
-                (Expect::Uncounted, None) => None,
-                (Expect::Uncounted, Some(_)) => {
-                    Some("draws were counted on an uncounted draw path".to_string())
-                }
-                (_, None) => Some("draws weren't counted".to_string()),
-                (Expect::FrustumOnly, Some(drawn)) => (drawn != in_view)
+            match scenario.expect {
+                Expect::FrustumOnly => (drawn != in_view)
                     .then(|| format!("drew {drawn} meshes, {in_view} are in view")),
-                (Expect::Occluded, Some(drawn)) => (drawn < must_draw || drawn > in_view)
+                Expect::Occluded => (drawn < must_draw || drawn > in_view)
                     .then(|| format!("drew {drawn} meshes, expected {must_draw} to {in_view}")),
-                (Expect::OnlyWall, Some(drawn)) => (drawn != 1)
+                Expect::OnlyWall => (drawn != 1)
                     .then(|| format!("drew {drawn} meshes, the wall hides all but itself")),
             };
         if let Some(failure) = failure {
