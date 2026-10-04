@@ -1,32 +1,58 @@
 use crate::{
     adapter::Adapter,
     buffer::{Buffer, DynamicBuffer},
-    descriptors::create_descriptor_pool,
+    hiz::DepthPyramid,
     mesh::MeshPool,
     renderer::create_shader_module,
 };
 use ash::{prelude::VkResult, vk};
 use glam::{Mat4, Vec4};
-use std::slice;
+use std::{ffi::CStr, slice};
 
 const CULL_SPV: &[u8] = include_bytes!("../assets/shader/cull.spv");
 /// Matches `numthreads` in `cull.slang`.
 const WORKGROUP_SIZE: u32 = 64;
 /// Starting number of meshes each frame's buffers fit, they grow to fit.
 const INITIAL_CANDIDATES: vk::DeviceSize = 1024;
-const DRAW_STRIDE: vk::DeviceSize = size_of::<vk::DrawIndexedIndirectCommand>() as vk::DeviceSize;
+pub const DRAW_STRIDE: vk::DeviceSize =
+    size_of::<vk::DrawIndexedIndirectCommand>() as vk::DeviceSize;
+
+/// Which culling pass to run, matches the `PHASE_` constants in `cull.slang`.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Frustum culling only, without occlusion.
+    Frustum = 0,
+    /// Draws meshes visible last frame, to build the depth pyramid from.
+    LastVisible = 1,
+    /// Tests meshes against the depth pyramid, drawing newly visible ones after
+    /// phase 1's draws and remembering what's visible for next frame.
+    Occlusion = 2,
+}
+
+impl Phase {
+    /// Which half of the frame's draws, and which draw count, this phase writes.
+    #[inline]
+    pub fn draw_region(self) -> u32 {
+        (self == Phase::Occlusion) as u32
+    }
+}
 
 /// Matches `CullParams` in `cull.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct CullParams {
-    pub planes: [[f32; 4]; 6],
+    pub view_proj_rows: [[f32; 4]; 4],
     pub candidate_count: u32,
     pub compact: u32,
+    pub phase: u32,
+    pub pyramid_levels: u32,
+    pub depth_size: [u32; 2],
 }
 
-/// Frustum culls a frame's meshes on the device, writing indirect draws for the visible ones.
+/// Culls a frame's meshes on the device, writing indirect draws for the visible ones.
 ///
+/// Each frame's draw buffer has room for two phases of draws, see `Phase`.
 /// Compacted draws are counted on the device for `cmd_draw_indexed_indirect_count`, which
 /// needs the `drawIndirectCount` feature. Otherwise every mesh keeps a draw, with
 /// culled ones drawing zero instances.
@@ -39,6 +65,7 @@ pub struct Culler {
     /// `MeshPool::info_buffer` indices to cull, written by the host.
     pub frame_candidate_buffers: Vec<DynamicBuffer>,
     pub frame_draw_buffers: Vec<DynamicBuffer>,
+    /// One draw count per phase region.
     pub frame_count_buffers: Vec<Buffer>,
     /// Whether the device supports counting draws, see `Culler`.
     pub can_compact: bool,
@@ -51,45 +78,40 @@ impl Culler {
         frames_in_flight: u32,
         can_compact: bool,
     ) -> VkResult<Self> {
-        let desc_set_layout = create_desc_set_layout(logical_device)?;
-        let desc_pool = create_descriptor_pool(
+        // Mesh infos, candidates, draws, draw counts and the depth pyramid.
+        let desc_set_layout = create_desc_set_layout(
             logical_device,
-            vk::DescriptorType::STORAGE_BUFFER,
-            4 * frames_in_flight,
+            &[
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::DescriptorType::SAMPLED_IMAGE,
+            ],
+        )?;
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(4 * frames_in_flight),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(frames_in_flight),
+        ];
+        let desc_pool = create_desc_pool(logical_device, &pool_sizes, frames_in_flight)?;
+        let frame_desc_sets = allocate_desc_sets(
+            logical_device,
+            desc_pool,
+            desc_set_layout,
             frames_in_flight,
         )?;
-        let set_layouts = vec![desc_set_layout; frames_in_flight as usize];
-        let desc_set_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(desc_pool)
-            .set_layouts(&set_layouts);
-        let frame_desc_sets = unsafe { logical_device.allocate_descriptor_sets(&desc_set_info)? };
 
-        let push_constant_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .size(size_of::<CullParams>() as u32);
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(slice::from_ref(&desc_set_layout))
-            .push_constant_ranges(slice::from_ref(&push_constant_range));
-        let pipeline_layout =
-            unsafe { logical_device.create_pipeline_layout(&pipeline_layout_info, None)? };
-
-        let shader_module = create_shader_module(logical_device, CULL_SPV)?;
-        let stage_info = vk::PipelineShaderStageCreateInfo::default()
-            .module(shader_module)
-            .name(c"cullMain")
-            .stage(vk::ShaderStageFlags::COMPUTE);
-        let pipeline_info = vk::ComputePipelineCreateInfo::default()
-            .stage(stage_info)
-            .layout(pipeline_layout);
-        let pipeline = unsafe {
-            let pipelines = logical_device.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                slice::from_ref(&pipeline_info),
-                None,
-            );
-            logical_device.destroy_shader_module(shader_module, None);
-            pipelines.map_err(|(_, err)| err)?[0]
-        };
+        let (pipeline, pipeline_layout) = create_compute_pipeline(
+            logical_device,
+            CULL_SPV,
+            c"cullMain",
+            desc_set_layout,
+            size_of::<CullParams>() as u32,
+        )?;
 
         let frame_candidate_buffers = (0..frames_in_flight)
             .map(|_| {
@@ -108,17 +130,17 @@ impl Culler {
                     logical_device,
                     vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
                     vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    INITIAL_CANDIDATES * DRAW_STRIDE,
+                    2 * INITIAL_CANDIDATES * DRAW_STRIDE,
                 )
             })
             .collect::<VkResult<Vec<_>>>()?;
         let count_info = vk::BufferCreateInfo::default()
-            .size(size_of::<u32>() as vk::DeviceSize)
+            .size(2 * size_of::<u32>() as vk::DeviceSize)
             .usage(
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::INDIRECT_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
-                    // Lets the count be read back when debugging.
+                    // Lets the counts be read back when debugging.
                     | vk::BufferUsageFlags::TRANSFER_SRC,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -147,34 +169,25 @@ impl Culler {
         })
     }
 
-    /// Records culling `candidates`, indices into `mesh_pool.info_buffer`, against the
-    /// frustum of `view_proj`. Draws are ready for `DRAW_INDIRECT` afterwards, compacted
-    /// and counted in `frame_count_buffers[frame]` when `compact`.
+    /// Writes this frame's `candidates`, indices into `mesh_pool.info_buffer`, binds its
+    /// buffers and records resetting its draw counts. Call once a frame before `cmd_cull`.
     ///
     /// # Safety
-    /// The device must not be using this frame's buffers, and `compact` needs `can_compact`.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn cmd_cull(
+    /// The device must not be using this frame's buffers or descriptor set.
+    pub unsafe fn prepare(
         &mut self,
         adapter: &Adapter,
         logical_device: &ash::Device,
         mesh_pool: &MeshPool,
+        depth_pyramid: &DepthPyramid,
         frame: usize,
         cmd_buffer: vk::CommandBuffer,
         candidates: &[u32],
-        view_proj: Mat4,
-        compact: bool,
     ) -> VkResult<()> {
-        debug_assert!(!compact || self.can_compact);
-        let candidate_count = candidates.len() as u32;
-        if candidate_count == 0 {
-            return Ok(());
-        }
-
-        let draw_buffer = &mut self.frame_draw_buffers[frame];
+        let draws_size = 2 * candidates.len() as vk::DeviceSize * DRAW_STRIDE;
         unsafe {
             self.frame_candidate_buffers[frame].write(adapter, logical_device, candidates)?;
-            draw_buffer.reserve(adapter, logical_device, candidates.len() as u64 * DRAW_STRIDE)?;
+            self.frame_draw_buffers[frame].reserve(adapter, logical_device, draws_size)?;
         }
         let count_buffer = self.frame_count_buffers[frame].handle;
 
@@ -190,8 +203,11 @@ impl Culler {
                 .buffer(buffer)
                 .range(vk::WHOLE_SIZE)
         });
+        let pyramid_info = vk::DescriptorImageInfo::default()
+            .image_view(depth_pyramid.view)
+            .image_layout(vk::ImageLayout::GENERAL);
         let desc_set = self.frame_desc_sets[frame];
-        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
+        let mut writes: Vec<vk::WriteDescriptorSet> = buffer_infos
             .iter()
             .enumerate()
             .map(|(binding, buffer_info)| {
@@ -202,31 +218,75 @@ impl Culler {
                     .buffer_info(slice::from_ref(buffer_info))
             })
             .collect();
-
-        let params = CullParams {
-            planes: frustum_planes(view_proj).map(|plane| plane.to_array()),
-            candidate_count,
-            compact: compact as u32,
-        };
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(desc_set)
+                .dst_binding(4)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(slice::from_ref(&pyramid_info)),
+        );
 
         unsafe {
             logical_device.update_descriptor_sets(&writes, &[]);
 
-            if compact {
-                logical_device.cmd_fill_buffer(cmd_buffer, count_buffer, 0, vk::WHOLE_SIZE, 0);
-                let clear_barrier = vk::MemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::CLEAR)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(
-                        vk::AccessFlags2::SHADER_STORAGE_READ
-                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                    );
-                let clear_dependency =
-                    vk::DependencyInfo::default().memory_barriers(slice::from_ref(&clear_barrier));
-                logical_device.cmd_pipeline_barrier2(cmd_buffer, &clear_dependency);
-            }
+            // Last frame's phase 2 updated mesh visibility, which this frame reads.
+            // The draw counts are reset for compacting.
+            logical_device.cmd_fill_buffer(cmd_buffer, count_buffer, 0, vk::WHOLE_SIZE, 0);
+            let barrier = vk::MemoryBarrier2::default()
+                .src_stage_mask(
+                    vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::CLEAR,
+                )
+                .src_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_WRITE | vk::AccessFlags2::TRANSFER_WRITE,
+                )
+                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                .dst_access_mask(
+                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                );
+            let dependency_info =
+                vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));
+            logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
+        }
 
+        Ok(())
+    }
+
+    /// Records culling this frame's candidates against `view_proj`, after which the
+    /// phase's draws are ready for `DRAW_INDIRECT`. `Phase::Occlusion` needs the depth
+    /// pyramid built and ready for compute reads.
+    ///
+    /// # Safety
+    /// `prepare` must have been called this frame, and `compact` needs `can_compact`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn cmd_cull(
+        &self,
+        logical_device: &ash::Device,
+        depth_pyramid: &DepthPyramid,
+        frame: usize,
+        cmd_buffer: vk::CommandBuffer,
+        candidate_count: u32,
+        view_proj: Mat4,
+        phase: Phase,
+        compact: bool,
+    ) {
+        debug_assert!(!compact || self.can_compact);
+        if candidate_count == 0 {
+            return;
+        }
+
+        let params = CullParams {
+            view_proj_rows: [0, 1, 2, 3].map(|row| view_proj.row(row).to_array()),
+            candidate_count,
+            compact: compact as u32,
+            phase: phase as u32,
+            pyramid_levels: depth_pyramid.levels,
+            depth_size: [
+                depth_pyramid.depth_extent.width,
+                depth_pyramid.depth_extent.height,
+            ],
+        };
+
+        unsafe {
             logical_device.cmd_bind_pipeline(
                 cmd_buffer,
                 vk::PipelineBindPoint::COMPUTE,
@@ -237,7 +297,7 @@ impl Culler {
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 0,
-                slice::from_ref(&desc_set),
+                slice::from_ref(&self.frame_desc_sets[frame]),
                 &[],
             );
             logical_device.cmd_push_constants(
@@ -249,17 +309,15 @@ impl Culler {
             );
             logical_device.cmd_dispatch(cmd_buffer, candidate_count.div_ceil(WORKGROUP_SIZE), 1, 1);
 
-            let draw_barrier = vk::MemoryBarrier2::default()
+            let barrier = vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                 .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
                 .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ);
-            let draw_dependency =
-                vk::DependencyInfo::default().memory_barriers(slice::from_ref(&draw_barrier));
-            logical_device.cmd_pipeline_barrier2(cmd_buffer, &draw_dependency);
+            let dependency_info =
+                vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));
+            logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
         }
-
-        Ok(())
     }
 
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
@@ -285,30 +343,100 @@ impl Culler {
 
 /// The inward facing planes of `view_proj`'s frustum, for Vulkan's `0..1` depth range.
 /// A point `p` is inside a plane when `plane.xyz.dot(p) + plane.w >= 0`.
+/// Matches `inFrustum` in `cull.slang`.
 pub fn frustum_planes(view_proj: Mat4) -> [Vec4; 6] {
     let [x, y, z, w] = [0, 1, 2, 3].map(|row| view_proj.row(row));
     [w + x, w - x, w + y, w - y, z, w - z]
 }
 
+/// Plain data as bytes, for push constants.
 #[inline]
-fn as_bytes<T: Copy>(data: &T) -> &[u8] {
+pub(crate) fn as_bytes<T: Copy>(data: &T) -> &[u8] {
     // SAFETY: Only used for plain data without implicit padding.
     unsafe { slice::from_raw_parts((data as *const T).cast(), size_of::<T>()) }
 }
 
-#[inline]
-fn create_desc_set_layout(logical_device: &ash::Device) -> VkResult<vk::DescriptorSetLayout> {
-    // Mesh infos, candidates, draws and the draw count.
-    let bindings = [0, 1, 2, 3].map(|binding| {
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(binding)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-    });
+/// A compute pipeline with one descriptor set and `push_constant_size` bytes of push constants.
+pub(crate) fn create_compute_pipeline(
+    logical_device: &ash::Device,
+    spv: &[u8],
+    entry: &CStr,
+    desc_set_layout: vk::DescriptorSetLayout,
+    push_constant_size: u32,
+) -> VkResult<(vk::Pipeline, vk::PipelineLayout)> {
+    let push_constant_range = vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        .size(push_constant_size);
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(slice::from_ref(&desc_set_layout))
+        .push_constant_ranges(slice::from_ref(&push_constant_range));
+    let pipeline_layout =
+        unsafe { logical_device.create_pipeline_layout(&pipeline_layout_info, None)? };
+
+    let shader_module = create_shader_module(logical_device, spv)?;
+    let stage_info = vk::PipelineShaderStageCreateInfo::default()
+        .module(shader_module)
+        .name(entry)
+        .stage(vk::ShaderStageFlags::COMPUTE);
+    let pipeline_info = vk::ComputePipelineCreateInfo::default()
+        .stage(stage_info)
+        .layout(pipeline_layout);
+    unsafe {
+        let pipelines = logical_device.create_compute_pipelines(
+            vk::PipelineCache::null(),
+            slice::from_ref(&pipeline_info),
+            None,
+        );
+        logical_device.destroy_shader_module(shader_module, None);
+        Ok((pipelines.map_err(|(_, err)| err)?[0], pipeline_layout))
+    }
+}
+
+/// A compute only layout with one descriptor per binding, numbered in order.
+pub(crate) fn create_desc_set_layout(
+    logical_device: &ash::Device,
+    types: &[vk::DescriptorType],
+) -> VkResult<vk::DescriptorSetLayout> {
+    let bindings: Vec<vk::DescriptorSetLayoutBinding> = types
+        .iter()
+        .enumerate()
+        .map(|(binding, &ty)| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding as u32)
+                .descriptor_type(ty)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        })
+        .collect();
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
     unsafe { logical_device.create_descriptor_set_layout(&info, None) }
+}
+
+pub(crate) fn create_desc_pool(
+    logical_device: &ash::Device,
+    pool_sizes: &[vk::DescriptorPoolSize],
+    max_sets: u32,
+) -> VkResult<vk::DescriptorPool> {
+    let info = vk::DescriptorPoolCreateInfo::default()
+        .max_sets(max_sets)
+        .pool_sizes(pool_sizes);
+
+    unsafe { logical_device.create_descriptor_pool(&info, None) }
+}
+
+pub(crate) fn allocate_desc_sets(
+    logical_device: &ash::Device,
+    desc_pool: vk::DescriptorPool,
+    desc_set_layout: vk::DescriptorSetLayout,
+    count: u32,
+) -> VkResult<Vec<vk::DescriptorSet>> {
+    let set_layouts = vec![desc_set_layout; count as usize];
+    let info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(desc_pool)
+        .set_layouts(&set_layouts);
+
+    unsafe { logical_device.allocate_descriptor_sets(&info) }
 }
 
 #[cfg(test)]

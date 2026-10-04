@@ -69,13 +69,16 @@ impl Swapchain {
                 .collect();
             let depth_image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::D16_UNORM)
+                .format(surface.depth_format)
                 .extent(extent.into())
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+                // Sampled to build the depth pyramid for occlusion culling.
+                .usage(
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             let depth_image = Image::new(
                 adapter,

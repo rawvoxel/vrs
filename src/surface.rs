@@ -7,6 +7,8 @@ pub struct Surface {
     pub handle: vk::SurfaceKHR,
     pub present_mode: vk::PresentModeKHR,
     pub format: vk::Format,
+    /// A sampleable depth format, for the depth pyramid.
+    pub depth_format: vk::Format,
     pub color_space: vk::ColorSpaceKHR,
     pub transform_flags: vk::SurfaceTransformFlagsKHR,
     pub image_count: u32,
@@ -26,6 +28,7 @@ impl Surface {
                 app.window_handle,
                 None,
             )?;
+            let depth_format = pick_depth_format(&app.instance, adapter);
             let present_mode = surface_instance
                 .get_physical_device_surface_present_modes(adapter.handle, surface)?
                 .into_iter()
@@ -52,6 +55,7 @@ impl Surface {
                 handle: surface,
                 present_mode,
                 format: format.format,
+                depth_format,
                 color_space: format.color_space,
                 transform_flags,
                 image_count: min_image_count,
@@ -77,5 +81,20 @@ impl Surface {
                 _ => capabilities.current_extent,
             })
         }
+    }
+}
+
+/// `D32_SFLOAT` when it can be rendered to and sampled, otherwise `D16_UNORM`, which always can.
+fn pick_depth_format(instance: &ash::Instance, adapter: &Adapter) -> vk::Format {
+    let required = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    let d32_features = unsafe {
+        instance
+            .get_physical_device_format_properties(adapter.handle, vk::Format::D32_SFLOAT)
+            .optimal_tiling_features
+    };
+    match d32_features.contains(required) {
+        true => vk::Format::D32_SFLOAT,
+        false => vk::Format::D16_UNORM,
     }
 }

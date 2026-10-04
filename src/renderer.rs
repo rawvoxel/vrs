@@ -7,7 +7,8 @@ use crate::{
         record_submit_commandbuffer,
     },
     descriptors::{create_descriptor_pool, create_descriptor_set_layout, create_descriptor_sets},
-    cull::Culler,
+    cull::{Culler, DRAW_STRIDE, Phase},
+    hiz::DepthPyramid,
     image,
     mesh::{MeshCapacity, MeshId, MeshPool},
     queue::{Queue, QueueFamily},
@@ -46,6 +47,11 @@ pub struct Renderer {
     pub frame_staging_buffers: Vec<DynamicBuffer>,
     /// Turns each frame's meshes into indirect draws for the visible ones.
     pub culler: Culler,
+    /// Built from each frame's depth between its two culling phases.
+    pub depth_pyramid: DepthPyramid,
+    /// Whether meshes hidden behind others are culled, on by default.
+    /// Off, meshes are only frustum culled and drawn in one pass.
+    pub occlusion_culling: bool,
     /// Most draws one indirect call can make, 1 without the `multiDrawIndirect` feature.
     pub indirect_draw_batch: u32,
     pub frame_index_buffers: Vec<DynamicBuffer>,
@@ -214,6 +220,22 @@ impl Renderer {
             })
             .collect::<VkResult<Vec<_>>>()?;
         let culler = Culler::new(&adapter, &render_device, FRAMES_IN_FLIGHT, draw_indirect_count)?;
+        let depth_pyramid = DepthPyramid::new(
+            &adapter,
+            &render_device,
+            swapchain.depth_image_view,
+            swapchain.extent,
+        )?;
+        record_submit_commandbuffer(
+            &render_device,
+            init_cmd_buffer,
+            init_cmd_fence,
+            graphics_queue.handle,
+            &[],
+            &[],
+            &[],
+            |cmd_buffer| unsafe { depth_pyramid.cmd_init_layout(&render_device, cmd_buffer) },
+        )?;
 
         // Dynamic Geometry Buffers
         let frame_index_buffers = (0..FRAMES_IN_FLIGHT)
@@ -237,32 +259,6 @@ impl Renderer {
             })
             .collect::<VkResult<Vec<_>>>()?;
 
-        // Transition Depth Image Layout
-        record_submit_commandbuffer(
-            &render_device,
-            init_cmd_buffer,
-            init_cmd_fence,
-            graphics_queue.handle,
-            &[],
-            &[],
-            &[],
-            |command_buffer| {
-                image::transition_layout(
-                    &render_device,
-                    swapchain.depth_image.handle,
-                    command_buffer,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                    vk::AccessFlags2::empty(),
-                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                        | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                    vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                    vk::ImageAspectFlags::DEPTH,
-                );
-            },
-        )?;
-
         unsafe {
             render_device.destroy_shader_module(shader_module, None);
         }
@@ -271,6 +267,8 @@ impl Renderer {
             mesh_pool,
             frame_staging_buffers,
             culler,
+            depth_pyramid,
+            occlusion_culling: true,
             indirect_draw_batch,
             frame_index_buffers,
             frame_vertex_buffers,
@@ -346,19 +344,6 @@ impl Renderer {
             self.rebuild_swapchain(surface_extent)?;
         }
 
-        let extent = self.swapchain.extent;
-        let scissors = [extent.into()];
-        let viewports = [vk::Viewport::default()
-            .x(0.0)
-            .y(0.0)
-            .width(extent.width as f32)
-            .height(extent.height as f32)
-            .min_depth(0.0)
-            .max_depth(1.0)];
-        let clear_value = vk::ClearValue {
-            color: vk::ClearColorValue { float32: [0.1; 4] },
-        };
-
         let frame = self.current_frame;
         let frame_in_flight = self.in_flight_frames[frame];
         let frame_available = self.available_frames[frame];
@@ -426,22 +411,39 @@ impl Renderer {
                 frame_cmd_buffer,
             )?;
 
-            // Mesh culling
-            self.culler.cmd_cull(
-                &self.adapter,
-                &self.render_device,
-                &self.mesh_pool,
-                frame,
-                frame_cmd_buffer,
-                &candidates,
-                draws.proj * draws.view,
-                compact,
-            )?;
+            // Phase 1 culling, only what was visible last frame when occlusion culling
+            let view_proj = draws.proj * draws.view;
+            let occlusion = self.occlusion_culling && candidate_count > 0;
+            let first_phase = match occlusion {
+                true => Phase::LastVisible,
+                false => Phase::Frustum,
+            };
+            if candidate_count > 0 {
+                self.culler.prepare(
+                    &self.adapter,
+                    &self.render_device,
+                    &self.mesh_pool,
+                    &self.depth_pyramid,
+                    frame,
+                    frame_cmd_buffer,
+                    &candidates,
+                )?;
+                self.culler.cmd_cull(
+                    &self.render_device,
+                    &self.depth_pyramid,
+                    frame,
+                    frame_cmd_buffer,
+                    candidate_count,
+                    view_proj,
+                    first_phase,
+                    compact,
+                );
+            }
 
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
 
-            // Color image transition
+            // Attachment transitions
             image::transition_layout(
                 &self.render_device,
                 present_image,
@@ -455,82 +457,104 @@ impl Renderer {
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::ImageAspectFlags::COLOR,
             );
+            // Every frame shares the depth buffer, last frame may still be using it.
+            image::transition_layout(
+                &self.render_device,
+                self.swapchain.depth_image.handle,
+                frame_cmd_buffer,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                vk::ImageAspectFlags::DEPTH,
+            );
 
-            // Render commands
-            let color_attachment_info = vk::RenderingAttachmentInfo::default()
-                .image_view(present_image_view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(clear_value);
-            let rendering_info = vk::RenderingInfo::default()
-                .render_area(extent.into())
-                .color_attachments(slice::from_ref(&color_attachment_info))
-                .layer_count(1);
-            self.render_device
-                .cmd_begin_rendering(frame_cmd_buffer, &rendering_info);
-
-            if candidate_count > 0 || !draws.indices.is_empty() {
-                self.render_device.cmd_bind_pipeline(
+            // Pass 1, with all dynamic geometry
+            self.cmd_begin_rendering(frame_cmd_buffer, present_image_view, vk::AttachmentLoadOp::CLEAR);
+            self.cmd_bind_graphics(frame_cmd_buffer, frame);
+            if candidate_count > 0 {
+                self.cmd_draw_meshes(frame_cmd_buffer, frame, first_phase, candidate_count, compact);
+            }
+            if !draws.indices.is_empty() {
+                self.cmd_bind_geometry(
                     frame_cmd_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.graphics_pipeline,
+                    self.frame_index_buffers[frame].buffer.handle,
+                    self.frame_vertex_buffers[frame].buffer.handle,
                 );
-
-                self.render_device.cmd_set_viewport(frame_cmd_buffer, 0, &viewports);
-                self.render_device.cmd_set_scissor(frame_cmd_buffer, 0, &scissors);
-                self.render_device.cmd_bind_descriptor_sets(
-                    frame_cmd_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.graphics_pipeline_layout,
-                    0,
-                    slice::from_ref(&self.ubo_desc_sets[frame]),
-                    &[],
-                );
-
-                // Every mesh shares these buffers, so they're bound once and drawn indirectly.
-                if candidate_count > 0 {
-                    self.cmd_bind_geometry(
-                        frame_cmd_buffer,
-                        self.mesh_pool.index_buffer.handle,
-                        self.mesh_pool.vertex_buffer.handle,
-                    );
-                    let draw_buffer = self.culler.frame_draw_buffers[frame].buffer.handle;
-                    let stride = size_of::<vk::DrawIndexedIndirectCommand>() as u32;
-                    if compact {
-                        self.render_device.cmd_draw_indexed_indirect_count(
-                            frame_cmd_buffer,
-                            draw_buffer,
-                            0,
-                            self.culler.frame_count_buffers[frame].handle,
-                            0,
-                            candidate_count,
-                            stride,
-                        );
-                    } else {
-                        // Culled meshes still have a draw, of zero instances.
-                        for first_draw in (0..candidate_count).step_by(self.indirect_draw_batch as usize) {
-                            self.render_device.cmd_draw_indexed_indirect(
-                                frame_cmd_buffer,
-                                draw_buffer,
-                                first_draw as vk::DeviceSize * stride as vk::DeviceSize,
-                                self.indirect_draw_batch.min(candidate_count - first_draw),
-                                stride,
-                            );
-                        }
-                    }
-                }
-
-                if !draws.indices.is_empty() {
-                    self.cmd_bind_geometry(
-                        frame_cmd_buffer,
-                        self.frame_index_buffers[frame].buffer.handle,
-                        self.frame_vertex_buffers[frame].buffer.handle,
-                    );
-                    self.render_device.cmd_draw_indexed(frame_cmd_buffer, draws.indices.len() as u32, 1, 0, 0, 0);
-                }
+                self.render_device.cmd_draw_indexed(frame_cmd_buffer, draws.indices.len() as u32, 1, 0, 0, 0);
             }
             self.render_device.cmd_end_rendering(frame_cmd_buffer);
+
+            if occlusion {
+                // Depth pyramid, from pass 1's depth
+                image::transition_layout(
+                    &self.render_device,
+                    self.swapchain.depth_image.handle,
+                    frame_cmd_buffer,
+                    vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    vk::AccessFlags2::SHADER_SAMPLED_READ,
+                    vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::ImageAspectFlags::DEPTH,
+                );
+                self.depth_pyramid.cmd_build(&self.render_device, frame_cmd_buffer);
+
+                // Phase 2 culling, what's newly visible
+                self.culler.cmd_cull(
+                    &self.render_device,
+                    &self.depth_pyramid,
+                    frame,
+                    frame_cmd_buffer,
+                    candidate_count,
+                    view_proj,
+                    Phase::Occlusion,
+                    compact,
+                );
+
+                // Pass 2 depth tests against pass 1's depth, and draws over its color.
+                let depth_barrier = vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
+                    .dst_access_mask(
+                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    )
+                    .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .new_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+                    .image(self.swapchain.depth_image.handle)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+                let color_barrier = vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(
+                        vk::AccessFlags2::COLOR_ATTACHMENT_READ
+                            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                    );
+                let dependency_info = vk::DependencyInfo::default()
+                    .memory_barriers(slice::from_ref(&color_barrier))
+                    .image_memory_barriers(slice::from_ref(&depth_barrier));
+                self.render_device.cmd_pipeline_barrier2(frame_cmd_buffer, &dependency_info);
+
+                // Pass 2
+                self.cmd_begin_rendering(frame_cmd_buffer, present_image_view, vk::AttachmentLoadOp::LOAD);
+                self.cmd_bind_graphics(frame_cmd_buffer, frame);
+                self.cmd_draw_meshes(frame_cmd_buffer, frame, Phase::Occlusion, candidate_count, compact);
+                self.render_device.cmd_end_rendering(frame_cmd_buffer);
+            }
 
             // Present image transition
             image::transition_layout(
@@ -600,6 +624,115 @@ impl Renderer {
         }
     }
 
+    /// Clears or keeps the frame's color and depth, depth is always stored for later passes.
+    fn cmd_begin_rendering(
+        &self,
+        cmd_buffer: vk::CommandBuffer,
+        color_view: vk::ImageView,
+        load_op: vk::AttachmentLoadOp,
+    ) {
+        let color_attachment_info = vk::RenderingAttachmentInfo::default()
+            .image_view(color_view)
+            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .load_op(load_op)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.1; 4] },
+            });
+        let depth_attachment_info = vk::RenderingAttachmentInfo::default()
+            .image_view(self.swapchain.depth_image_view)
+            .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+            .load_op(load_op)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            });
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(self.swapchain.extent.into())
+            .color_attachments(slice::from_ref(&color_attachment_info))
+            .depth_attachment(&depth_attachment_info)
+            .layer_count(1);
+        unsafe {
+            self.render_device
+                .cmd_begin_rendering(cmd_buffer, &rendering_info)
+        };
+    }
+
+    /// The graphics pipeline, its dynamic state and this frame's uniforms.
+    fn cmd_bind_graphics(&self, cmd_buffer: vk::CommandBuffer, frame: usize) {
+        let extent = self.swapchain.extent;
+        let viewport = vk::Viewport::default()
+            .width(extent.width as f32)
+            .height(extent.height as f32)
+            .max_depth(1.0);
+        unsafe {
+            self.render_device.cmd_bind_pipeline(
+                cmd_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline,
+            );
+            self.render_device
+                .cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
+            self.render_device
+                .cmd_set_scissor(cmd_buffer, 0, slice::from_ref(&extent.into()));
+            self.render_device.cmd_bind_descriptor_sets(
+                cmd_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.graphics_pipeline_layout,
+                0,
+                slice::from_ref(&self.ubo_desc_sets[frame]),
+                &[],
+            );
+        }
+    }
+
+    /// Draws the meshes `phase` found visible, which all share the mesh pool's buffers.
+    fn cmd_draw_meshes(
+        &self,
+        cmd_buffer: vk::CommandBuffer,
+        frame: usize,
+        phase: Phase,
+        candidate_count: u32,
+        compact: bool,
+    ) {
+        self.cmd_bind_geometry(
+            cmd_buffer,
+            self.mesh_pool.index_buffer.handle,
+            self.mesh_pool.vertex_buffer.handle,
+        );
+        let draw_buffer = self.culler.frame_draw_buffers[frame].buffer.handle;
+        let region = phase.draw_region();
+        let first_draw_offset = region as vk::DeviceSize * candidate_count as vk::DeviceSize * DRAW_STRIDE;
+        let stride = DRAW_STRIDE as u32;
+        unsafe {
+            if compact {
+                self.render_device.cmd_draw_indexed_indirect_count(
+                    cmd_buffer,
+                    draw_buffer,
+                    first_draw_offset,
+                    self.culler.frame_count_buffers[frame].handle,
+                    region as vk::DeviceSize * size_of::<u32>() as vk::DeviceSize,
+                    candidate_count,
+                    stride,
+                );
+            } else {
+                // Culled meshes still have a draw, of zero instances.
+                for first_draw in (0..candidate_count).step_by(self.indirect_draw_batch as usize) {
+                    self.render_device.cmd_draw_indexed_indirect(
+                        cmd_buffer,
+                        draw_buffer,
+                        first_draw_offset + first_draw as vk::DeviceSize * DRAW_STRIDE,
+                        self.indirect_draw_batch.min(candidate_count - first_draw),
+                        stride,
+                    );
+                }
+            }
+        }
+    }
+
     pub fn rebuild_swapchain(&mut self, extent: vk::Extent2D) -> VkResult<()> {
         unsafe {
             self.render_device.device_wait_idle()?;
@@ -623,7 +756,12 @@ impl Renderer {
                 self.rendered_images = create_semaphores(&self.render_device, image_count as u32);
             }
 
-            // Depth image layout transition
+            self.depth_pyramid.resize(
+                &self.adapter,
+                &self.render_device,
+                self.swapchain.depth_image_view,
+                self.swapchain.extent,
+            )?;
             record_submit_commandbuffer(
                 &self.render_device,
                 self.init_cmd_buffer,
@@ -632,20 +770,9 @@ impl Renderer {
                 &[],
                 &[],
                 &[],
-                |command_buffer| {
-                    image::transition_layout(
-                        &self.render_device,
-                        self.swapchain.depth_image.handle,
-                        command_buffer,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                        vk::AccessFlags2::empty(),
-                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                        vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                        vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                        vk::ImageAspectFlags::DEPTH,
-                    );
+                |cmd_buffer| {
+                    self.depth_pyramid
+                        .cmd_init_layout(&self.render_device, cmd_buffer)
                 },
             )
         }
@@ -661,6 +788,7 @@ impl Drop for Renderer {
 
             self.mesh_pool.destroy_buffers(&self.render_device);
             self.culler.destroy(&self.render_device);
+            self.depth_pyramid.destroy(&self.render_device);
             for dynamic_buffer in self
                 .frame_staging_buffers
                 .iter()
@@ -834,6 +962,7 @@ fn create_graphics_pipeline(
 
     let depth_state_info = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
+        .depth_write_enable(true)
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
         .front(noop_stencil_state)
         .back(noop_stencil_state)
@@ -843,7 +972,8 @@ fn create_graphics_pipeline(
         .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
 
     let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(slice::from_ref(&surface.format));
+        .color_attachment_formats(slice::from_ref(&surface.format))
+        .depth_attachment_format(surface.depth_format);
 
     let graphics_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .push_next(&mut pipeline_rendering_info)

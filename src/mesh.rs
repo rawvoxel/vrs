@@ -56,7 +56,8 @@ impl Mesh {
             bounds_max: self.bounds_max.to_array(),
             first_index: self.indices.start,
             vertex_offset: self.vertices.start as i32,
-            _pad: [0; 3],
+            visible: 0,
+            _pad: [0; 2],
         }
     }
 }
@@ -71,7 +72,9 @@ pub struct MeshInfo {
     pub bounds_max: [f32; 3],
     pub first_index: u32,
     pub vertex_offset: i32,
-    pub _pad: [u32; 3],
+    /// Written by occlusion culling, non-zero when the mesh was last found visible.
+    pub visible: u32,
+    pub _pad: [u32; 2],
 }
 
 /// Mesh data waiting for the next frame to copy it into the shared buffers.
@@ -318,7 +321,7 @@ impl MeshPool {
             // Freed ranges are only reused once their last frame's fence was waited on, but an
             // indexed draw could read any vertex, so validation sees frames still in flight reading
             // the whole vertex buffer. Mesh slots are reused right away though, so frames in flight
-            // may still cull with, or still be uploading, a destroyed mesh's `MeshInfo`.
+            // may still cull with, upload or update the visibility of a destroyed mesh's `MeshInfo`.
             // Wait for all of these before copying.
             let reuse_barrier = vk::MemoryBarrier2::default()
                 .src_stage_mask(
@@ -327,7 +330,9 @@ impl MeshPool {
                         | vk::PipelineStageFlags2::COMPUTE_SHADER
                         | vk::PipelineStageFlags2::COPY,
                 )
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .src_access_mask(
+                    vk::AccessFlags2::TRANSFER_WRITE | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                )
                 .dst_stage_mask(vk::PipelineStageFlags2::COPY)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE);
             let reuse_dependency =
@@ -360,7 +365,8 @@ impl MeshPool {
                 .dst_access_mask(
                     vk::AccessFlags2::INDEX_READ
                         | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
-                        | vk::AccessFlags2::SHADER_STORAGE_READ,
+                        | vk::AccessFlags2::SHADER_STORAGE_READ
+                        | vk::AccessFlags2::SHADER_STORAGE_WRITE,
                 );
             let dependency_info =
                 vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));

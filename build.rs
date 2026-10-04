@@ -3,6 +3,7 @@ use std::{fs, path::Path, process::Command, time::SystemTime};
 fn main() {
     compile_slang_spv("shader.slang", "slang.spv", &["vertMain", "fragMain"]);
     compile_slang_spv("cull.slang", "cull.spv", &["cullMain"]);
+    compile_slang_spv("hiz.slang", "hiz.spv", &["reduceMain"]);
 }
 
 #[rustfmt::skip]

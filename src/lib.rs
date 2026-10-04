@@ -11,6 +11,7 @@ pub mod commands;
 pub mod cull;
 pub mod debug;
 pub mod descriptors;
+pub mod hiz;
 pub mod image;
 pub mod mesh;
 pub mod queue;
