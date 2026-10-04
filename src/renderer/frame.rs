@@ -107,8 +107,7 @@ impl Renderer {
         let candidate_count = data.candidate_count();
         let culling = candidate_count > 0;
         let occlusion = culling && self.occlusion_culling;
-        // A counted draw can't be split, so too many meshes fall back to one draw each.
-        let compact = self.culler.can_compact && candidate_count <= self.indirect_draw_batch;
+        let compact = self.compacts(candidate_count);
         let first_phase = match occlusion {
             true => Phase::LastVisible,
             false => Phase::Frustum,

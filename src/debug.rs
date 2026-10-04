@@ -1,5 +1,28 @@
 use ash::{ext::debug_utils, prelude::VkResult, vk};
-use std::{borrow::Cow, ffi};
+use std::{
+    borrow::Cow,
+    ffi,
+    sync::atomic::{AtomicU32, Ordering},
+};
+
+static ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
+static WARNING_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Validation messages reported since the program started, across every `App`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageCounts {
+    pub errors: u32,
+    pub warnings: u32,
+}
+
+/// For tests and tools, which can fail on validation messages instead of a person reading them.
+/// Always zero without validation, see `App::debug`.
+pub fn message_counts() -> MessageCounts {
+    MessageCounts {
+        errors: ERROR_COUNT.load(Ordering::Relaxed),
+        warnings: WARNING_COUNT.load(Ordering::Relaxed),
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Debug {
@@ -48,6 +71,12 @@ unsafe extern "system" fn vulkan_debug_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT<'_>,
     _user_data: *mut std::os::raw::c_void,
 ) -> vk::Bool32 {
+    if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else if message_severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::WARNING) {
+        WARNING_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
     unsafe {
         let callback_data = *p_callback_data;
         let message_id_number = callback_data.message_id_number;

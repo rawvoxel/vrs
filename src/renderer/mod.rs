@@ -1,5 +1,8 @@
+mod debug;
 mod frame;
 mod setup;
+
+pub use debug::FrameStats;
 
 use crate::{
     App,
@@ -59,6 +62,10 @@ pub struct Renderer {
     depth_pyramid: DepthPyramid,
     /// Most draws one indirect call can make, 1 without the `multiDrawIndirect` feature.
     indirect_draw_batch: u32,
+    /// What the device supports, which `debug_limit_draw_paths` limits the above to.
+    device_draw_paths: (bool, u32),
+    /// What `debug_frame_stats` reads back.
+    last_frame: Option<debug::LastFrame>,
     frame_index_buffers: Vec<DynamicBuffer>,
     frame_vertex_buffers: Vec<DynamicBuffer>,
 
@@ -151,6 +158,8 @@ impl Renderer {
                 true => adapter.properties.limits.max_draw_indirect_count,
                 false => 1,
             },
+            device_draw_paths: (draw_indirect_count, 1),
+            last_frame: None,
             frame_index_buffers: Vec::new(),
             frame_vertex_buffers: Vec::new(),
 
@@ -184,6 +193,7 @@ impl Renderer {
             surface_instance,
             adapter,
         };
+        renderer.device_draw_paths.1 = renderer.indirect_draw_batch;
         renderer.create(surface_extent, mesh_capacity)?;
         Ok(renderer)
     }
@@ -354,9 +364,21 @@ impl Renderer {
         let data = self.write_frame_data(frame, draws)?;
         self.record_frame(frame, image_index, &data)?;
         self.submit_and_present(frame, image_index)?;
+        self.last_frame = Some(debug::LastFrame {
+            frame,
+            meshes: data.candidates.len() as u32,
+            compact: self.compacts(data.candidates.len() as u32),
+        });
 
         self.current_frame = (self.current_frame + 1) % self.in_flight_frames.len();
         Ok(())
+    }
+
+    /// Whether a frame with `candidate_count` meshes compacts and counts its draws.
+    /// A counted draw can't be split, so too many meshes fall back to one draw each.
+    #[inline]
+    fn compacts(&self, candidate_count: u32) -> bool {
+        self.culler.can_compact && candidate_count <= self.indirect_draw_batch
     }
 
     fn rebuild_swapchain(&mut self, extent: vk::Extent2D) -> VkResult<()> {

@@ -103,6 +103,36 @@ impl Buffer {
         }
     }
 
+    /// Copies from the mapped buffer into `data`, starting `offset` bytes in.
+    ///
+    /// The device must not be writing the read bytes, and since nothing invalidates
+    /// the mapping first the memory should be `HOST_COHERENT`.
+    ///
+    /// # Safety
+    /// The bytes read must be a valid `T`, which any plain integer or float is.
+    ///
+    /// # Panics
+    /// If the buffer isn't mapped or `data` reaches past its end.
+    pub unsafe fn mem_read_at<T: Copy>(&self, offset: vk::DeviceSize, data: &mut [T]) {
+        let ptr = self.mapped.expect("Buffer must be mapped before it's read.");
+        let byte_count = size_of_val(data);
+        assert!(
+            offset.checked_add(byte_count as vk::DeviceSize).is_some_and(|end| end <= self.size),
+            "Reading {byte_count} bytes at {offset} overflows a {} byte buffer.",
+            self.size,
+        );
+
+        // SAFETY: The mapping covers the whole buffer and was bounds checked above, and the
+        // caller promised the bytes are a valid `T`. Bytes are copied, so the source needs no alignment.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr.as_ptr().cast::<u8>().add(offset as usize),
+                data.as_mut_ptr().cast::<u8>(),
+                byte_count,
+            );
+        }
+    }
+
     pub fn mem_unmap(&mut self, logical_device: &ash::Device) {
         if self.mapped.take().is_some() {
             unsafe { logical_device.unmap_memory(self.memory) }
