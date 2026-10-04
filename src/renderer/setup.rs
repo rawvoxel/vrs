@@ -69,6 +69,8 @@ impl Renderer {
         // destroys exactly what was created.
         let mut renderer = Self {
             occlusion_culling: config.occlusion_culling,
+            backface_culling: config.backface_culling,
+            grow_mesh_pool: config.grow_mesh_pool,
             clear_color: DEFAULT_CLEAR_COLOR,
 
             mesh_pool: MeshPool::null(config.mesh_capacity, FRAMES_IN_FLIGHT as usize),

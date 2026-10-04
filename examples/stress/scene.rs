@@ -22,19 +22,26 @@ pub const CAPACITY: MeshCapacity = MeshCapacity {
     meshes: GRID * GRID * 3 / 2,
 };
 
+/// Faces the camera unless `facing_away`, which backface culling skips.
 pub fn quad(
     renderer: &mut Renderer,
     min: Vec2,
     size: f32,
     z: f32,
     col: [f32; 3],
+    facing_away: bool,
 ) -> Result<MeshId, vk::Result> {
     let corner = |x: f32, y: f32| Vertex {
         pos: [min.x + x * size, min.y + y * size, z],
         col,
     };
+    // Front faces wind counter-clockwise on screen.
+    let indices = match facing_away {
+        false => [0, 2, 1, 1, 2, 3],
+        true => [0, 1, 2, 2, 1, 3],
+    };
     renderer.create_mesh(
-        &[0, 1, 2, 2, 1, 3],
+        &indices,
         &[
             corner(0.0, 0.0),
             corner(1.0, 0.0),
@@ -81,13 +88,26 @@ pub struct Scene {
     /// Each chunk's color, `None` when it's empty or wasn't meshed.
     pub colors: Vec<Option<[f32; 3]>>,
     pub wall: Option<MeshId>,
+    /// Backface culling skips the wall, so it hides nothing.
+    pub wall_faces_away: bool,
+    /// A big mesh out of view, which takes up pool space without being drawn.
+    pub ballast: Option<MeshId>,
     pub renderer: Renderer,
     pub app: App,
 }
 
 /// Every mesh in the scene, borrowing only its meshes so the renderer stays free.
-pub fn live<'a>(chunks: &'a [Option<MeshId>], wall: &'a Option<MeshId>) -> Vec<&'a MeshId> {
-    chunks.iter().flatten().chain(wall.as_ref()).collect()
+pub fn live<'a>(
+    chunks: &'a [Option<MeshId>],
+    wall: &'a Option<MeshId>,
+    ballast: &'a Option<MeshId>,
+) -> Vec<&'a MeshId> {
+    chunks
+        .iter()
+        .flatten()
+        .chain(wall.as_ref())
+        .chain(ballast.as_ref())
+        .collect()
 }
 
 impl Scene {
@@ -97,6 +117,8 @@ impl Scene {
             chunks: (0..cells).map(|_| None).collect(),
             colors: vec![None; cells],
             wall: None,
+            wall_faces_away: false,
+            ballast: None,
             renderer,
             app,
         }
@@ -110,14 +132,56 @@ impl Scene {
         if let Some(wall) = self.wall.take() {
             self.renderer.destroy_mesh(wall);
         }
+        self.wall_faces_away = false;
+        if let Some(ballast) = self.ballast.take() {
+            self.renderer.destroy_mesh(ballast);
+        }
     }
 
-    /// Every chunk, and the wall in front of them when `wall`.
-    pub fn fill(&mut self, wall: bool) -> Result<(), vk::Result> {
+    /// Destroys every other chunk, scattering free space through the pool.
+    pub fn punch_holes(&mut self) {
+        for cell in (0..GRID * GRID).step_by(2) {
+            if let Some(id) = self.chunks[cell as usize].take() {
+                self.renderer.destroy_mesh(id);
+            }
+            self.colors[cell as usize] = None;
+        }
+    }
+
+    /// Where the last mesh's vertices end in the pool.
+    pub fn vertices_end(&self) -> u32 {
+        live(&self.chunks, &self.wall, &self.ballast)
+            .into_iter()
+            .map(|id| self.renderer.mesh(id).vertices.end)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A mesh of `vertices` far outside every camera's view, frustum culled every frame.
+    pub fn add_ballast(&mut self, vertices: u32) -> Result<(), vk::Result> {
+        let far = Vertex {
+            pos: [1000.0, 1000.0, CHUNK_Z],
+            col: [1.0; 3],
+        };
+        let vertices = vec![far; vertices as usize];
+        self.ballast = Some(self.renderer.create_mesh(&[0, 1, 2], &vertices)?);
+        Ok(())
+    }
+
+    /// Every chunk, and the wall in front of them when `wall`, facing away when `wall_faces_away`.
+    pub fn fill(&mut self, wall: bool, wall_faces_away: bool) -> Result<(), vk::Result> {
         if wall {
             let min = Vec2::splat(-WALL_HALF_SIZE);
             let size = 2.0 * WALL_HALF_SIZE;
-            self.wall = Some(quad(&mut self.renderer, min, size, WALL_Z, WALL_COLOR)?);
+            self.wall = Some(quad(
+                &mut self.renderer,
+                min,
+                size,
+                WALL_Z,
+                WALL_COLOR,
+                wall_faces_away,
+            )?);
+            self.wall_faces_away = wall_faces_away;
         }
         for cell in 0..GRID * GRID {
             self.remesh(cell, 0)?;
@@ -142,6 +206,7 @@ impl Scene {
                 CHUNK_SIZE,
                 CHUNK_Z,
                 color,
+                false,
             )?,
             None => self.renderer.create_mesh(&[], &[])?,
         };
@@ -154,7 +219,7 @@ impl Scene {
     pub fn expected(&self, view_proj: Mat4) -> (u32, u32) {
         let wall = self.wall_rect(view_proj);
         let (mut in_view, mut must_draw) = (0, 0);
-        for id in live(&self.chunks, &self.wall) {
+        for id in live(&self.chunks, &self.wall, &self.ballast) {
             let mesh = self.renderer.mesh(id);
             if mesh.index_count() == 0 {
                 continue;
@@ -173,8 +238,11 @@ impl Scene {
         (in_view, must_draw)
     }
 
-    /// The wall's screen rectangle in NDC, when there is one in view.
+    /// The wall's screen rectangle in NDC, when there's one in view facing the camera.
     pub fn wall_rect(&self, view_proj: Mat4) -> Option<(Vec2, Vec2)> {
+        if self.wall_faces_away {
+            return None;
+        }
         let mesh = self.renderer.mesh(self.wall.as_ref()?);
         screen_rect(view_proj, mesh.bounds_min, mesh.bounds_max)
     }

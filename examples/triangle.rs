@@ -19,7 +19,8 @@ use winit::{
     window::{Window, WindowId},
 };
 
-const INDICES: [Index; 3] = [0, 1, 2];
+/// Counter-clockwise on screen, so it faces the camera.
+const INDICES: [Index; 3] = [0, 2, 1];
 
 #[rustfmt::skip]
 const VERTICES: [Vertex; 3] = [

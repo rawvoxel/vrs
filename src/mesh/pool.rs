@@ -39,11 +39,33 @@ pub(crate) struct MeshInfo {
     pub _pad: [u32; 2],
 }
 
+impl MeshInfo {
+    /// For a slot without a mesh, which draws nothing.
+    pub const EMPTY: Self = Self {
+        bounds_min: [0.0; 3],
+        index_count: 0,
+        bounds_max: [0.0; 3],
+        first_index: 0,
+        vertex_offset: 0,
+        visible: 0,
+        _pad: [0; 2],
+    };
+}
+
 /// A mesh waiting for the next frame to copy its staged data into the shared buffers.
-struct Upload {
-    slot: usize,
+pub(super) struct Upload {
+    pub slot: usize,
     /// Into the vertex, index and info buffers, `None` for empty data.
-    copies: [Option<vk::BufferCopy2<'static>>; 3],
+    pub copies: [Option<vk::BufferCopy2<'static>>; 3],
+}
+
+/// How often a pool has been repacked, see `MeshPool::repack`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RepackCounts {
+    /// Repacked at the same capacity, to join scattered free space.
+    pub defrags: u32,
+    /// Repacked into a larger capacity.
+    pub growths: u32,
 }
 
 /// Every mesh shares one `DEVICE_LOCAL` vertex buffer and one index buffer,
@@ -52,20 +74,21 @@ struct Upload {
 ///
 /// Creating a mesh writes its data to the current frame's staging buffer, which that frame
 /// copies in before drawing. Destroying a mesh only frees its ranges once no frame in flight
-/// can still draw it.
+/// can still draw it. When there's no room, `repack` defragments or grows the buffers.
 pub(crate) struct MeshPool {
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
     pub info_buffer: Buffer,
     pub capacity: MeshCapacity,
-    vertex_ranges: RangeAllocator,
-    index_ranges: RangeAllocator,
+    pub(super) vertex_ranges: RangeAllocator,
+    pub(super) index_ranges: RangeAllocator,
     /// Indexed by `MeshId`, `None` slots are free for reuse.
-    meshes: Vec<Option<Mesh>>,
-    uploads: Vec<Upload>,
+    pub(super) meshes: Vec<Option<Mesh>>,
+    pub(super) uploads: Vec<Upload>,
     staging: UploadStaging,
     /// Meshes to free once each frame's fence has been waited on.
-    frame_releases: Vec<Vec<Mesh>>,
+    pub(super) frame_releases: Vec<Vec<Mesh>>,
+    pub(super) repacks: RepackCounts,
 }
 
 impl MeshPool {
@@ -76,37 +99,12 @@ impl MeshPool {
         frames_in_flight: usize,
     ) -> VkResult<Self> {
         let mut pool = Self::null(capacity, frames_in_flight);
-        let sizes = [
-            (
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                capacity.vertices as vk::DeviceSize * size_of::<Vertex>() as vk::DeviceSize,
-            ),
-            (
-                vk::BufferUsageFlags::INDEX_BUFFER,
-                capacity.indices as vk::DeviceSize * size_of::<Index>() as vk::DeviceSize,
-            ),
-            (
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                capacity.meshes as vk::DeviceSize * size_of::<MeshInfo>() as vk::DeviceSize,
-            ),
-        ];
-        let created = sizes
-            .into_iter()
-            .enumerate()
-            .try_for_each(|(i, (usage, size))| {
-                let buffer = create_device_local_buffer(adapter, logical_device, usage, size)?;
-                match i {
-                    0 => pool.vertex_buffer = buffer,
-                    1 => pool.index_buffer = buffer,
-                    _ => pool.info_buffer = buffer,
-                }
-                Ok(())
-            })
-            .and_then(|()| {
-                pool.staging
-                    .create(adapter, logical_device, frames_in_flight)
-            });
-        if let Err(err) = created {
+        [pool.vertex_buffer, pool.index_buffer, pool.info_buffer] =
+            create_pool_buffers(adapter, logical_device, capacity)?;
+        if let Err(err) = pool
+            .staging
+            .create(adapter, logical_device, frames_in_flight)
+        {
             unsafe { pool.destroy_buffers(logical_device) };
             return Err(err);
         }
@@ -126,7 +124,19 @@ impl MeshPool {
             uploads: Vec::new(),
             staging: UploadStaging::null(),
             frame_releases: (0..frames_in_flight).map(|_| Vec::new()).collect(),
+            repacks: RepackCounts::default(),
         }
+    }
+
+    #[inline]
+    pub fn repack_counts(&self) -> RepackCounts {
+        self.repacks
+    }
+
+    /// Meshes with an id, uploaded or not.
+    #[inline]
+    pub fn mesh_count(&self) -> u32 {
+        self.meshes.iter().flatten().count() as u32
     }
 
     /// Reserves space and stages the data for `frame` to upload.
@@ -275,6 +285,20 @@ impl MeshPool {
         self.staging.begin_writes(frame);
     }
 
+    /// Whether destroyed meshes are waiting on frames in flight to free their space.
+    pub fn has_pending_releases(&self) -> bool {
+        self.frame_releases.iter().any(|meshes| !meshes.is_empty())
+    }
+
+    /// Frees every destroyed mesh's space, call once the device is idle.
+    pub fn release_all(&mut self) {
+        for frame in 0..self.frame_releases.len() {
+            for mesh in std::mem::take(&mut self.frame_releases[frame]) {
+                self.release(mesh);
+            }
+        }
+    }
+
     #[inline]
     fn release(&mut self, mesh: Mesh) {
         self.vertex_ranges.free(mesh.vertices);
@@ -374,4 +398,41 @@ impl MeshPool {
             self.staging.destroy(logical_device);
         }
     }
+}
+
+/// The vertex, index and info buffers for `capacity`. If one fails, those already created are destroyed.
+pub(super) fn create_pool_buffers(
+    adapter: &Adapter,
+    logical_device: &ash::Device,
+    capacity: MeshCapacity,
+) -> VkResult<[Buffer; 3]> {
+    let sizes = [
+        (
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            capacity.vertices as vk::DeviceSize * size_of::<Vertex>() as vk::DeviceSize,
+        ),
+        (
+            vk::BufferUsageFlags::INDEX_BUFFER,
+            capacity.indices as vk::DeviceSize * size_of::<Index>() as vk::DeviceSize,
+        ),
+        (
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            capacity.meshes as vk::DeviceSize * size_of::<MeshInfo>() as vk::DeviceSize,
+        ),
+    ];
+    let mut buffers = [Buffer::null(), Buffer::null(), Buffer::null()];
+    for (buffer, (usage, size)) in buffers.iter_mut().zip(sizes) {
+        // Repacking copies out of them.
+        let usage = usage | vk::BufferUsageFlags::TRANSFER_SRC;
+        match create_device_local_buffer(adapter, logical_device, usage, size) {
+            Ok(created) => *buffer = created,
+            Err(err) => {
+                for buffer in buffers.iter() {
+                    unsafe { buffer.destroy(logical_device) };
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(buffers)
 }

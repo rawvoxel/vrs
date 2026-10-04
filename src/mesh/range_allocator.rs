@@ -18,10 +18,19 @@ impl RangeAllocator {
         }
     }
 
+    #[inline]
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+
     /// Total free space, which may be split across several ranges.
-    #[cfg(test)]
     pub fn free_len(&self) -> u32 {
         self.free.iter().map(|range| range.len() as u32).sum()
+    }
+
+    /// Whether `alloc(len)` would succeed.
+    pub fn can_alloc(&self, len: u32) -> bool {
+        len == 0 || self.free.iter().any(|range| range.len() as u32 >= len)
     }
 
     /// An empty range never fails and takes no space.
@@ -119,6 +128,18 @@ mod tests {
         ranges.free(c);
         ranges.free(b);
         assert_eq!(ranges.free, vec![0..9]);
+    }
+
+    #[test]
+    fn can_alloc_matches_alloc() {
+        let mut ranges = RangeAllocator::new(6);
+        let a = ranges.alloc(2).unwrap();
+        let _b = ranges.alloc(2).unwrap();
+        ranges.free(a);
+        assert!(ranges.can_alloc(2));
+        assert!(!ranges.can_alloc(3));
+        assert!(ranges.can_alloc(0));
+        assert_eq!(ranges.alloc(3), None);
     }
 
     #[test]

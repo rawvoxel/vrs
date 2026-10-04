@@ -24,14 +24,14 @@ mod target;
 use anyhow::{Result, bail};
 use ash::vk;
 use glam::Mat4;
-use scenarios::{Expect, SCENARIOS};
+use scenarios::{Expect, PoolTest, SCENARIOS};
 use scene::{CAPACITY, CHUNK_SIZE, CHUNK_Z, GRID, Scene, chunk_min, live, quad};
 use std::time::Instant;
 use target::{START_SIZE, Target};
 use vrs::{
     App, debug,
     mesh::MeshCapacity,
-    renderer::{DrawList, Renderer, RendererConfig},
+    renderer::{DrawList, MeshPoolStats, Renderer, RendererConfig},
 };
 use winit::{
     application::ApplicationHandler,
@@ -47,6 +47,9 @@ use winit::{
 const SETTLE_FRAMES: u32 = 3;
 /// Chunks remeshed per frame when remeshing.
 const REMESH_PER_FRAME: u32 = 24;
+/// Frames after the scene is filled before a pool test, so the repack has uploaded meshes
+/// to copy, not just ones still waiting to upload.
+const POOL_TEST_DELAY: u32 = 2;
 
 #[derive(Default)]
 struct Stress {
@@ -54,8 +57,10 @@ struct Stress {
     scene: Option<Scene>,
     scenario: usize,
     frame: u32,
-    out_of_memory: u32,
+    /// Chunks that couldn't be meshed, which never happens while every chunk fits the pool.
+    out_of_room: u32,
     started: Option<Instant>,
+    pool_at_start: Option<MeshPoolStats>,
     messages_at_start: debug::MessageCounts,
     failures: Vec<String>,
 }
@@ -87,8 +92,10 @@ impl Stress {
         self.messages_at_start = debug::message_counts();
         self.check_failed_construction(&app, size);
 
+        // Only the growth scenario grows the pool, the rest keep it nearly full.
         let config = RendererConfig {
             mesh_capacity: CAPACITY,
+            grow_mesh_pool: false,
             ..Default::default()
         };
         let renderer = Renderer::with_config(&app, size.width, size.height, config).unwrap();
@@ -142,11 +149,13 @@ impl Stress {
         let scene = self.scene.as_mut().unwrap();
         scene.clear();
         scene.renderer.occlusion_culling = scenario.occlusion;
+        scene.renderer.grow_mesh_pool = scenario.pool == PoolTest::Grow;
+        self.pool_at_start = Some(scene.renderer.debug_mesh_pool_stats());
         let (compact, max_batch) = scenario.draw_paths;
         scene.renderer.debug_limit_draw_paths(compact, max_batch);
         self.target.as_mut().unwrap().resize(START_SIZE);
         self.frame = 0;
-        self.out_of_memory = 0;
+        self.out_of_room = 0;
         self.started = Some(Instant::now());
     }
 
@@ -157,7 +166,7 @@ impl Stress {
             let cell = (frame * 37 + k * 11) % (GRID * GRID);
             match scene.remesh(cell, frame) {
                 Ok(()) => (),
-                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => self.out_of_memory += 1,
+                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => self.out_of_room += 1,
                 Err(err) => panic!("Creating a mesh failed with {err}."),
             }
         }
@@ -168,6 +177,7 @@ impl Stress {
             CHUNK_SIZE,
             CHUNK_Z,
             [1.0; 3],
+            false,
         ) {
             scene.renderer.destroy_mesh(id);
         }
@@ -182,12 +192,37 @@ impl Stress {
         }
     }
 
+    /// Makes the pool repack for the scenario's pool test.
+    fn test_pool(&mut self) {
+        let scenario = &SCENARIOS[self.scenario];
+        let scene = self.scene.as_mut().unwrap();
+        let capacity = scene.renderer.debug_mesh_pool_stats().capacity.vertices;
+        let ballast = match scenario.pool {
+            PoolTest::None => return,
+            PoolTest::Defragment => {
+                scene.punch_holes();
+                // Past the free space at the end, but not past all of it.
+                capacity - scene.vertices_end() + 8
+            }
+            PoolTest::Grow => capacity,
+        };
+        if let Err(err) = scene.add_ballast(ballast) {
+            self.fail(format!(
+                "{}: creating the ballast failed with {err}",
+                scenario.name
+            ));
+        }
+    }
+
     /// Renders one frame. `false` once every scenario has run.
     fn frame(&mut self) -> bool {
         let scenario = &SCENARIOS[self.scenario];
         self.frame += 1;
         if self.frame == SETTLE_FRAMES {
-            self.scene.as_mut().unwrap().fill(scenario.wall).unwrap();
+            let scene = self.scene.as_mut().unwrap();
+            scene.fill(scenario.wall, scenario.wall_faces_away).unwrap();
+        } else if self.frame == SETTLE_FRAMES + POOL_TEST_DELAY && scenario.pool != PoolTest::None {
+            self.test_pool();
         } else if self.frame > SETTLE_FRAMES && scenario.remesh {
             self.remesh();
         }
@@ -199,7 +234,7 @@ impl Stress {
             .view_proj(size.width as f32 / size.height.max(1) as f32);
         let scene = self.scene.as_mut().unwrap();
         let captured = last_frame && scene.renderer.debug_capture_next_frame();
-        let live = live(&scene.chunks, &scene.wall);
+        let live = live(&scene.chunks, &scene.wall, &scene.ballast);
         let draws = DrawList {
             meshes: &live,
             view,
@@ -236,15 +271,11 @@ impl Stress {
             .map(|capture| pixels::check(scene, capture, view_proj));
         let elapsed = self.started.unwrap().elapsed();
         println!(
-            "  {} frames in {:.1?}, {} meshes, {in_view} in view, {must_draw} the wall can't hide, drawn {:?}{}{}",
+            "  {} frames in {:.1?}, {} meshes, {in_view} in view, {must_draw} the wall can't hide, drawn {:?}{}",
             scenario.frames,
             elapsed,
             stats.meshes,
             stats.drawn,
-            match scenario.remesh {
-                true => format!(", the pool was full {} times", self.out_of_memory),
-                false => String::new(),
-            },
             match &pixels {
                 Some(Ok(checked)) => format!(", {checked} pixels match"),
                 Some(Err(_)) => String::new(),
@@ -273,8 +304,37 @@ impl Stress {
         if let Some(Err(failure)) = pixels {
             self.fail(format!("{}: {failure}", scenario.name));
         }
-        if scenario.remesh && self.out_of_memory == 0 {
-            self.fail(format!("{}: the mesh pool never filled up", scenario.name));
+        let before = self.pool_at_start.unwrap();
+        let after = self
+            .scene
+            .as_ref()
+            .unwrap()
+            .renderer
+            .debug_mesh_pool_stats();
+        let defrags = after.defrags - before.defrags;
+        let growths = after.growths - before.growths;
+        if defrags > 0 || growths > 0 {
+            println!(
+                "  the pool defragmented {defrags} and grew {growths} times, to {} vertices",
+                after.capacity.vertices
+            );
+        }
+        let pool_failure = match scenario.pool {
+            PoolTest::None => (growths > 0).then_some("the pool grew with growth off"),
+            PoolTest::Defragment if defrags == 0 => Some("the pool never defragmented"),
+            PoolTest::Defragment => (growths > 0).then_some("the pool grew with growth off"),
+            PoolTest::Grow => (growths == 0 || after.capacity.vertices <= before.capacity.vertices)
+                .then_some("the pool never grew"),
+        };
+        if let Some(failure) = pool_failure {
+            self.fail(format!("{}: {failure}", scenario.name));
+        }
+        // Destroyed chunks' space is released or packed together before running out.
+        if self.out_of_room > 0 {
+            self.fail(format!(
+                "{}: the pool ran out of room {} times, though every chunk fits",
+                scenario.name, self.out_of_room
+            ));
         }
         self.check_messages(scenario.name);
     }

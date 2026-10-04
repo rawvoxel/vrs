@@ -40,6 +40,7 @@ pub fn create_graphics_pipeline(
         .viewport_count(1)
         .scissor_count(1);
 
+    // Front faces wind counter-clockwise on screen, the cull mode is dynamic.
     let rasterization_info = vk::PipelineRasterizationStateCreateInfo::default()
         .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
         .line_width(1.0)
@@ -76,8 +77,11 @@ pub fn create_graphics_pipeline(
         .back(noop_stencil_state)
         .max_depth_bounds(1.0);
 
-    let dynamic_state_info = vk::PipelineDynamicStateCreateInfo::default()
-        .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
+    let dynamic_state_info = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&[
+        vk::DynamicState::VIEWPORT,
+        vk::DynamicState::SCISSOR,
+        vk::DynamicState::CULL_MODE,
+    ]);
 
     let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(slice::from_ref(&surface.format))

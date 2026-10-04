@@ -1,5 +1,6 @@
 mod pool;
 mod range_allocator;
+mod repack;
 mod staging;
 
 pub(crate) use pool::MeshPool;
@@ -14,7 +15,7 @@ use std::ops::Range;
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct MeshId(usize);
 
-/// How much a `MeshPool` holds. Its buffers are allocated up front and don't grow.
+/// How much a `MeshPool` holds when created. It grows when `RendererConfig::grow_mesh_pool` allows.
 #[derive(Clone, Copy, Debug)]
 pub struct MeshCapacity {
     pub vertices: u32,

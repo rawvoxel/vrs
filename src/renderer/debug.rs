@@ -1,7 +1,7 @@
 //! Hooks for tests and tools. They stall the device, so keep them out of normal frames.
 
 use super::Renderer;
-use crate::{buffer::Buffer, commands::record_submit_commandbuffer};
+use crate::{buffer::Buffer, commands::record_submit_commandbuffer, mesh::MeshCapacity};
 use ash::{prelude::VkResult, vk};
 
 /// The last submitted frame, for `Renderer::debug_frame_stats`.
@@ -22,6 +22,18 @@ pub struct FrameStats {
     /// `None` when the frame's draws weren't counted on the device, which needs the
     /// `drawIndirectCount` feature and at most `maxDrawIndirectCount` meshes.
     pub drawn: Option<[u32; 2]>,
+}
+
+/// The mesh pool's size and how often it's been repacked.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshPoolStats {
+    pub capacity: MeshCapacity,
+    /// Meshes with an id, uploaded or not.
+    pub meshes: u32,
+    /// Repacked at the same capacity, to join scattered free space.
+    pub defrags: u32,
+    /// Repacked into a larger capacity.
+    pub growths: u32,
 }
 
 impl FrameStats {
@@ -97,6 +109,17 @@ impl Renderer {
             meshes,
             drawn: Some(read?),
         }))
+    }
+
+    /// For tests and tools, without stalling.
+    pub fn debug_mesh_pool_stats(&self) -> MeshPoolStats {
+        let repacks = self.mesh_pool.repack_counts();
+        MeshPoolStats {
+            capacity: self.mesh_pool.capacity,
+            meshes: self.mesh_pool.mesh_count(),
+            defrags: repacks.defrags,
+            growths: repacks.growths,
+        }
     }
 
     /// Draws as if the device lacked features, to test the fallbacks on any device.

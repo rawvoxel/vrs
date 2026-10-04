@@ -26,7 +26,8 @@ let mut renderer = Renderer::new(&app, 800, 600).unwrap();
 let color = [1.0, 0.0, 0.0];
 let triangle = renderer
     .create_mesh(
-        &[0, 1, 2],
+        // Counter-clockwise on screen, so it faces the camera.
+        &[0, 2, 1],
         &[
             Vertex { pos: [0.0, -0.5, 0.5], col: color },
             Vertex { pos: [0.5, 0.5, 0.5], col: color },
@@ -52,11 +53,19 @@ drop(renderer);
   means a destroyed mesh can't be drawn again. Its space is reused once no frame in flight
   can still draw it. Indices are relative to each mesh's first vertex, and meshes must already
   be in world space.
+- **Winding**: front faces wind counter-clockwise on screen, backface culling skips the rest.
+- **Cameras**: `DrawList::proj` maps into Vulkan's clip space, where y points down and depth
+  runs from 0 to 1. Flip y in an OpenGL style projection, such as glam's `perspective_rh`,
+  otherwise the image is mirrored and the wrong faces are culled.
+- **The mesh pool** is defragmented when its free space is too scattered for a new mesh, and
+  doubled when there isn't enough of it. Both copy every mesh into new buffers, stalling
+  `create_mesh` until the copies finish, which is rare since the pool doubles each time.
+  Without growth, `create_mesh` fails with `ERROR_OUT_OF_DEVICE_MEMORY` when it's full.
 - **Per frame geometry**, such as debug lines, goes in a `DrawList`'s `indices` and `vertices`.
-- **Settings**: a `RendererConfig` for `Renderer::with_config` sizes the mesh pool, and sets
-  the starting vsync and occlusion culling. At runtime `occlusion_culling` and `clear_color`
-  are fields, vsync is `set_vsync`. The pool doesn't grow, `create_mesh` fails with
-  `ERROR_OUT_OF_DEVICE_MEMORY` when it's full.
+- **Settings**: a `RendererConfig` for `Renderer::with_config` sets the mesh pool's starting
+  size, and starting values for growing it, vsync, occlusion culling and backface culling. At
+  runtime `grow_mesh_pool`, `occlusion_culling`, `backface_culling` and `clear_color` are
+  fields, vsync is `set_vsync`.
 - **Headless**: `App::headless` renders into images of the renderer's own, with no window.
 
 `App` and `Renderer` are `Send + Sync`, such as for Bevy resources.
@@ -85,8 +94,11 @@ uses it and exits with a failure code if anything's wrong:
   fallbacks for devices without `multiDrawIndirect` or `drawIndirectCount`. Draw counts read
   back from the GPU must match the meshes in view, and with occlusion culling, at least every
   mesh the wall can't hide.
+- A wall facing away from the camera must be skipped by backface culling.
 - Chunks are remeshed every frame against a nearly full mesh pool, while the window is
   resized and minimized.
+- The mesh pool is made to defragment and to grow, after which every moved mesh must still
+  draw correctly.
 - Each scenario's last frame is captured, and every chunk's center pixel must show the color
   it should, which catches meshes drawn from missing data or culled while visible.
 - A renderer failing partway through being built must leak nothing.
@@ -108,6 +120,7 @@ For tests and tools, these stall the GPU:
 - `Renderer::debug_frame_stats` reads back how many meshes the last frame drew.
 - `Renderer::debug_capture_next_frame` and `debug_read_capture` copy a frame back.
 - `Renderer::debug_limit_draw_paths` draws as if the device lacked features.
+- `Renderer::debug_mesh_pool_stats` reports the mesh pool's size and how often it repacked.
 - `debug::message_counts` counts validation errors and warnings.
 
 ## Layout
@@ -115,7 +128,7 @@ For tests and tools, these stall the GPU:
 | Module | |
 | --- | --- |
 | `renderer` | `Renderer`, building it, each frame's stages and command recording |
-| `mesh` | Mesh ids and the shared mesh pool, its staging and range allocator |
+| `mesh` | Mesh ids and the shared mesh pool, its staging, range allocator and repacking |
 | `cull`, `hiz` | GPU culling, and the depth pyramid occlusion culling tests against |
 | `app`, `adapter`, `surface`, `swapchain` | The instance, GPUs, and what frames are drawn into |
 | `buffer`, `image`, `pipeline`, `descriptors`, `commands`, `sync` | Vulkan building blocks |

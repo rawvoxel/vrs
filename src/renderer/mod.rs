@@ -8,7 +8,7 @@ mod setup;
 
 pub use capture::Capture;
 pub use config::RendererConfig;
-pub use debug::FrameStats;
+pub use debug::{FrameStats, MeshPoolStats};
 
 use crate::{
     adapter::Adapter,
@@ -37,6 +37,9 @@ pub struct DrawList<'a> {
     pub vertices: &'a [Vertex],
     /// Meshes outside this camera's frustum, or hidden behind others, are culled on the device.
     pub view: Mat4,
+    /// Into Vulkan's clip space, where y points down and depth runs from 0 to 1. An OpenGL style
+    /// projection, such as glam's `perspective_rh`, needs its y flipped, otherwise the image
+    /// is mirrored and backface culling skips the wrong faces.
     pub proj: Mat4,
 }
 
@@ -46,6 +49,12 @@ pub struct Renderer {
     /// Whether meshes hidden behind others are culled, starting as `RendererConfig::occlusion_culling`.
     /// Off, meshes are only frustum culled and drawn in one pass. Changes take effect next frame.
     pub occlusion_culling: bool,
+    /// Whether triangles facing away are skipped, starting as `RendererConfig::backface_culling`.
+    /// Front faces wind counter-clockwise on screen. Changes take effect next frame.
+    pub backface_culling: bool,
+    /// Whether the mesh pool grows when it's out of room, starting as `RendererConfig::grow_mesh_pool`.
+    /// Either way it defragments when that makes room.
+    pub grow_mesh_pool: bool,
     /// What each frame starts as, in linear color.
     pub clear_color: [f32; 4],
 
@@ -135,10 +144,61 @@ impl Renderer {
     /// Its data is staged right away, which first waits for the device to finish the frame
     /// that last used the next frame's staging buffer. That's normally long done.
     ///
-    /// Fails with `ERROR_OUT_OF_DEVICE_MEMORY` when the shared buffers have no room left.
+    /// When the pool's out of room it waits for the device to go idle, freeing destroyed
+    /// meshes' space, then defragments, or grows when `grow_mesh_pool` allows. Those stall,
+    /// but are rare. Fails with `ERROR_OUT_OF_DEVICE_MEMORY` when none of it makes room.
     pub fn create_mesh(&mut self, indices: &[Index], vertices: &[Vertex]) -> VkResult<MeshId> {
         let frame = self.current_frame;
         self.wait_for_frame(frame)?;
+        let out_of_room = |result: &VkResult<MeshId>| {
+            matches!(result, Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
+        };
+
+        let created = self.stage_mesh(frame, indices, vertices);
+        if !out_of_room(&created) {
+            return created;
+        }
+        // Frames in flight may still hold destroyed meshes' space.
+        let mut created = created;
+        if self.mesh_pool.has_pending_releases() {
+            unsafe { self.render_device.device_wait_idle()? };
+            self.mesh_pool.release_all();
+            created = self.stage_mesh(frame, indices, vertices);
+            if !out_of_room(&created) {
+                return created;
+            }
+        }
+
+        let plan = self.mesh_pool.plan_repack(
+            vertices.len() as u32,
+            indices.len() as u32,
+            self.grow_mesh_pool,
+        );
+        let Some(capacity) = plan else {
+            return created;
+        };
+        unsafe {
+            self.render_device.device_wait_idle()?;
+            self.mesh_pool.repack(
+                &self.adapter,
+                &self.render_device,
+                self.graphics_queue.handle,
+                self.init_cmd_buffer,
+                self.init_cmd_fence,
+                capacity,
+            )?;
+        }
+        self.stage_mesh(frame, indices, vertices)
+    }
+
+    #[inline]
+    fn stage_mesh(
+        &mut self,
+        frame: usize,
+        indices: &[Index],
+        vertices: &[Vertex],
+    ) -> VkResult<MeshId> {
+        // SAFETY: `create_mesh` waited for `frame`, which readies its staging buffer.
         unsafe {
             self.mesh_pool
                 .create(&self.adapter, &self.render_device, frame, indices, vertices)

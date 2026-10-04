@@ -299,6 +299,11 @@ impl Renderer {
                 .cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
             self.render_device
                 .cmd_set_scissor(cmd_buffer, 0, slice::from_ref(&extent.into()));
+            let cull_mode = match self.backface_culling {
+                true => vk::CullModeFlags::BACK,
+                false => vk::CullModeFlags::NONE,
+            };
+            self.render_device.cmd_set_cull_mode(cmd_buffer, cull_mode);
             self.render_device.cmd_bind_descriptor_sets(
                 cmd_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
