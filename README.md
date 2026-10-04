@@ -53,9 +53,10 @@ drop(renderer);
   can still draw it. Indices are relative to each mesh's first vertex, and meshes must already
   be in world space.
 - **Per frame geometry**, such as debug lines, goes in a `DrawList`'s `indices` and `vertices`.
-- **Settings**: `occlusion_culling` and `clear_color` are fields, vsync is `set_vsync`. The
-  mesh pool's size and the starting vsync are a `RendererConfig` for `Renderer::with_config`.
-  The pool doesn't grow, `create_mesh` fails with `ERROR_OUT_OF_DEVICE_MEMORY` when it's full.
+- **Settings**: a `RendererConfig` for `Renderer::with_config` sizes the mesh pool, and sets
+  the starting vsync and occlusion culling. At runtime `occlusion_culling` and `clear_color`
+  are fields, vsync is `set_vsync`. The pool doesn't grow, `create_mesh` fails with
+  `ERROR_OUT_OF_DEVICE_MEMORY` when it's full.
 - **Headless**: `App::headless` renders into images of the renderer's own, with no window.
 
 `App` and `Renderer` are `Send + Sync`, such as for Bevy resources.

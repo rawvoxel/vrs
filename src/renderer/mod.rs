@@ -43,8 +43,8 @@ pub struct DrawList<'a> {
 /// Draws meshes into the `App`'s window, or images of its own when headless,
 /// culling them on the device.
 pub struct Renderer {
-    /// Whether meshes hidden behind others are culled, on by default.
-    /// Off, meshes are only frustum culled and drawn in one pass.
+    /// Whether meshes hidden behind others are culled, starting as `RendererConfig::occlusion_culling`.
+    /// Off, meshes are only frustum culled and drawn in one pass. Changes take effect next frame.
     pub occlusion_culling: bool,
     /// What each frame starts as, in linear color.
     pub clear_color: [f32; 4],
