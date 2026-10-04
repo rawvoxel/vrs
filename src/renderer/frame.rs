@@ -22,19 +22,32 @@ impl FrameData {
 }
 
 impl Renderer {
+    /// Waits for the device to finish `frame`'s last use, freeing up what it used.
+    pub(super) fn wait_for_frame(&mut self, frame: usize) -> VkResult<()> {
+        unsafe {
+            self.render_device
+                .wait_for_fences(&[self.in_flight_frames[frame]], true, u64::MAX)?;
+        }
+        self.mesh_pool.release_frame(frame);
+        Ok(())
+    }
+
     /// Waits for the frame's last use to finish, then acquires a swapchain image.
     /// `None` when the swapchain was out of date, so the frame is skipped.
+    ///
+    /// Headless, each frame has an image of its own, which the wait freed up.
     pub(super) fn acquire_image(
         &mut self,
         frame: usize,
         surface_extent: vk::Extent2D,
     ) -> VkResult<Option<u32>> {
         let frame_in_flight = self.in_flight_frames[frame];
+        self.wait_for_frame(frame)?;
+        if self.is_headless() {
+            unsafe { self.render_device.reset_fences(&[frame_in_flight])? };
+            return Ok(Some(frame as u32));
+        }
         unsafe {
-            self.render_device
-                .wait_for_fences(&[frame_in_flight], true, u64::MAX)?;
-            self.mesh_pool.release_frame(frame);
-
             // NOTE: A suboptimal image can still be presented, so it's rebuilt next frame.
             let image_index = match self.swapchain_device.acquire_next_image(
                 self.swapchain.handle,
@@ -97,11 +110,23 @@ impl Renderer {
         })
     }
 
-    /// Submits the recorded frame and queues its image for presentation.
+    /// Submits the recorded frame and queues its image for presentation, unless headless.
     pub(super) fn submit_and_present(&mut self, frame: usize, image_index: u32) -> VkResult<()> {
-        let image_rendered = self.rendered_images[image_index as usize];
         let cmd_buffer_submit_info =
             vk::CommandBufferSubmitInfo::default().command_buffer(self.frame_cmd_buffers[frame]);
+        if self.is_headless() {
+            let submit_info = vk::SubmitInfo2::default()
+                .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info));
+            return unsafe {
+                self.render_device.queue_submit2(
+                    self.graphics_queue.handle,
+                    slice::from_ref(&submit_info),
+                    self.in_flight_frames[frame],
+                )
+            };
+        }
+
+        let image_rendered = self.rendered_images[image_index as usize];
         let wait_sem_submit_info = vk::SemaphoreSubmitInfo::default()
             .semaphore(self.available_frames[frame])
             .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);

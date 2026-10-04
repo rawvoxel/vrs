@@ -1,7 +1,7 @@
-use super::{Mesh, MeshCapacity, MeshId, range_allocator::RangeAllocator};
+use super::{Mesh, MeshCapacity, MeshId, range_allocator::RangeAllocator, staging::UploadStaging};
 use crate::{
     adapter::Adapter,
-    buffer::{Buffer, DynamicBuffer, create_device_local_buffer},
+    buffer::{Buffer, create_device_local_buffer},
     bytes::slice_as_bytes,
     vertex::{Index, Vertex},
 };
@@ -39,19 +39,20 @@ pub(crate) struct MeshInfo {
     pub _pad: [u32; 2],
 }
 
-/// Mesh data waiting for the next frame to copy it into the shared buffers.
+/// A mesh waiting for the next frame to copy its staged data into the shared buffers.
 struct Upload {
     slot: usize,
-    vertices: Vec<Vertex>,
-    indices: Vec<Index>,
+    /// Into the vertex, index and info buffers, `None` for empty data.
+    copies: [Option<vk::BufferCopy2<'static>>; 3],
 }
 
 /// Every mesh shares one `DEVICE_LOCAL` vertex buffer and one index buffer,
 /// so drawing many meshes needs no rebinding. Each mesh's `MeshInfo` lives in
 /// `info_buffer` at its `MeshId`, for culling on the device.
 ///
-/// Creating a mesh only queues its data, frames copy queued data in before drawing.
-/// Destroying a mesh only frees its ranges once no frame in flight can still draw it.
+/// Creating a mesh writes its data to the current frame's staging buffer, which that frame
+/// copies in before drawing. Destroying a mesh only frees its ranges once no frame in flight
+/// can still draw it.
 pub(crate) struct MeshPool {
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
@@ -62,6 +63,7 @@ pub(crate) struct MeshPool {
     /// Indexed by `MeshId`, `None` slots are free for reuse.
     meshes: Vec<Option<Mesh>>,
     uploads: Vec<Upload>,
+    staging: UploadStaging,
     /// Meshes to free once each frame's fence has been waited on.
     frame_releases: Vec<Vec<Mesh>>,
 }
@@ -88,18 +90,25 @@ impl MeshPool {
                 capacity.meshes as vk::DeviceSize * size_of::<MeshInfo>() as vk::DeviceSize,
             ),
         ];
-        for (i, (usage, size)) in sizes.into_iter().enumerate() {
-            match create_device_local_buffer(adapter, logical_device, usage, size) {
-                Ok(buffer) => match i {
+        let created = sizes
+            .into_iter()
+            .enumerate()
+            .try_for_each(|(i, (usage, size))| {
+                let buffer = create_device_local_buffer(adapter, logical_device, usage, size)?;
+                match i {
                     0 => pool.vertex_buffer = buffer,
                     1 => pool.index_buffer = buffer,
                     _ => pool.info_buffer = buffer,
-                },
-                Err(err) => {
-                    unsafe { pool.destroy_buffers(logical_device) };
-                    return Err(err);
                 }
-            }
+                Ok(())
+            })
+            .and_then(|()| {
+                pool.staging
+                    .create(adapter, logical_device, frames_in_flight)
+            });
+        if let Err(err) = created {
+            unsafe { pool.destroy_buffers(logical_device) };
+            return Err(err);
         }
         Ok(pool)
     }
@@ -115,15 +124,26 @@ impl MeshPool {
             index_ranges: RangeAllocator::new(capacity.indices),
             meshes: Vec::new(),
             uploads: Vec::new(),
+            staging: UploadStaging::null(),
             frame_releases: (0..frames_in_flight).map(|_| Vec::new()).collect(),
         }
     }
 
-    /// Reserves space and queues the data for the next frame to upload.
+    /// Reserves space and stages the data for `frame` to upload.
     /// Indices are relative to the mesh's own first vertex.
     ///
     /// Fails with `ERROR_OUT_OF_DEVICE_MEMORY` when the pool is full.
-    pub fn create(&mut self, indices: &[Index], vertices: &[Vertex]) -> VkResult<MeshId> {
+    ///
+    /// # Safety
+    /// `begin_writes` must have been called for `frame` since it last recorded uploads.
+    pub unsafe fn create(
+        &mut self,
+        adapter: &Adapter,
+        logical_device: &ash::Device,
+        frame: usize,
+        indices: &[Index],
+        vertices: &[Vertex],
+    ) -> VkResult<MeshId> {
         let out_of_memory = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
         let free_slot = self.meshes.iter().position(Option::is_none);
         if free_slot.is_none() && self.meshes.len() >= self.capacity.meshes as usize {
@@ -155,7 +175,46 @@ impl MeshPool {
             bounds_min,
             bounds_max,
         };
-        let slot = match free_slot {
+        let slot = free_slot.unwrap_or(self.meshes.len());
+
+        // NOTE: Even empty meshes upload their `MeshInfo`, the slot's last one may still be there.
+        let info = mesh.info();
+        let pieces = [
+            (
+                slice_as_bytes(vertices),
+                mesh.vertices.start as usize * size_of::<Vertex>(),
+            ),
+            (
+                slice_as_bytes(indices),
+                mesh.indices.start as usize * size_of::<Index>(),
+            ),
+            (
+                slice_as_bytes(slice::from_ref(&info)),
+                slot * size_of::<MeshInfo>(),
+            ),
+        ];
+        let mut copies = [None; 3];
+        for (copy, (bytes, dst_offset)) in copies.iter_mut().zip(pieces) {
+            if bytes.is_empty() {
+                continue;
+            }
+            match unsafe { self.staging.push(adapter, logical_device, frame, bytes) } {
+                Ok(src_offset) => {
+                    *copy = Some(
+                        vk::BufferCopy2::default()
+                            .src_offset(src_offset)
+                            .dst_offset(dst_offset as vk::DeviceSize)
+                            .size(bytes.len() as vk::DeviceSize),
+                    );
+                }
+                Err(err) => {
+                    self.release(mesh);
+                    return Err(err);
+                }
+            }
+        }
+
+        match free_slot {
             Some(slot) => {
                 self.meshes[slot] = Some(mesh);
                 slot
@@ -165,12 +224,7 @@ impl MeshPool {
                 self.meshes.len() - 1
             }
         };
-        // NOTE: Even empty meshes upload their `MeshInfo`, the slot's last one may still be there.
-        self.uploads.push(Upload {
-            slot,
-            vertices: vertices.to_vec(),
-            indices: indices.to_vec(),
-        });
+        self.uploads.push(Upload { slot, copies });
 
         Ok(MeshId(slot))
     }
@@ -212,11 +266,13 @@ impl MeshPool {
         id.0 as u32
     }
 
-    /// Frees meshes waiting on `frame`, call once its fence has been waited on.
+    /// Frees meshes waiting on `frame` and readies its staging buffer for writes.
+    /// Call once its fence has been waited on.
     pub fn release_frame(&mut self, frame: usize) {
         for mesh in std::mem::take(&mut self.frame_releases[frame]) {
             self.release(mesh);
         }
+        self.staging.begin_writes(frame);
     }
 
     #[inline]
@@ -225,73 +281,30 @@ impl MeshPool {
         self.index_ranges.free(mesh.indices);
     }
 
-    /// Writes queued uploads into `staging` and records their copies, followed by
-    /// a barrier making them visible to vertex input and culling.
+    /// Records copying `frame`'s staged uploads, followed by a barrier making them
+    /// visible to vertex input and culling.
     ///
     /// # Safety
-    /// The device must not be using `staging`.
+    /// Every upload must have been staged for `frame`.
     pub unsafe fn cmd_upload(
         &mut self,
-        adapter: &Adapter,
         logical_device: &ash::Device,
-        staging: &mut DynamicBuffer,
+        frame: usize,
         cmd_buffer: vk::CommandBuffer,
-    ) -> VkResult<()> {
+    ) {
         if self.uploads.is_empty() {
-            return Ok(());
+            return;
         }
 
-        let byte_count = self
-            .uploads
-            .iter()
-            .map(|upload| {
-                size_of_val(&upload.vertices[..])
-                    + size_of_val(&upload.indices[..])
-                    + size_of::<MeshInfo>()
-            })
-            .sum::<usize>() as vk::DeviceSize;
-        unsafe { staging.reserve(adapter, logical_device, byte_count)? };
-
-        let mut src_offset = 0;
-        let mut vertex_regions = Vec::with_capacity(self.uploads.len());
-        let mut index_regions = Vec::with_capacity(self.uploads.len());
-        let mut info_regions = Vec::with_capacity(self.uploads.len());
+        let mut regions: [Vec<vk::BufferCopy2>; 3] = Default::default();
         for upload in self.uploads.drain(..) {
-            let mesh = self.meshes[upload.slot]
-                .as_ref()
-                .expect("Destroyed meshes have no upload.");
-            let info = mesh.info();
-
-            for (data, dst_offset, regions) in [
-                (
-                    slice_as_bytes(&upload.vertices),
-                    mesh.vertices.start as usize * size_of::<Vertex>(),
-                    &mut vertex_regions,
-                ),
-                (
-                    slice_as_bytes(&upload.indices),
-                    mesh.indices.start as usize * size_of::<Index>(),
-                    &mut index_regions,
-                ),
-                (
-                    slice_as_bytes(slice::from_ref(&info)),
-                    upload.slot * size_of::<MeshInfo>(),
-                    &mut info_regions,
-                ),
-            ] {
-                if data.is_empty() {
-                    continue;
-                }
-                staging.buffer.mem_write_at(src_offset, data);
-                regions.push(
-                    vk::BufferCopy2::default()
-                        .src_offset(src_offset)
-                        .dst_offset(dst_offset as vk::DeviceSize)
-                        .size(data.len() as vk::DeviceSize),
-                );
-                src_offset += data.len() as vk::DeviceSize;
+            for (regions, copy) in regions.iter_mut().zip(upload.copies) {
+                regions.extend(copy);
             }
         }
+        let [vertex_regions, index_regions, info_regions] = regions;
+        let staging_buffer = self.staging.buffer(frame);
+        self.staging.mark_in_flight(frame);
 
         unsafe {
             // Freed ranges are only reused once their last frame's fence was waited on, but an
@@ -324,7 +337,7 @@ impl MeshPool {
                     continue;
                 }
                 let copy_info = vk::CopyBufferInfo2::default()
-                    .src_buffer(staging.buffer.handle)
+                    .src_buffer(staging_buffer)
                     .dst_buffer(dst.handle)
                     .regions(regions);
                 logical_device.cmd_copy_buffer2(cmd_buffer, &copy_info);
@@ -348,8 +361,6 @@ impl MeshPool {
                 vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));
             logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
         }
-
-        Ok(())
     }
 
     /// # Safety
@@ -360,6 +371,7 @@ impl MeshPool {
             self.vertex_buffer.destroy(logical_device);
             self.index_buffer.destroy(logical_device);
             self.info_buffer.destroy(logical_device);
+            self.staging.destroy(logical_device);
         }
     }
 }

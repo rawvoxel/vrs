@@ -4,11 +4,21 @@ use std::slice;
 
 #[derive(Clone, Copy)]
 pub struct Image {
-    pub memory: vk::DeviceMemory,
-    pub handle: vk::Image,
+    pub(crate) memory: vk::DeviceMemory,
+    pub(crate) handle: vk::Image,
 }
 
 impl Image {
+    #[inline]
+    pub fn handle(&self) -> vk::Image {
+        self.handle
+    }
+
+    #[inline]
+    pub fn memory(&self) -> vk::DeviceMemory {
+        self.memory
+    }
+
     /// Owns nothing, destroying it does nothing.
     pub fn null() -> Self {
         Self {

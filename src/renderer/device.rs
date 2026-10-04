@@ -8,17 +8,20 @@ pub(super) fn create_render_device(
     queue_family: &QueueFamily,
     multi_draw_indirect: bool,
     draw_indirect_count: bool,
+    swapchain: bool,
 ) -> VkResult<ash::Device> {
     let queue_priorities = [1.0];
     let device_queue_info = vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family.index)
         .queue_priorities(&queue_priorities);
 
-    let extension_names_raw = [
-        khr::swapchain::NAME.as_ptr(),
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        khr::portability_subset::NAME.as_ptr(),
-    ];
+    // Headless devices have no swapchain to present with.
+    let mut extension_names_raw = Vec::new();
+    if swapchain {
+        extension_names_raw.push(khr::swapchain::NAME.as_ptr());
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    extension_names_raw.push(khr::portability_subset::NAME.as_ptr());
 
     // NOTE: Keep in mind proper ordering when adding features.
     let features = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(multi_draw_indirect);

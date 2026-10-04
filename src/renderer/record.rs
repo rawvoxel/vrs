@@ -36,12 +36,8 @@ impl Renderer {
             self.render_device
                 .begin_command_buffer(cmd_buffer, &begin_info)?;
 
-            self.mesh_pool.cmd_upload(
-                &self.adapter,
-                &self.render_device,
-                &mut self.frame_staging_buffers[frame],
-                cmd_buffer,
-            )?;
+            self.mesh_pool
+                .cmd_upload(&self.render_device, frame, cmd_buffer);
 
             if culling {
                 self.culler.prepare(
@@ -99,18 +95,36 @@ impl Renderer {
                 self.render_device.cmd_end_rendering(cmd_buffer);
             }
 
-            image::transition_layout(
-                &self.render_device,
-                self.swapchain.present_images[image_index as usize],
-                cmd_buffer,
+            let image = self.swapchain.present_images[image_index as usize];
+            let mut last_use = (
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::AccessFlags2::empty(),
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
-                vk::ImageAspectFlags::COLOR,
             );
+            if self.capture_requested {
+                self.cmd_capture(cmd_buffer, frame, image)?;
+                last_use = (
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags2::empty(),
+                    vk::PipelineStageFlags2::COPY,
+                );
+            }
+            // Headless, the next frame to use the image starts from `UNDEFINED`.
+            if !self.is_headless() {
+                let (layout, access, stage) = last_use;
+                image::transition_layout(
+                    &self.render_device,
+                    image,
+                    cmd_buffer,
+                    layout,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    access,
+                    vk::AccessFlags2::empty(),
+                    stage,
+                    vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+                    vk::ImageAspectFlags::COLOR,
+                );
+            }
 
             self.render_device.end_command_buffer(cmd_buffer)
         }
@@ -242,7 +256,9 @@ impl Renderer {
             .load_op(load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue { float32: [0.1; 4] },
+                color: vk::ClearColorValue {
+                    float32: self.clear_color,
+                },
             });
         let depth_attachment_info = vk::RenderingAttachmentInfo::default()
             .image_view(self.swapchain.depth_image_view)

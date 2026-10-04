@@ -7,10 +7,10 @@ mod dynamic;
 pub use dynamic::DynamicBuffer;
 
 pub struct Buffer {
-    pub size: vk::DeviceSize,
-    pub memory_req: vk::MemoryRequirements,
-    pub memory: vk::DeviceMemory,
-    pub handle: vk::Buffer,
+    pub(crate) size: vk::DeviceSize,
+    pub(crate) memory_req: vk::MemoryRequirements,
+    pub(crate) memory: vk::DeviceMemory,
+    pub(crate) handle: vk::Buffer,
     mapped: Option<NonNull<c_void>>,
 }
 
@@ -20,6 +20,27 @@ unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
+    #[inline]
+    pub fn handle(&self) -> vk::Buffer {
+        self.handle
+    }
+
+    /// The size it was created with, its memory may be larger.
+    #[inline]
+    pub fn size(&self) -> vk::DeviceSize {
+        self.size
+    }
+
+    #[inline]
+    pub fn memory(&self) -> vk::DeviceMemory {
+        self.memory
+    }
+
+    #[inline]
+    pub fn memory_requirements(&self) -> &vk::MemoryRequirements {
+        &self.memory_req
+    }
+
     /// Owns nothing, destroying it does nothing.
     pub fn null() -> Self {
         Self {

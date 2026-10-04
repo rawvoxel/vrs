@@ -1,15 +1,47 @@
-use crate::{queue::QueueFamily, surface::Surface};
+use crate::queue::QueueFamily;
 use ash::{khr, prelude::VkResult, vk};
 
 #[derive(Clone)]
 pub struct Adapter {
-    pub handle: vk::PhysicalDevice,
-    pub features: vk::PhysicalDeviceFeatures,
+    pub(crate) handle: vk::PhysicalDevice,
+    pub(crate) features: vk::PhysicalDeviceFeatures,
     /// The Vulkan 1.2 `drawIndirectCount` feature.
-    pub draw_indirect_count: bool,
-    pub properties: vk::PhysicalDeviceProperties,
-    pub memory_properties: vk::PhysicalDeviceMemoryProperties,
-    pub queue_families: Vec<QueueFamily>,
+    pub(crate) draw_indirect_count: bool,
+    pub(crate) properties: vk::PhysicalDeviceProperties,
+    pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
+    pub(crate) queue_families: Vec<QueueFamily>,
+}
+impl Adapter {
+    #[inline]
+    pub fn handle(&self) -> vk::PhysicalDevice {
+        self.handle
+    }
+
+    #[inline]
+    pub fn features(&self) -> &vk::PhysicalDeviceFeatures {
+        &self.features
+    }
+
+    /// The Vulkan 1.2 `drawIndirectCount` feature.
+    #[inline]
+    pub fn supports_draw_indirect_count(&self) -> bool {
+        self.draw_indirect_count
+    }
+
+    #[inline]
+    pub fn properties(&self) -> &vk::PhysicalDeviceProperties {
+        &self.properties
+    }
+
+    #[inline]
+    pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+        &self.memory_properties
+    }
+
+    #[inline]
+    pub fn queue_families(&self) -> &[QueueFamily] {
+        &self.queue_families
+    }
 }
 
 impl Adapter {
@@ -36,30 +68,40 @@ impl Adapter {
         }
     }
 
-    /// The first queue family with `queue_flags`, which can or can't present to `surface`.
+    /// The first queue family with `queue_flags`, which can also present to `surface` when there is one.
     #[inline]
     pub fn get_queue_family(
         &self,
         surface_instance: &khr::surface::Instance,
-        surface: &Surface,
-        supports_surface: bool,
+        surface: Option<vk::SurfaceKHR>,
         queue_flags: vk::QueueFlags,
     ) -> VkResult<Option<QueueFamily>> {
         for queue_family in self.queue_families.iter() {
-            let presents = unsafe {
-                surface_instance.get_physical_device_surface_support(
-                    self.handle,
-                    queue_family.index,
-                    surface.handle,
-                )?
+            if !queue_family.properties.queue_flags.contains(queue_flags) {
+                continue;
+            }
+            let presents = match surface {
+                Some(surface) => unsafe {
+                    surface_instance.get_physical_device_surface_support(
+                        self.handle,
+                        queue_family.index,
+                        surface,
+                    )?
+                },
+                None => true,
             };
-            if queue_family.properties.queue_flags.contains(queue_flags)
-                && presents == supports_surface
-            {
+            if presents {
                 return Ok(Some(*queue_family));
             }
         }
         Ok(None)
+    }
+
+    /// Dynamic rendering and synchronization2 are core in Vulkan 1.3.
+    #[inline]
+    pub fn supports_vulkan_1_3(&self) -> bool {
+        vk::api_version_major(self.properties.api_version) > 1
+            || vk::api_version_minor(self.properties.api_version) >= 3
     }
 }
 

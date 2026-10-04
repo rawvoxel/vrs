@@ -1,9 +1,13 @@
+mod capture;
+mod config;
 mod debug;
 mod device;
 mod frame;
 mod record;
 mod setup;
 
+pub use capture::Capture;
+pub use config::RendererConfig;
 pub use debug::FrameStats;
 
 use crate::{
@@ -36,15 +40,16 @@ pub struct DrawList<'a> {
     pub proj: Mat4,
 }
 
-/// Draws meshes into the `App`'s window, culling them on the device.
+/// Draws meshes into the `App`'s window, or images of its own when headless,
+/// culling them on the device.
 pub struct Renderer {
     /// Whether meshes hidden behind others are culled, on by default.
     /// Off, meshes are only frustum culled and drawn in one pass.
     pub occlusion_culling: bool,
+    /// What each frame starts as, in linear color.
+    pub clear_color: [f32; 4],
 
     mesh_pool: MeshPool,
-    /// Mesh uploads pass through these on their way into `mesh_pool`.
-    frame_staging_buffers: Vec<DynamicBuffer>,
     /// Turns each frame's meshes into indirect draws for the visible ones.
     culler: Culler,
     /// Built from each frame's depth between its two culling phases.
@@ -55,13 +60,20 @@ pub struct Renderer {
     device_draw_paths: (bool, u32),
     /// What `debug_frame_stats` reads back.
     last_frame: Option<debug::LastFrame>,
+    /// Whether the next frame is copied into `capture_buffers`.
+    capture_requested: bool,
+    capture_buffers: Vec<DynamicBuffer>,
+    /// What `debug_read_capture` reads back.
+    recorded_capture: Option<capture::RecordedCapture>,
     frame_index_buffers: Vec<DynamicBuffer>,
     frame_vertex_buffers: Vec<DynamicBuffer>,
 
     current_frame: usize,
     in_flight_frames: Vec<vk::Fence>,
+    /// Signaled when the frame's swapchain image is acquired, unused when headless.
     available_frames: Vec<vk::Semaphore>,
-    /// One per swapchain image, the presentation engine may hold onto it until that image is reacquired.
+    /// One per swapchain image, the presentation engine may hold onto it until that image
+    /// is reacquired. Empty when headless.
     rendered_images: Vec<vk::Semaphore>,
     frame_cmd_buffers: Vec<vk::CommandBuffer>,
     frame_cmd_pools: Vec<vk::CommandPool>,
@@ -98,13 +110,39 @@ impl Renderer {
         &self.adapter
     }
 
+    /// Whether the renderer draws into images of its own, for a headless `App`.
+    #[inline]
+    pub fn is_headless(&self) -> bool {
+        self.surface.is_offscreen()
+    }
+
+    /// Whether presenting waits for the display to refresh, never when headless.
+    #[inline]
+    pub fn vsync(&self) -> bool {
+        !self.is_headless() && self.surface.present_mode == vk::PresentModeKHR::FIFO
+    }
+
+    /// Rebuilds the swapchain with or without vsync next frame. Headless, there's nothing to sync to.
+    pub fn set_vsync(&mut self, vsync: bool) {
+        let present_mode = self.surface.present_mode;
+        self.surface.set_vsync(vsync);
+        self.swapchain_outdated |= self.surface.present_mode != present_mode;
+    }
+
     /// Adds a mesh to the shared mesh buffers, uploaded by the next `submit`.
     /// Indices are relative to the mesh's own first vertex, and an empty mesh draws nothing.
     ///
+    /// Its data is staged right away, which first waits for the device to finish the frame
+    /// that last used the next frame's staging buffer. That's normally long done.
+    ///
     /// Fails with `ERROR_OUT_OF_DEVICE_MEMORY` when the shared buffers have no room left.
-    #[inline]
     pub fn create_mesh(&mut self, indices: &[Index], vertices: &[Vertex]) -> VkResult<MeshId> {
-        self.mesh_pool.create(indices, vertices)
+        let frame = self.current_frame;
+        self.wait_for_frame(frame)?;
+        unsafe {
+            self.mesh_pool
+                .create(&self.adapter, &self.render_device, frame, indices, vertices)
+        }
     }
 
     /// Its space is reused once no frame in flight can still draw it.
@@ -184,7 +222,10 @@ impl Renderer {
             self.swapchain_outdated = false;
 
             // The device is idle, so no semaphore is still waiting to be signaled or presented.
-            let image_count = self.swapchain.present_images.len();
+            let image_count = match self.is_headless() {
+                true => 0,
+                false => self.swapchain.present_images.len(),
+            };
             if self.rendered_images.len() != image_count {
                 for semaphore in self.rendered_images.drain(..) {
                     self.render_device.destroy_semaphore(semaphore, None);
@@ -235,7 +276,7 @@ impl Drop for Renderer {
             self.culler.destroy(device);
             self.depth_pyramid.destroy(device);
             for buffer in self
-                .frame_staging_buffers
+                .capture_buffers
                 .iter()
                 .chain(&self.frame_index_buffers)
                 .chain(&self.frame_vertex_buffers)

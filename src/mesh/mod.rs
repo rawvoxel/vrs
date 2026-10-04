@@ -1,5 +1,6 @@
 mod pool;
 mod range_allocator;
+mod staging;
 
 pub(crate) use pool::MeshPool;
 

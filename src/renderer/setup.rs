@@ -1,8 +1,9 @@
 //! Building a `Renderer`.
 
-use super::{Renderer, device::create_render_device};
+use super::{Renderer, RendererConfig, device::create_render_device};
 use crate::{
     App,
+    adapter::Adapter,
     buffer::DynamicBuffer,
     commands::{create_command_buffer, create_command_pool},
     cull::Culler,
@@ -10,7 +11,7 @@ use crate::{
     hiz::DepthPyramid,
     mesh::{MeshCapacity, MeshPool},
     pipeline::{create_graphics_pipeline, create_pipeline_layout, create_shader_module},
-    queue::Queue,
+    queue::{Queue, QueueFamily},
     surface::Surface,
     swapchain::Swapchain,
     sync::{create_fence, create_semaphore},
@@ -24,39 +25,34 @@ const SLANG_SPV: &[u8] = include_bytes!("../../assets/shader/slang.spv");
 pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
 /// Starting size of each frame's dynamic geometry buffers, they grow to fit.
 const INITIAL_DYNAMIC_ELEMENTS: vk::DeviceSize = 1024;
+/// Frames start as the near black the renderer used before it drew in sRGB.
+const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.01, 0.01, 0.01, 1.0];
 
 impl Renderer {
+    /// With the default `RendererConfig`.
     pub fn new(app: &App, window_width: u32, window_height: u32) -> VkResult<Self> {
-        Self::with_mesh_capacity(app, window_width, window_height, MeshCapacity::default())
+        Self::with_config(app, window_width, window_height, RendererConfig::default())
     }
 
-    /// Sizes the shared mesh buffers, which don't grow.
-    pub fn with_mesh_capacity(
+    /// For a headless `App`, the size is what frames render at.
+    pub fn with_config(
         app: &App,
         window_width: u32,
         window_height: u32,
-        mesh_capacity: MeshCapacity,
+        config: RendererConfig,
     ) -> VkResult<Self> {
-        let adapter = app
-            .request_adapter()
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let surface_instance = app.surface_instance.clone();
+        let (adapter, graphics_queue_family) = pick_adapter(app, &surface_instance)?;
 
         // Surface
-        let surface_instance = app.surface_instance.clone();
-        let surface = Surface::new(app, &adapter, &surface_instance)?;
+        let surface = match app.surface() {
+            Some(_) => Surface::new(app, &adapter, &surface_instance, config.vsync)?,
+            None => Surface::offscreen(app, &adapter, FRAMES_IN_FLIGHT),
+        };
         let surface_extent =
             surface.extent(window_width, window_height, &adapter, &surface_instance)?;
 
         // Render Device
-        // NOTE: Culling runs on the graphics queue, so it must also support compute.
-        let graphics_queue_family = adapter
-            .get_queue_family(
-                &surface_instance,
-                &surface,
-                true,
-                vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
-            )?
-            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
         let multi_draw_indirect = adapter.features.multi_draw_indirect == vk::TRUE;
         // Compacting needs to draw every visible mesh in one counted call.
         let draw_indirect_count = adapter.draw_indirect_count && multi_draw_indirect;
@@ -66,15 +62,16 @@ impl Renderer {
             &graphics_queue_family,
             multi_draw_indirect,
             draw_indirect_count,
+            !surface.is_offscreen(),
         )?;
 
         // Everything else starts null, so dropping the renderer if `create` fails
         // destroys exactly what was created.
         let mut renderer = Self {
             occlusion_culling: true,
+            clear_color: DEFAULT_CLEAR_COLOR,
 
-            mesh_pool: MeshPool::null(mesh_capacity, FRAMES_IN_FLIGHT as usize),
-            frame_staging_buffers: Vec::new(),
+            mesh_pool: MeshPool::null(config.mesh_capacity, FRAMES_IN_FLIGHT as usize),
             culler: Culler::null(draw_indirect_count),
             depth_pyramid: DepthPyramid::null(),
             indirect_draw_batch: match multi_draw_indirect {
@@ -83,6 +80,9 @@ impl Renderer {
             },
             device_draw_paths: (draw_indirect_count, 1),
             last_frame: None,
+            capture_requested: false,
+            capture_buffers: Vec::new(),
+            recorded_capture: None,
             frame_index_buffers: Vec::new(),
             frame_vertex_buffers: Vec::new(),
 
@@ -117,7 +117,7 @@ impl Renderer {
             adapter,
         };
         renderer.device_draw_paths.1 = renderer.indirect_draw_batch;
-        renderer.create(surface_extent, mesh_capacity)?;
+        renderer.create(surface_extent, config.mesh_capacity)?;
         Ok(renderer)
     }
 
@@ -195,8 +195,10 @@ impl Renderer {
             self.in_flight_frames.push(create_fence(&device)?);
             self.available_frames.push(create_semaphore(&device)?);
         }
-        for _ in 0..self.swapchain.present_images.len() {
-            self.rendered_images.push(create_semaphore(&device)?);
+        if !self.surface.is_offscreen() {
+            for _ in 0..self.swapchain.present_images.len() {
+                self.rendered_images.push(create_semaphore(&device)?);
+            }
         }
 
         // Meshes
@@ -221,9 +223,12 @@ impl Renderer {
             )
         };
         for _ in 0..FRAMES_IN_FLIGHT {
-            self.frame_staging_buffers.push(dynamic_buffer(
-                vk::BufferUsageFlags::TRANSFER_SRC,
-                size_of::<Vertex>(),
+            // Only grown when a frame is captured.
+            self.capture_buffers.push(DynamicBuffer::new(
+                &adapter,
+                &device,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                4,
             )?);
             self.frame_index_buffers.push(dynamic_buffer(
                 vk::BufferUsageFlags::INDEX_BUFFER,
@@ -237,4 +242,27 @@ impl Renderer {
 
         Ok(())
     }
+}
+
+/// The most preferred adapter supporting Vulkan 1.3 that can render, cull, and present to
+/// the `App`'s window unless it's headless. Culling runs on the graphics queue, so it must
+/// also support compute.
+fn pick_adapter(
+    app: &App,
+    surface_instance: &khr::surface::Instance,
+) -> VkResult<(Adapter, QueueFamily)> {
+    for adapter in app.adapters_by_preference() {
+        if !adapter.supports_vulkan_1_3() {
+            continue;
+        }
+        let queue_family = adapter.get_queue_family(
+            surface_instance,
+            app.surface(),
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+        )?;
+        if let Some(queue_family) = queue_family {
+            return Ok((adapter.clone(), queue_family));
+        }
+    }
+    Err(vk::Result::ERROR_INITIALIZATION_FAILED)
 }

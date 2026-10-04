@@ -14,6 +14,7 @@ pub const CHUNK_SIZE: f32 = 2.0 / GRID as f32 * 0.9;
 pub const CHUNK_Z: f32 = 0.5;
 pub const WALL_Z: f32 = 0.2;
 pub const WALL_HALF_SIZE: f32 = 0.5;
+pub const WALL_COLOR: [f32; 3] = [0.9, 0.8, 0.1];
 /// Room for half again the grid's geometry, so remeshing has to reuse freed space.
 pub const CAPACITY: MeshCapacity = MeshCapacity {
     vertices: GRID * GRID * 4 * 3 / 2 + 4,
@@ -43,24 +44,22 @@ pub fn quad(
     )
 }
 
-/// Some chunks are empty, like air in a voxel world.
-pub fn chunk(renderer: &mut Renderer, cell: u32, frame: u32) -> Result<MeshId, vk::Result> {
+/// The corner of a cell's chunk nearest the origin.
+pub fn chunk_min(cell: u32) -> Vec2 {
+    Vec2::new((cell % GRID) as f32, (cell / GRID) as f32) / GRID as f32 * 2.0 - 1.0
+}
+
+/// A chunk's color when it's meshed on `frame`, `None` when it's empty, like air in a voxel world.
+pub fn chunk_color(cell: u32, frame: u32) -> Option<[f32; 3]> {
     if (cell + frame).is_multiple_of(13) {
-        return renderer.create_mesh(&[], &[]);
+        return None;
     }
-    let min = Vec2::new((cell % GRID) as f32, (cell / GRID) as f32) / GRID as f32 * 2.0 - 1.0;
     let shade = ((frame / 7 + cell) % 10) as f32 / 10.0;
-    quad(
-        renderer,
-        min,
-        CHUNK_SIZE,
-        CHUNK_Z,
-        [shade, 1.0 - shade, 0.5],
-    )
+    Some([shade, 1.0 - shade, 0.5])
 }
 
 /// A box's screen rectangle in NDC, `None` when it's outside the frustum.
-fn screen_rect(view_proj: Mat4, min: Vec3, max: Vec3) -> Option<(Vec2, Vec2)> {
+pub fn screen_rect(view_proj: Mat4, min: Vec3, max: Vec3) -> Option<(Vec2, Vec2)> {
     let mut lo = Vec2::splat(f32::MAX);
     let mut hi = Vec2::splat(f32::MIN);
     for corner in 0..8 {
@@ -79,6 +78,8 @@ fn screen_rect(view_proj: Mat4, min: Vec3, max: Vec3) -> Option<(Vec2, Vec2)> {
 
 pub struct Scene {
     pub chunks: Vec<Option<MeshId>>,
+    /// Each chunk's color, `None` when it's empty or wasn't meshed.
+    pub colors: Vec<Option<[f32; 3]>>,
     pub wall: Option<MeshId>,
     pub renderer: Renderer,
     pub app: App,
@@ -90,21 +91,68 @@ pub fn live<'a>(chunks: &'a [Option<MeshId>], wall: &'a Option<MeshId>) -> Vec<&
 }
 
 impl Scene {
+    pub fn new(renderer: Renderer, app: App) -> Self {
+        let cells = (GRID * GRID) as usize;
+        Self {
+            chunks: (0..cells).map(|_| None).collect(),
+            colors: vec![None; cells],
+            wall: None,
+            renderer,
+            app,
+        }
+    }
+
     pub fn clear(&mut self) {
         for id in self.chunks.iter_mut().filter_map(Option::take) {
             self.renderer.destroy_mesh(id);
         }
+        self.colors.fill(None);
         if let Some(wall) = self.wall.take() {
             self.renderer.destroy_mesh(wall);
         }
     }
 
+    /// Every chunk, and the wall in front of them when `wall`.
+    pub fn fill(&mut self, wall: bool) -> Result<(), vk::Result> {
+        if wall {
+            let min = Vec2::splat(-WALL_HALF_SIZE);
+            let size = 2.0 * WALL_HALF_SIZE;
+            self.wall = Some(quad(&mut self.renderer, min, size, WALL_Z, WALL_COLOR)?);
+        }
+        for cell in 0..GRID * GRID {
+            self.remesh(cell, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Replaces a cell's chunk with the one meshed on `frame`. When the pool is full the
+    /// cell is left without one.
+    pub fn remesh(&mut self, cell: u32, frame: u32) -> Result<(), vk::Result> {
+        let index = cell as usize;
+        if let Some(old) = self.chunks[index].take() {
+            self.renderer.destroy_mesh(old);
+        }
+        self.colors[index] = None;
+
+        let color = chunk_color(cell, frame);
+        let id = match color {
+            Some(color) => quad(
+                &mut self.renderer,
+                chunk_min(cell),
+                CHUNK_SIZE,
+                CHUNK_Z,
+                color,
+            )?,
+            None => self.renderer.create_mesh(&[], &[])?,
+        };
+        self.chunks[index] = Some(id);
+        self.colors[index] = color;
+        Ok(())
+    }
+
     /// Meshes in view, and of those, how many the wall can't hide.
     pub fn expected(&self, view_proj: Mat4) -> (u32, u32) {
-        let wall = self.wall.as_ref().and_then(|wall| {
-            let mesh = self.renderer.mesh(wall);
-            screen_rect(view_proj, mesh.bounds_min, mesh.bounds_max)
-        });
+        let wall = self.wall_rect(view_proj);
         let (mut in_view, mut must_draw) = (0, 0);
         for id in live(&self.chunks, &self.wall) {
             let mesh = self.renderer.mesh(id);
@@ -123,5 +171,11 @@ impl Scene {
             }
         }
         (in_view, must_draw)
+    }
+
+    /// The wall's screen rectangle in NDC, when there is one in view.
+    pub fn wall_rect(&self, view_proj: Mat4) -> Option<(Vec2, Vec2)> {
+        let mesh = self.renderer.mesh(self.wall.as_ref()?);
+        screen_rect(view_proj, mesh.bounds_min, mesh.bounds_max)
     }
 }

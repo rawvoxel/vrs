@@ -5,9 +5,9 @@ use ash::{prelude::VkResult, vk};
 /// A buffer which grows whenever it's too small. By default a persistently mapped
 /// `HOST_VISIBLE` buffer the device reads directly.
 pub struct DynamicBuffer {
-    pub buffer: Buffer,
-    pub usage: vk::BufferUsageFlags,
-    pub memory_flags: vk::MemoryPropertyFlags,
+    pub(crate) buffer: Buffer,
+    pub(crate) usage: vk::BufferUsageFlags,
+    pub(crate) memory_flags: vk::MemoryPropertyFlags,
 }
 
 impl DynamicBuffer {
@@ -57,6 +57,12 @@ impl DynamicBuffer {
         })
     }
 
+    /// The current buffer, which growing replaces.
+    #[inline]
+    pub fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
     #[inline]
     pub fn capacity(&self) -> vk::DeviceSize {
         self.buffer.size
@@ -87,16 +93,37 @@ impl DynamicBuffer {
         logical_device: &ash::Device,
         byte_count: vk::DeviceSize,
     ) -> VkResult<()> {
-        if byte_count > self.capacity() {
-            let grown = Self::with_memory(
-                adapter,
-                logical_device,
-                self.usage,
-                self.memory_flags,
-                byte_count.next_power_of_two(),
-            )?;
-            unsafe { std::mem::replace(self, grown).destroy(logical_device) };
+        unsafe { self.reserve_preserving(adapter, logical_device, byte_count, 0) }
+    }
+
+    /// Like `reserve`, but keeps the first `keep` bytes, which only mapped memory can.
+    ///
+    /// # Safety
+    /// The device must not be using the buffer, and a grown buffer has a new handle.
+    pub unsafe fn reserve_preserving(
+        &mut self,
+        adapter: &Adapter,
+        logical_device: &ash::Device,
+        byte_count: vk::DeviceSize,
+        keep: vk::DeviceSize,
+    ) -> VkResult<()> {
+        if byte_count <= self.capacity() {
+            return Ok(());
         }
+        let mut grown = Self::with_memory(
+            adapter,
+            logical_device,
+            self.usage,
+            self.memory_flags,
+            byte_count.next_power_of_two(),
+        )?;
+        if keep > 0 {
+            let mut kept = vec![0u8; keep as usize];
+            // SAFETY: Any byte is a valid `u8`.
+            unsafe { self.buffer.mem_read_at(0, &mut kept) };
+            grown.buffer.mem_write_at(0, &kept);
+        }
+        unsafe { std::mem::replace(self, grown).destroy(logical_device) };
         Ok(())
     }
 
