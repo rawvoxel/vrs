@@ -13,7 +13,7 @@ pub use crate::gi::GiConfig;
 pub use capture::Capture;
 pub use config::RendererConfig;
 pub use debug::{FrameStats, MeshPoolStats};
-pub use lighting::{Lighting, LightingUniforms, ShadowGrid};
+pub use lighting::{Lighting, LightingUniforms, ShadowGrid, ShadowResolution};
 
 use crate::{
     adapter::Adapter,
@@ -24,6 +24,7 @@ use crate::{
     hiz::DepthPyramid,
     mesh::{MeshId, MeshPool},
     queue::{Queue, QueueFamily},
+    shadows::ShadowPass,
     surface::Surface,
     swapchain::Swapchain,
     sync::create_semaphore,
@@ -73,6 +74,8 @@ pub struct Renderer {
     depth_pyramid: DepthPyramid,
     /// The light probes, a single unused one when there's no `RendererConfig::global_illumination`.
     probe_volume: ProbeVolume,
+    /// Sun shadows traced below full resolution, see `Lighting::shadow_resolution`.
+    shadow_pass: ShadowPass,
     gi_configured: bool,
     /// Frames submitted, which seeds each frame's probe rays.
     frame_number: u64,
@@ -122,6 +125,10 @@ pub struct Renderer {
 
     /// Draws the mesh pool's meshes, pulling their vertices.
     mesh_pipeline: vk::Pipeline,
+    /// Draws the mesh pool's meshes' depth alone, for shadows traced below full resolution.
+    mesh_depth_pipeline: vk::Pipeline,
+    /// Draws the mesh pool's meshes' color over their depth already drawn.
+    mesh_over_depth_pipeline: vk::Pipeline,
     /// Draws each frame's own geometry from `frame_vertex_buffers`.
     dynamic_pipeline: vk::Pipeline,
     graphics_pipeline_layout: vk::PipelineLayout,
@@ -183,6 +190,7 @@ impl Renderer {
         if self.swapchain_outdated || self.swapchain.extent != surface_extent {
             self.rebuild_swapchain(surface_extent)?;
         }
+        self.prepare_shadow_pass()?;
 
         // Every visible mesh is drawn by one counted indirect call.
         if draws.meshes.len() > self.adapter.properties.limits.max_draw_indirect_count as usize {
@@ -261,6 +269,24 @@ impl Renderer {
         )
     }
 
+    /// Readies a new shadow image, waiting for the device.
+    fn init_shadow_pass(&self) -> VkResult<()> {
+        record_submit_commandbuffer(
+            &self.render_device,
+            self.init_cmd_buffer,
+            self.init_cmd_fence,
+            self.graphics_queue.handle,
+            &[],
+            &[],
+            &[],
+            |cmd_buffer| unsafe { self.shadow_pass.cmd_init(&self.render_device, cmd_buffer) },
+        )?;
+        unsafe {
+            self.render_device
+                .wait_for_fences(&[self.init_cmd_fence], true, u64::MAX)
+        }
+    }
+
     /// Readies the light probes, waiting for the device.
     fn init_probe_volume(&self) -> VkResult<()> {
         record_submit_commandbuffer(
@@ -293,6 +319,7 @@ impl Drop for Renderer {
             self.culler.destroy(device);
             self.depth_pyramid.destroy(device);
             self.probe_volume.destroy(device);
+            self.shadow_pass.destroy(device);
             for buffer in self
                 .capture_buffers
                 .iter()
@@ -326,6 +353,8 @@ impl Drop for Renderer {
             device.destroy_command_pool(self.init_cmd_pool, None);
 
             device.destroy_pipeline(self.mesh_pipeline, None);
+            device.destroy_pipeline(self.mesh_depth_pipeline, None);
+            device.destroy_pipeline(self.mesh_over_depth_pipeline, None);
             device.destroy_pipeline(self.dynamic_pipeline, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             device.destroy_device(None);

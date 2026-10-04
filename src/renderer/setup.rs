@@ -11,8 +11,11 @@ use crate::{
     gi::ProbeVolume,
     hiz::DepthPyramid,
     mesh::MeshPool,
-    pipeline::{create_graphics_pipeline, create_pipeline_layout, create_shader_module},
+    pipeline::{
+        PipelinePass, create_graphics_pipeline, create_pipeline_layout, create_shader_module,
+    },
     queue::{Queue, QueueFamily},
+    shadows::ShadowPass,
     surface::Surface,
     swapchain::Swapchain,
     sync::{create_fence, create_semaphore},
@@ -75,6 +78,7 @@ impl Renderer {
             culler: Culler::null(),
             depth_pyramid: DepthPyramid::null(),
             probe_volume: ProbeVolume::null(),
+            shadow_pass: ShadowPass::null(),
             gi_configured: config.global_illumination.is_some(),
             frame_number: 0,
             last_frame: None,
@@ -111,6 +115,8 @@ impl Renderer {
             shadow_table: Vec::new(),
 
             mesh_pipeline: vk::Pipeline::null(),
+            mesh_depth_pipeline: vk::Pipeline::null(),
+            mesh_over_depth_pipeline: vk::Pipeline::null(),
             dynamic_pipeline: vk::Pipeline::null(),
             graphics_pipeline_layout: vk::PipelineLayout::null(),
             graphics_queue: Queue::new(&graphics_queue_family, &render_device, 0),
@@ -133,7 +139,8 @@ impl Renderer {
         // Frame Descriptors, matching the bindings in `common.slang`: the uniforms, the mesh
         // pool's vertices, mesh infos and voxel types, the palette and the shadow table, then
         // the light probes, their atlases sampled, their atlases written, their rays and the
-        // probes they're tracing.
+        // probes they're tracing, then the low resolution shadows written, the depth buffer
+        // they're traced from, and the shadows sampled.
         let bindings = [
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
@@ -148,6 +155,9 @@ impl Renderer {
             vk::DescriptorType::STORAGE_IMAGE,
             vk::DescriptorType::STORAGE_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
         ];
         let pool_sizes = [
             vk::DescriptorType::UNIFORM_BUFFER,
@@ -184,18 +194,35 @@ impl Renderer {
         // Graphics Pipelines
         self.graphics_pipeline_layout =
             create_pipeline_layout(&device, slice::from_ref(&self.frame_desc_set_layout))?;
-        for (pipeline, spv, entries, vertex_input) in [
+        let mesh_entries = (c"meshVert", c"meshFrag");
+        for (pipeline, spv, entries, vertex_input, pass) in [
             (
                 &mut self.mesh_pipeline,
                 MESH_SPV,
-                (c"meshVert", c"meshFrag"),
+                mesh_entries,
                 false,
+                PipelinePass::Shaded,
+            ),
+            (
+                &mut self.mesh_depth_pipeline,
+                MESH_SPV,
+                mesh_entries,
+                false,
+                PipelinePass::DepthOnly,
+            ),
+            (
+                &mut self.mesh_over_depth_pipeline,
+                MESH_SPV,
+                mesh_entries,
+                false,
+                PipelinePass::ShadedOverDepth,
             ),
             (
                 &mut self.dynamic_pipeline,
                 DYNAMIC_SPV,
                 (c"vertMain", c"fragMain"),
                 true,
+                PipelinePass::Shaded,
             ),
         ] {
             let shader_module = create_shader_module(&device, spv)?;
@@ -205,6 +232,7 @@ impl Renderer {
                 shader_module,
                 entries,
                 vertex_input,
+                pass,
                 self.graphics_pipeline_layout,
             );
             unsafe { device.destroy_shader_module(shader_module, None) };
@@ -256,6 +284,10 @@ impl Renderer {
         self.probe_volume
             .write_descriptors(&device, &self.frame_desc_sets);
         self.init_probe_volume()?;
+
+        // Shadows below full resolution, with the graphics pipelines' layout too.
+        self.shadow_pass = ShadowPass::new(&adapter, &device, self.graphics_pipeline_layout)?;
+        self.init_shadow_pass()?;
 
         // Meshes
         self.mesh_pool = MeshPool::new(

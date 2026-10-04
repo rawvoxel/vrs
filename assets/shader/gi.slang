@@ -180,7 +180,7 @@ void traceProbeRays(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID) {
     } else {
         // Lit as the camera would see it, with last frame's light from the probes.
         float3 worldPosition = (probe.position + direction * hit.distance) * ubo.lighting.shadowGrid.x;
-        float3 light = lightAt(worldPosition, hit.normal, hit.normal, -direction, true);
+        float3 light = lightAt(worldPosition, hit.normal, hit.normal, -direction, true, -1.0);
         result = float4(paletteColor(hit.id) * light, hit.distance);
     }
     rayResults[listed * rays + ray] = result;

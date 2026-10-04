@@ -16,6 +16,7 @@ pub mod mesh;
 pub(crate) mod pipeline;
 pub mod queue;
 pub mod renderer;
+pub mod shadows;
 pub mod surface;
 pub mod swapchain;
 pub mod sync;

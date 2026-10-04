@@ -5,7 +5,7 @@ use ash::prelude::VkResult;
 use glam::{Mat4, Vec3};
 use vrs::{
     mesh::{MeshCapacity, MeshId},
-    renderer::{GiConfig, Renderer, RendererConfig, ShadowGrid},
+    renderer::{GiConfig, Renderer, RendererConfig, ShadowGrid, ShadowResolution},
     voxel::{ChunkMesh, ChunkVertices, VoxelTypes},
 };
 
@@ -67,7 +67,7 @@ fn voxel_type(height: i32, depth: i32) -> u16 {
 }
 
 /// Meshes every chunk with ground in it and adds it to `renderer`, setting its palette, and
-/// lights it with a low sun whose shadows are traced through the chunks.
+/// lights it with a low sun whose shadows are traced through the chunks at half resolution.
 pub fn create(renderer: &mut Renderer) -> VkResult<Vec<MeshId>> {
     renderer.set_palette(&palette());
     renderer.lighting.sun_direction = Vec3::new(-0.6, 0.5, 0.25);
@@ -75,6 +75,8 @@ pub fn create(renderer: &mut Renderer) -> VkResult<Vec<MeshId>> {
         voxel_size: 1.0,
         voxels_per_edge: EDGE as u32,
     });
+    // One shadow ray per 2x2 pixels, which looks nearly the same for well under half the cost.
+    renderer.lighting.shadow_resolution = ShadowResolution::Half;
     let edge = EDGE as i32;
     let world = CHUNKS.map(|chunks| chunks as i32 * edge);
     let mut ids = Vec::new();

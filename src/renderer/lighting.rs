@@ -5,6 +5,7 @@ use super::Renderer;
 use crate::{
     gi::{GiUniforms, PROBE_CELL},
     mesh::MeshKind,
+    shadows::ShadowUniforms,
 };
 use ash::prelude::VkResult;
 use glam::{IVec3, Mat4, Quat, Vec3};
@@ -21,6 +22,30 @@ const NO_CHUNK: u32 = u32::MAX;
 pub struct ShadowGrid {
     pub voxel_size: f32,
     pub voxels_per_edge: u32,
+}
+
+/// How finely sun shadows are traced, see `Lighting::shadow_resolution`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShadowResolution {
+    /// A shadow ray for every pixel, as it's shaded.
+    #[default]
+    Full,
+    /// One for every 2x2 pixels.
+    Half,
+    /// One for every 4x4 pixels.
+    Quarter,
+}
+
+impl ShadowResolution {
+    /// Frame pixels along each axis that share a shadow ray.
+    #[inline]
+    pub fn pixels_per_ray(self) -> u32 {
+        match self {
+            ShadowResolution::Full => 1,
+            ShadowResolution::Half => 2,
+            ShadowResolution::Quarter => 4,
+        }
+    }
 }
 
 /// How chunk meshes are lit, see `Renderer::lighting`. Colored meshes keep their own colors.
@@ -46,6 +71,11 @@ pub struct Lighting {
     /// Their rays are traced through the `shadow_grid`, which needs `voxels_per_edge` to be a
     /// multiple of 16. Outside the probes, chunks are lit by the sky and ground colors.
     pub global_illumination: bool,
+    /// How finely sun shadows are traced. Below full resolution, frames draw their depth
+    /// first, trace a shadow ray for each block of pixels from it, then draw their color over
+    /// it, upscaling the shadows. That costs drawing every mesh twice, and makes shadows'
+    /// edges a little softer.
+    pub shadow_resolution: ShadowResolution,
 }
 
 impl Default for Lighting {
@@ -59,6 +89,7 @@ impl Default for Lighting {
             shadow_grid: None,
             shadow_distance: 512.0,
             global_illumination: true,
+            shadow_resolution: ShadowResolution::Full,
         }
     }
 }
@@ -79,6 +110,45 @@ pub struct LightingUniforms {
 }
 
 impl Renderer {
+    /// Frame pixels along each axis that share a shadow ray, 1 when shading traces its own
+    /// or there are no shadows.
+    pub(super) fn shadow_scale(&self) -> u32 {
+        match self.lighting.shadow_grid {
+            Some(_) => self.lighting.shadow_resolution.pixels_per_ray(),
+            None => 1,
+        }
+    }
+
+    /// Makes the shadow image fit the frame and `shadow_scale`, waiting for the device to go
+    /// idle when it has to be replaced.
+    pub(super) fn prepare_shadow_pass(&mut self) -> VkResult<()> {
+        let scale = self.shadow_scale();
+        let frame = self.swapchain.extent;
+        let fits = self.shadow_pass.scale == scale
+            && self.shadow_pass.extent.width == frame.width.div_ceil(scale)
+            && self.shadow_pass.extent.height == frame.height.div_ceil(scale);
+        if scale == 1 || fits {
+            return Ok(());
+        }
+        unsafe {
+            self.render_device.device_wait_idle()?;
+            self.shadow_pass
+                .resize(&self.adapter, &self.render_device, frame, scale)?;
+        }
+        self.init_shadow_pass()
+    }
+
+    /// The shadow pass's uniforms for a frame seen through `view_proj`.
+    pub(super) fn shadow_uniforms(&self, view_proj: Mat4) -> ShadowUniforms {
+        let extent = self.shadow_pass.extent;
+        let frame = self.swapchain.extent;
+        ShadowUniforms {
+            inverse_view_proj: view_proj.inverse(),
+            params: [self.shadow_scale(), extent.width, extent.height, 0],
+            frame_size: [frame.width, frame.height, 0, 0],
+        }
+    }
+
     /// Whether this frame updates and samples the light probes, see `Lighting::global_illumination`.
     pub(super) fn gi_enabled(&self) -> bool {
         self.gi_configured

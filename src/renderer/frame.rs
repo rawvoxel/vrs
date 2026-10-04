@@ -14,6 +14,8 @@ pub(super) struct FrameData {
     pub view_proj: Mat4,
     /// Whether the light probes are updated and sampled.
     pub gi: bool,
+    /// Frame pixels along each axis that share a shadow ray, see `Renderer::shadow_scale`.
+    pub shadow_scale: u32,
 }
 
 impl FrameData {
@@ -24,8 +26,9 @@ impl FrameData {
 }
 
 impl Renderer {
-    /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces, and
-    /// its palette and shadow table, which growing replaces. The uniforms never move.
+    /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces, its
+    /// palette and shadow table, which growing replaces, and the depth buffer and shadow image,
+    /// which resizing replaces. The uniforms and light probes never move.
     ///
     /// # Safety
     /// The device must not be using `frame`'s descriptor set.
@@ -53,7 +56,39 @@ impl Renderer {
                     .buffer_info(slice::from_ref(buffer_info))
             })
             .collect();
-        unsafe { self.render_device.update_descriptor_sets(&writes, &[]) };
+        let shadow_storage = vk::DescriptorImageInfo::default()
+            .image_view(self.shadow_pass.view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let depth_sampled = vk::DescriptorImageInfo::default()
+            .image_view(self.swapchain.depth_image_view)
+            .sampler(self.shadow_pass.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let shadow_sampled = shadow_storage.sampler(self.shadow_pass.sampler);
+        let image_writes = [
+            (13, vk::DescriptorType::STORAGE_IMAGE, &shadow_storage),
+            (
+                14,
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                &depth_sampled,
+            ),
+            (
+                15,
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                &shadow_sampled,
+            ),
+        ]
+        .map(|(binding, ty, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.frame_desc_sets[frame])
+                .dst_binding(binding)
+                .descriptor_type(ty)
+                .image_info(slice::from_ref(info))
+        });
+        unsafe {
+            self.render_device.update_descriptor_sets(&writes, &[]);
+            self.render_device
+                .update_descriptor_sets(&image_writes, &[]);
+        }
     }
 
     /// Waits for the device to finish `frame`'s last use, freeing up what it used.
@@ -138,6 +173,7 @@ impl Renderer {
             },
             lighting,
             gi: self.gi_uniforms(draws.view),
+            shadow: self.shadow_uniforms(draws.proj * draws.view),
         };
         self.uniform_buffers[frame].mem_write(slice::from_ref(&uniforms));
 
@@ -150,6 +186,7 @@ impl Renderer {
             dynamic_index_count: draws.indices.len() as u32,
             view_proj: draws.proj * draws.view,
             gi: self.gi_enabled(),
+            shadow_scale: self.shadow_scale(),
         })
     }
 

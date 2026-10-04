@@ -1,4 +1,7 @@
-use crate::{adapter::Adapter, buffer::Buffer, gi::GiUniforms, renderer::LightingUniforms};
+use crate::{
+    adapter::Adapter, buffer::Buffer, gi::GiUniforms, renderer::LightingUniforms,
+    shadows::ShadowUniforms,
+};
 use ash::{prelude::VkResult, vk};
 use glam::{Mat4, Vec4};
 use std::slice;
@@ -11,6 +14,7 @@ pub struct FrameUniforms {
     pub matrices: MvpMatrices,
     pub lighting: LightingUniforms,
     pub gi: GiUniforms,
+    pub shadow: ShadowUniforms,
 }
 
 #[repr(C)]

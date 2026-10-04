@@ -2,7 +2,7 @@ mod compute;
 mod graphics;
 
 pub use compute::create_compute_pipeline;
-pub use graphics::{create_graphics_pipeline, create_pipeline_layout};
+pub use graphics::{PipelinePass, create_graphics_pipeline, create_pipeline_layout};
 
 use ash::{prelude::VkResult, util, vk};
 use std::io::Cursor;

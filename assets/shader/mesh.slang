@@ -26,6 +26,13 @@ static const float3 FACE_NORMALS[6] = {
 // How far inside a face, in voxels, its fragments are moved to find their voxel: far above
 // the float error of an interpolated position, far below a voxel.
 static const float FACE_NUDGE = 1.0 / 256.0;
+// How much nearer or further, relative to its distance, a shadow texel's surface can be than
+// a pixel's and still shadow it.
+static const float SHADOW_DEPTH_TOLERANCE = 0.08;
+
+// The sun's visibility and the surface's distance for each block of pixels, when shadows are
+// traced at a fraction of the frame's resolution, see `shadow.slang`.
+[[vk::binding(15, 0)]] Sampler2D<float4> shadowTexels;
 
 struct VSOutput {
     float4 position : SV_Position;
@@ -95,6 +102,38 @@ uint3 cellAt(float3 p, uint edge) {
     return uint3(clamp(int3(floor(p)), int3(0), int3(int(edge) - 1)));
 }
 
+// The sun's visibility at the frame pixel centered on `pixel`, whose surface is `distance`
+// from the camera, upscaled from the shadow texels: the 4 nearest, weighted by how near each
+// is, of those whose surface is about as far. With none, the one whose surface is nearest in
+// distance, so shadows don't bleed across edges.
+float upscaledShadow(float2 pixel, float distance) {
+    float scale = float(ubo.shadow.params.x);
+    float2 size = float2(ubo.shadow.params.yz);
+    // Each texel holds the pixel at its block's center.
+    float2 texel = (pixel - 0.5 - floor(scale * 0.5)) / scale;
+    int2 base = int2(floor(texel));
+    float2 alpha = texel - float2(base);
+    float sum = 0.0;
+    float totalWeight = 0.0;
+    float closest = 1e9;
+    float closestVisible = 1.0;
+    for (int i = 0; i < 4; i++) {
+        int2 offset = int2(i & 1, i >> 1);
+        float2 tap = clamp(float2(base + offset), 0.0, size - 1.0);
+        float2 shadow = shadowTexels.SampleLevel((tap + 0.5) / size, 0.0).xy;
+        float difference = abs(shadow.y - distance) / max(distance, 1e-3);
+        if (difference < closest) {
+            closest = difference;
+            closestVisible = shadow.x;
+        }
+        float2 bilinear = lerp(1.0 - alpha, alpha, float2(offset));
+        float weight = bilinear.x * bilinear.y * saturate(1.0 - difference / SHADOW_DEPTH_TOLERANCE);
+        sum += weight * shadow.x;
+        totalWeight += weight;
+    }
+    return totalWeight > 1e-4 ? sum / totalWeight : closestVisible;
+}
+
 [shader("fragment")]
 float4 meshFrag(VSOutput input) : SV_Target {
     // The triangle's outward normal, from screen derivatives. Taken before
@@ -115,7 +154,9 @@ float4 meshFrag(VSOutput input) : SV_Target {
 
     // Greedy normals are exact already, packed ones are interpolated between vertices.
     float3 normal = input.kind == KIND_GREEDY ? input.normal : normalize(input.normal);
-    float3 toViewer = normalize(ubo.gi.cameraPosition.xyz - input.worldPosition);
-    float3 light = lightAt(input.worldPosition, normal, faceNormal, toViewer, false);
+    float3 fromCamera = input.worldPosition - ubo.gi.cameraPosition.xyz;
+    float3 toViewer = -normalize(fromCamera);
+    float sunVisible = ubo.shadow.params.x > 1 ? upscaledShadow(input.position.xy, length(fromCamera)) : -1.0;
+    float3 light = lightAt(input.worldPosition, normal, faceNormal, toViewer, false, sunVisible);
     return float4(paletteColor(id) * light, 1.0);
 }

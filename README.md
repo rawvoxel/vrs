@@ -73,6 +73,9 @@ drop(renderer);
   width, placed on a grid from the world's origin. Chunks of other sizes are lit but cast no
   shadows, and chunks with no faces, such as under the ground, should still be created for
   their voxels to cast shadows.
+  `Lighting::shadow_resolution` traces one shadow ray per 2x2 or 4x4 pixels instead of every
+  pixel: frames draw their depth first, trace the shadows from it, then draw their color over
+  it, upscaling the shadows by distance so they don't bleed across edges.
 - **Global illumination**: with `RendererConfig::global_illumination`, a volume of light
   probes 16 voxels apart follows the camera, and lights chunks inside it with light bounced
   off the voxels around them, in place of the sky and ground colors. It's dynamic diffuse

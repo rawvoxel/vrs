@@ -47,6 +47,17 @@ struct GiUniforms {
     uint4 frame;
 };
 
+// Matches `shadows::ShadowUniforms`.
+struct ShadowUniforms {
+    // From clip space back to the world.
+    float4x4 inverseViewProj;
+    // Frame pixels per shadow texel along each axis, 1 when shading traces its own, then the
+    // shadow image's width and height.
+    uint4 params;
+    // The frame's width and height.
+    uint4 frameSize;
+};
+
 // Matches `uniforms::FrameUniforms`.
 struct Uniforms {
     float4x4 model;
@@ -54,6 +65,7 @@ struct Uniforms {
     float4x4 proj;
     LightingUniforms lighting;
     GiUniforms gi;
+    ShadowUniforms shadow;
 };
 
 // A light probe, matches `gi::PROBE_SIZE`. Positions are in the shadow grid's voxels.
@@ -409,13 +421,14 @@ float3 ambientLight(float3 normal) {
 
 // The light reaching a surface at `worldPosition` with unit normal `normal`, seen from
 // direction `toViewer`. `faceNormal` is the triangle's own, which rays leave the surface
-// along.
+// along. `sunVisible` is how much of the sun reaches it when already known, or negative for
+// a shadow ray to find out.
 //
 // For the probes' own rays, `probeRay` is true: only probes that have been updated before
 // count, and where none covers the surface inside the volume, there's no indirect light yet.
 // The sky's would leak into closed rooms, and with every bounce adding to the next, take
 // many frames to fade.
-float3 lightAt(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay) {
+float3 lightAt(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay, float sunVisible) {
     LightingUniforms lighting = ubo.lighting;
     float3 gridPosition = worldPosition / max(lighting.shadowGrid.x, 1e-6);
     float3 indirect = ambientLight(normal);
@@ -432,9 +445,11 @@ float3 lightAt(float3 worldPosition, float3 normal, float3 faceNormal, float3 to
     if (facing <= 0.0) {
         return indirect;
     }
-    float visible = 1.0;
-    if (lighting.shadowTable.w > 0) {
-        visible = sunVisibility(gridPosition + faceNormal * SHADOW_RAY_OFFSET, lighting.sunDirection.xyz);
+    float visible = sunVisible;
+    if (visible < 0.0) {
+        visible = lighting.shadowTable.w > 0
+            ? sunVisibility(gridPosition + faceNormal * SHADOW_RAY_OFFSET, lighting.sunDirection.xyz)
+            : 1.0;
     }
     return indirect + lighting.sunColor.rgb * facing * visible;
 }

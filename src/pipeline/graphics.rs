@@ -12,18 +12,30 @@ pub fn create_pipeline_layout(
     unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
 }
 
+/// What a graphics pipeline draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelinePass {
+    /// Color, and depth.
+    Shaded,
+    /// Depth alone, without a fragment shader or color attachment.
+    DepthOnly,
+    /// Color over depth already drawn, testing against it without writing it.
+    ShadedOverDepth,
+}
+
 /// The renderer's pipeline drawing into `surface`, with the vertex and fragment shaders of
-/// `entries`. With `vertex_input` it reads `Vertex`es from a vertex buffer, without, the
-/// vertex shader pulls its own.
+/// `entries`, the fragment shader unused for `PipelinePass::DepthOnly`. With `vertex_input`
+/// it reads `Vertex`es from a vertex buffer, without, the vertex shader pulls its own.
 pub fn create_graphics_pipeline(
     surface: &Surface,
     render_device: &ash::Device,
     shader_module: vk::ShaderModule,
     entries: (&CStr, &CStr),
     vertex_input: bool,
+    pass: PipelinePass,
     pipeline_layout: vk::PipelineLayout,
 ) -> VkResult<vk::Pipeline> {
-    let shader_stage_infos = [
+    let all_stages = [
         vk::PipelineShaderStageCreateInfo::default()
             .module(shader_module)
             .name(entries.0)
@@ -33,6 +45,10 @@ pub fn create_graphics_pipeline(
             .name(entries.1)
             .stage(vk::ShaderStageFlags::FRAGMENT),
     ];
+    let shader_stage_infos = match pass {
+        PipelinePass::DepthOnly => &all_stages[..1],
+        PipelinePass::Shaded | PipelinePass::ShadedOverDepth => &all_stages[..],
+    };
 
     let vertex_input_state_info = match vertex_input {
         true => vk::PipelineVertexInputStateCreateInfo::default()
@@ -67,9 +83,13 @@ pub fn create_graphics_pipeline(
         .alpha_blend_op(vk::BlendOp::ADD)
         .color_write_mask(vk::ColorComponentFlags::RGBA)];
 
+    let color_attachments = match pass {
+        PipelinePass::DepthOnly => 0,
+        PipelinePass::Shaded | PipelinePass::ShadedOverDepth => 1,
+    };
     let color_blend_state_info = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op(vk::LogicOp::CLEAR)
-        .attachments(&color_blend_attachment_states);
+        .attachments(&color_blend_attachment_states[..color_attachments]);
 
     let noop_stencil_state = vk::StencilOpState::default()
         .fail_op(vk::StencilOp::KEEP)
@@ -79,7 +99,7 @@ pub fn create_graphics_pipeline(
 
     let depth_state_info = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
-        .depth_write_enable(true)
+        .depth_write_enable(pass != PipelinePass::ShadedOverDepth)
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
         .front(noop_stencil_state)
         .back(noop_stencil_state)
@@ -92,12 +112,12 @@ pub fn create_graphics_pipeline(
     ]);
 
     let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(slice::from_ref(&surface.format))
+        .color_attachment_formats(&slice::from_ref(&surface.format)[..color_attachments])
         .depth_attachment_format(surface.depth_format);
 
     let graphics_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .push_next(&mut pipeline_rendering_info)
-        .stages(&shader_stage_infos)
+        .stages(shader_stage_infos)
         .vertex_input_state(&vertex_input_state_info)
         .input_assembly_state(&vertex_input_assembly_state_info)
         .viewport_state(&viewport_state_info)

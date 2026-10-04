@@ -13,6 +13,9 @@ impl Renderer {
     ///
     /// With occlusion culling: phase 1 culling, pass 1, the depth pyramid,
     /// phase 2 culling and pass 2. Without, frustum culling and one pass.
+    ///
+    /// With shadows below full resolution, those passes draw only depth, then the shadows are
+    /// traced from it, then one more pass draws color over the depth.
     pub(super) fn record_frame(
         &mut self,
         frame: usize,
@@ -60,27 +63,78 @@ impl Renderer {
             }
 
             self.cmd_begin_attachments(cmd_buffer, image_index);
+            let shaded = data.shadow_scale == 1;
+            let (color, mesh_pipeline) = match shaded {
+                true => (Some(color_view), self.mesh_pipeline),
+                false => (None, self.mesh_depth_pipeline),
+            };
 
-            // Pass 1, with all dynamic geometry
-            self.cmd_begin_rendering(cmd_buffer, color_view, vk::AttachmentLoadOp::CLEAR);
+            // Pass 1, with all dynamic geometry when it's shaded
+            let clear = vk::AttachmentLoadOp::CLEAR;
+            self.cmd_begin_rendering(cmd_buffer, color.map(|view| (view, clear)), clear);
             self.cmd_bind_graphics(cmd_buffer, frame);
             if culling {
-                self.cmd_draw_meshes(cmd_buffer, frame, first_phase, candidate_count);
+                self.cmd_draw_meshes(
+                    cmd_buffer,
+                    frame,
+                    first_phase,
+                    candidate_count,
+                    mesh_pipeline,
+                );
             }
-            if data.dynamic_index_count > 0 {
+            if shaded && data.dynamic_index_count > 0 {
                 self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
             }
             self.render_device.cmd_end_rendering(cmd_buffer);
 
+            let load = vk::AttachmentLoadOp::LOAD;
             if occlusion {
                 self.cmd_build_depth_pyramid(cmd_buffer);
                 self.cmd_cull(cmd_buffer, frame, data, Phase::Occlusion);
                 self.cmd_resume_attachments(cmd_buffer);
 
                 // Pass 2, what phase 2 found newly visible
-                self.cmd_begin_rendering(cmd_buffer, color_view, vk::AttachmentLoadOp::LOAD);
+                self.cmd_begin_rendering(cmd_buffer, color.map(|view| (view, load)), load);
                 self.cmd_bind_graphics(cmd_buffer, frame);
-                self.cmd_draw_meshes(cmd_buffer, frame, Phase::Occlusion, candidate_count);
+                self.cmd_draw_meshes(
+                    cmd_buffer,
+                    frame,
+                    Phase::Occlusion,
+                    candidate_count,
+                    mesh_pipeline,
+                );
+                self.render_device.cmd_end_rendering(cmd_buffer);
+            }
+
+            if !shaded {
+                // Shadows from the depth, then color over it.
+                self.cmd_depth_for_compute(cmd_buffer);
+                self.shadow_pass.cmd_trace(
+                    &self.render_device,
+                    cmd_buffer,
+                    self.frame_desc_sets[frame],
+                    self.graphics_pipeline_layout,
+                );
+                self.cmd_resume_attachments(cmd_buffer);
+
+                self.cmd_begin_rendering(cmd_buffer, Some((color_view, clear)), load);
+                self.cmd_bind_graphics(cmd_buffer, frame);
+                if culling {
+                    let pipeline = self.mesh_over_depth_pipeline;
+                    self.cmd_draw_meshes(cmd_buffer, frame, first_phase, candidate_count, pipeline);
+                    if occlusion {
+                        self.cmd_draw_meshes(
+                            cmd_buffer,
+                            frame,
+                            Phase::Occlusion,
+                            candidate_count,
+                            pipeline,
+                        );
+                    }
+                }
+                if data.dynamic_index_count > 0 {
+                    self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
+                }
                 self.render_device.cmd_end_rendering(cmd_buffer);
             }
 
@@ -174,18 +228,7 @@ impl Renderer {
 
     /// Builds the depth pyramid from pass 1's depth.
     fn cmd_build_depth_pyramid(&self, cmd_buffer: vk::CommandBuffer) {
-        image::transition_layout(
-            &self.render_device,
-            self.swapchain.depth_image.handle,
-            cmd_buffer,
-            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            vk::AccessFlags2::SHADER_SAMPLED_READ,
-            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            vk::PipelineStageFlags2::COMPUTE_SHADER,
-            vk::ImageAspectFlags::DEPTH,
-        );
+        self.cmd_depth_for_compute(cmd_buffer);
         unsafe {
             self.depth_pyramid
                 .cmd_build(&self.render_device, cmd_buffer)
@@ -230,27 +273,49 @@ impl Renderer {
         };
     }
 
-    /// Clears or keeps the frame's color and depth, depth is always stored for later passes.
+    /// Readies the depth buffer for compute shaders to sample, after a pass drew it.
+    fn cmd_depth_for_compute(&self, cmd_buffer: vk::CommandBuffer) {
+        image::transition_layout(
+            &self.render_device,
+            self.swapchain.depth_image.handle,
+            cmd_buffer,
+            vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::AccessFlags2::SHADER_SAMPLED_READ,
+            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::PipelineStageFlags2::COMPUTE_SHADER,
+            vk::ImageAspectFlags::DEPTH,
+        );
+    }
+
+    /// Clears or keeps the frame's color, when the pass draws it, and depth, which is always
+    /// stored for later passes.
     fn cmd_begin_rendering(
         &self,
         cmd_buffer: vk::CommandBuffer,
-        color_view: vk::ImageView,
-        load_op: vk::AttachmentLoadOp,
+        color: Option<(vk::ImageView, vk::AttachmentLoadOp)>,
+        depth_load_op: vk::AttachmentLoadOp,
     ) {
-        let color_attachment_info = vk::RenderingAttachmentInfo::default()
-            .image_view(color_view)
-            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .load_op(load_op)
-            .store_op(vk::AttachmentStoreOp::STORE)
-            .clear_value(vk::ClearValue {
-                color: vk::ClearColorValue {
-                    float32: self.clear_color,
-                },
-            });
+        let color_attachment_infos: Vec<vk::RenderingAttachmentInfo> = color
+            .map(|(view, load_op)| {
+                vk::RenderingAttachmentInfo::default()
+                    .image_view(view)
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(load_op)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: self.clear_color,
+                        },
+                    })
+            })
+            .into_iter()
+            .collect();
         let depth_attachment_info = vk::RenderingAttachmentInfo::default()
             .image_view(self.swapchain.depth_image_view)
             .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-            .load_op(load_op)
+            .load_op(depth_load_op)
             .store_op(vk::AttachmentStoreOp::STORE)
             .clear_value(vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
@@ -260,7 +325,7 @@ impl Renderer {
             });
         let rendering_info = vk::RenderingInfo::default()
             .render_area(self.swapchain.extent.into())
-            .color_attachments(slice::from_ref(&color_attachment_info))
+            .color_attachments(&color_attachment_infos)
             .depth_attachment(&depth_attachment_info)
             .layer_count(1);
         unsafe {
@@ -336,9 +401,10 @@ impl Renderer {
         frame: usize,
         phase: Phase,
         candidate_count: u32,
+        pipeline: vk::Pipeline,
     ) {
         // The mesh shaders pull vertices themselves, there's no vertex buffer.
-        self.cmd_bind_pipeline(cmd_buffer, self.mesh_pipeline);
+        self.cmd_bind_pipeline(cmd_buffer, pipeline);
         unsafe {
             self.render_device.cmd_bind_index_buffer(
                 cmd_buffer,
