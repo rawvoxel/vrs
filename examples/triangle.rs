@@ -28,8 +28,9 @@ const VERTICES: [Vertex; 3] = [
 ];
 
 struct Vulkan {
-    app: App,
+    // NOTE: Field order matters, the renderer must be dropped before the app.
     renderer: Renderer,
+    _app: App,
 }
 
 impl Vulkan {
@@ -45,16 +46,7 @@ impl Vulkan {
         )?;
         let renderer = Renderer::new(&app, size.width, size.height)?;
 
-        Ok(Self { app, renderer })
-    }
-}
-
-impl Drop for Vulkan {
-    fn drop(&mut self) {
-        self.renderer
-            .destroy()
-            .expect("Could not destroy Renderer.");
-        self.app.destroy();
+        Ok(Self { renderer, _app: app })
     }
 }
 

@@ -10,7 +10,6 @@ use std::{default::Default, ffi::c_void, io::Cursor, slice};
 const SLANG_SPV: &[u8] = include_bytes!("../assets/shader/slang.spv");
 const FRAMES_IN_FLIGHT: u32 = 2;
 
-#[derive(Clone)]
 pub struct Renderer {
     pub index_src_buffer_ptr: *mut c_void,
     pub index_src_buffer: Buffer,
@@ -47,7 +46,7 @@ pub struct Renderer {
 
     pub surface: Surface,
     pub surface_instance: khr::surface::Instance,
-    pub discrete_gpu: Adapter,
+    pub adapter: Adapter,
 }
 
 unsafe impl Send for Renderer {}
@@ -55,29 +54,28 @@ unsafe impl Sync for Renderer {}
 
 impl Renderer {
     pub fn new(app: &App, window_width: u32, window_height: u32) -> VkResult<Self> {
-        // FIXME: Create fallback for integrated GPUs.
-        let discrete_gpu = app
-            .request_adapter_type(vk::PhysicalDeviceType::DISCRETE_GPU)
-            .expect("No discrete gpu was found!");
+        let adapter = app
+            .request_adapter()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
 
         // Surface
         let surface_instance = khr::surface::Instance::new(&app.entry, &app.instance);
-        let surface = Surface::new(app, &discrete_gpu, &surface_instance)?;
+        let surface = Surface::new(app, &adapter, &surface_instance)?;
         let surface_extent = surface.extent(
             window_width,
             window_height,
-            &discrete_gpu,
+            &adapter,
             &surface_instance,
         )?;
 
         // Render Device
-        let graphics_queue_family = discrete_gpu.get_queue_family(
+        let graphics_queue_family = adapter.get_queue_family(
             &surface_instance,
             &surface,
             true,
             vk::QueueFlags::GRAPHICS,
         );
-        let render_device = create_render_device(app, &discrete_gpu, &graphics_queue_family)?;
+        let render_device = create_render_device(app, &adapter, &graphics_queue_family)?;
         let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0);
 
         // Uniform Buffers
@@ -97,7 +95,7 @@ impl Renderer {
             ubo_desc_pool,
             &vec![ubo_desc_set_layout; FRAMES_IN_FLIGHT as usize],
         )?;
-        let uniform_buffers = create_uniform_buffers(&discrete_gpu, &render_device, FRAMES_IN_FLIGHT);
+        let uniform_buffers = create_uniform_buffers(&adapter, &render_device, FRAMES_IN_FLIGHT);
         write_uniform_descriptor_sets(&render_device, &ubo_desc_sets, &uniform_buffers);
         let uniform_buffer_ptrs = uniform_buffers.iter()
             .map(|b| {
@@ -118,7 +116,7 @@ impl Renderer {
         // Swapchain
         let swapchain_device = khr::swapchain::Device::new(&app.instance, &render_device);
         let swapchain = Swapchain::new(
-            &discrete_gpu,
+            &adapter,
             &surface,
             surface_extent,
             &graphics_queue_family,
@@ -150,20 +148,20 @@ impl Renderer {
         // Mesh Buffers
         // FIXME: Figure out how to initialize an upper limit for size.
         let index_src_buffer = create_transfer_src_buffer(
-            &discrete_gpu,
+            &adapter,
             &render_device,
             12 * size_of::<Index>() as vk::DeviceSize
         )?;
         let index_src_buffer_ptr = index_src_buffer.mem_map(&render_device, 0)?;
-        let index_dst_buffer = create_index_dst_buffer(&discrete_gpu, &render_device, 12)?;
+        let index_dst_buffer = create_index_dst_buffer(&adapter, &render_device, 12)?;
 
         let vertex_src_buffer = create_transfer_src_buffer(
-            &discrete_gpu,
+            &adapter,
             &render_device,
             12 * size_of::<Vertex>() as vk::DeviceSize
         )?;
         let vertex_src_buffer_ptr = vertex_src_buffer.mem_map(&render_device, 0)?;
-        let vertex_dst_buffer = create_vertex_dst_buffer(&discrete_gpu, &render_device, 12)?;
+        let vertex_dst_buffer = create_vertex_dst_buffer(&adapter, &render_device, 12)?;
 
         // Transition Depth Image Layout
         record_submit_commandbuffer(
@@ -231,7 +229,7 @@ impl Renderer {
 
             surface,
             surface_instance,
-            discrete_gpu,
+            adapter,
         })
     }
 
@@ -304,7 +302,7 @@ impl Renderer {
         vertices: &[Vertex],
     ) -> VkResult<()> {
         let surface_extent = self.surface
-            .extent(window_width, window_height, &self.discrete_gpu, &self.surface_instance)?;
+            .extent(window_width, window_height, &self.adapter, &self.surface_instance)?;
         if self.swapchain.extent != surface_extent {
             self.rebuild_swapchain(surface_extent)?;
         }
@@ -475,7 +473,7 @@ impl Renderer {
             self.render_device.device_wait_idle()?;
 
             self.swapchain.rebuild(
-                &self.discrete_gpu,
+                &self.adapter,
                 &self.surface,
                 extent,
                 &self.graphics_queue_family,
@@ -510,13 +508,14 @@ impl Renderer {
             )
         }
     }
+}
 
-    #[inline]
-    pub fn destroy(&mut self) -> VkResult<()> {
+/// Must be dropped before the `App` it was created from.
+impl Drop for Renderer {
+    fn drop(&mut self) {
         unsafe {
-            // NOTE: This call is the only reason this destroy
-            // NOTE: method is not unsafe where all others are.
-            self.render_device.device_wait_idle()?;
+            // NOTE: Nothing can be done about a lost device here, so destroy regardless.
+            let _ = self.render_device.device_wait_idle();
 
             self.index_src_buffer.mem_unmap(&self.render_device);
             self.index_src_buffer.destroy(&self.render_device);
@@ -555,8 +554,6 @@ impl Renderer {
             self.render_device.destroy_device(None);
 
             self.surface_instance.destroy_surface(self.surface.handle, None);
-
-            Ok(())
         }
     }
 }
