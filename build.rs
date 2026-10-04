@@ -1,13 +1,18 @@
 use std::{path::Path, process::Command};
 
 fn main() {
-    // Included by `mesh.slang`, `gi.slang` and `shadow.slang`.
+    // Included by `mesh.slang`, `gi.slang`, `shadow.slang` and `probes.slang`.
     println!("cargo:rerun-if-changed=assets/shader/common.slang");
     compile_slang_spv("shader.slang", "slang.spv", &["vertMain", "fragMain"]);
     compile_slang_spv("cull.slang", "cull.spv", &["cullMain"]);
     compile_slang_spv("hiz.slang", "hiz.spv", &["reduceMain"]);
     compile_slang_spv("mesh.slang", "mesh.spv", &["meshVert", "meshFrag"]);
-    compile_slang_spv("shadow.slang", "shadow.spv", &["traceShadows"]);
+    compile_slang_spv(
+        "shadow.slang",
+        "shadow.spv",
+        &["cullLights", "traceShadows"],
+    );
+    compile_slang_spv("probes.slang", "probes.spv", &["probeVert", "probeFrag"]);
     compile_slang_spv(
         "gi.slang",
         "gi.spv",

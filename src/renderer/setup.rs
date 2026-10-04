@@ -27,6 +27,7 @@ use std::slice;
 
 const DYNAMIC_SPV: &[u8] = include_bytes!("../../assets/shader/slang.spv");
 const MESH_SPV: &[u8] = include_bytes!("../../assets/shader/mesh.spv");
+const PROBES_SPV: &[u8] = include_bytes!("../../assets/shader/probes.spv");
 pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
 /// Starting size of each frame's dynamic geometry buffers, they grow to fit.
 const INITIAL_DYNAMIC_ELEMENTS: vk::DeviceSize = 1024;
@@ -73,6 +74,7 @@ impl Renderer {
             grow_mesh_pool: config.grow_mesh_pool,
             clear_color: DEFAULT_CLEAR_COLOR,
             lighting: Lighting::default(),
+            lights: Vec::new(),
 
             mesh_pool: MeshPool::null(config.mesh_capacity, FRAMES_IN_FLIGHT as usize),
             culler: Culler::null(),
@@ -109,14 +111,24 @@ impl Renderer {
             uniform_buffers: Vec::new(),
             palette: Vec::new(),
             palette_version: 0,
+            glossy_palette: false,
             frame_palette_buffers: Vec::new(),
             frame_palette_versions: Vec::new(),
             frame_shadow_tables: Vec::new(),
             shadow_table: Vec::new(),
+            frame_changed_chunks: Vec::new(),
+            changed_chunks: Vec::new(),
+            frame_light_buffers: Vec::new(),
+            chunk_serials: Default::default(),
+            chunk_serials_next: Default::default(),
+            previous_lighting: None,
+            convergence: super::lighting::Convergence::NONE,
+            hysteresis_scale: [1.0; 2],
 
             mesh_pipeline: vk::Pipeline::null(),
             mesh_depth_pipeline: vk::Pipeline::null(),
             mesh_over_depth_pipeline: vk::Pipeline::null(),
+            probes_pipeline: vk::Pipeline::null(),
             dynamic_pipeline: vk::Pipeline::null(),
             graphics_pipeline_layout: vk::PipelineLayout::null(),
             graphics_queue: Queue::new(&graphics_queue_family, &render_device, 0),
@@ -140,7 +152,9 @@ impl Renderer {
         // pool's vertices, mesh infos and voxel types, the palette and the shadow table, then
         // the light probes, their atlases sampled, their atlases written, their rays and the
         // probes they're tracing, then the low resolution shadows written, the depth buffer
-        // they're traced from, and the shadows sampled.
+        // they're traced from, and the shadows sampled, then the chunks that changed, then the
+        // lights, the lights reaching each tile, and their shadows written and read, then the
+        // reflections written and read.
         let bindings = [
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
@@ -158,12 +172,20 @@ impl Renderer {
             vk::DescriptorType::STORAGE_IMAGE,
             vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::SAMPLED_IMAGE,
         ];
         let pool_sizes = [
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
             vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::SAMPLED_IMAGE,
         ]
         .map(|ty| {
             let count = bindings.iter().filter(|&&binding| binding == ty).count() as u32;
@@ -222,6 +244,13 @@ impl Renderer {
                 DYNAMIC_SPV,
                 (c"vertMain", c"fragMain"),
                 true,
+                PipelinePass::Shaded,
+            ),
+            (
+                &mut self.probes_pipeline,
+                PROBES_SPV,
+                (c"probeVert", c"probeFrag"),
+                false,
                 PipelinePass::Shaded,
             ),
         ] {
@@ -326,7 +355,7 @@ impl Renderer {
                 &adapter,
                 &device,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
-                INITIAL_DYNAMIC_ELEMENTS * size_of::<[f32; 4]>() as vk::DeviceSize,
+                INITIAL_DYNAMIC_ELEMENTS * size_of::<[[f32; 4]; 2]>() as vk::DeviceSize,
             )?);
             // Written by the first frame.
             self.frame_palette_versions.push(u64::MAX);
@@ -336,6 +365,18 @@ impl Renderer {
                 &device,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 4,
+            )?);
+            self.frame_changed_chunks.push(DynamicBuffer::new(
+                &adapter,
+                &device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                4,
+            )?);
+            self.frame_light_buffers.push(DynamicBuffer::new(
+                &adapter,
+                &device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                size_of::<crate::lights::GpuLight>() as vk::DeviceSize,
             )?);
             self.frame_index_buffers.push(dynamic_buffer(
                 vk::BufferUsageFlags::INDEX_BUFFER,

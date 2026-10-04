@@ -160,6 +160,8 @@ pub(crate) struct MeshPool {
     /// Meshes to free once each frame's fence has been waited on.
     pub(super) frame_releases: Vec<Vec<Mesh>>,
     pub(super) repacks: RepackCounts,
+    /// The next mesh's `Mesh::serial`.
+    next_serial: u64,
 }
 
 impl MeshPool {
@@ -202,6 +204,7 @@ impl MeshPool {
             staging: UploadStaging::null(),
             frame_releases: (0..frames_in_flight).map(|_| Vec::new()).collect(),
             repacks: RepackCounts::default(),
+            next_serial: 0,
         }
     }
 
@@ -261,7 +264,9 @@ impl MeshPool {
             voxels_per_edge: new.voxels_per_edge,
             bounds_min: new.bounds.0,
             bounds_max: new.bounds.1,
+            serial: self.next_serial,
         };
+        self.next_serial += 1;
         let slot = free_slot.unwrap_or(self.meshes.len());
 
         // NOTE: Even empty meshes upload their `MeshInfo`, the slot's last one may still be there.

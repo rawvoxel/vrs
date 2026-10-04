@@ -12,6 +12,7 @@ pub mod descriptors;
 pub mod gi;
 pub(crate) mod hiz;
 pub mod image;
+pub mod lights;
 pub mod mesh;
 pub(crate) mod pipeline;
 pub mod queue;

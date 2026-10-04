@@ -9,11 +9,15 @@ mod palette;
 mod record;
 mod setup;
 
-pub use crate::gi::GiConfig;
+pub use crate::gi::{GiConfig, MAX_CASCADES, ProbeTuning};
+pub use crate::lights::{Light, MAX_LIGHTS, Spot};
 pub use capture::Capture;
 pub use config::RendererConfig;
 pub use debug::{FrameStats, MeshPoolStats};
-pub use lighting::{Lighting, LightingUniforms, ShadowGrid, ShadowResolution};
+pub use lighting::{
+    DebugView, Lighting, LightingUniforms, MAX_SHADOW_LEVELS, ShadowGrid, ShadowResolution,
+};
+pub use palette::Material;
 
 use crate::{
     adapter::Adapter,
@@ -66,6 +70,11 @@ pub struct Renderer {
     pub clear_color: [f32; 4],
     /// How chunk meshes are lit. Changes take effect next frame.
     pub lighting: Lighting,
+    /// The point and spot lights lighting chunk meshes, and the light probes, the first
+    /// `MAX_LIGHTS` of them. Each pixel's brightest `Lighting::shadowed_lights` are shadowed,
+    /// in the `Lighting::shadow_grid`, at the `Lighting::shadow_resolution`. With any, frames
+    /// draw their depth first, as below full resolution. Changes take effect next frame.
+    pub lights: Vec<Light>,
 
     mesh_pool: MeshPool,
     /// Turns each frame's meshes into indirect draws for the visible ones.
@@ -112,9 +121,11 @@ pub struct Renderer {
     frame_desc_set_layout: vk::DescriptorSetLayout,
     frame_desc_sets: Vec<vk::DescriptorSet>,
     uniform_buffers: Vec<Buffer>,
-    /// Linear colors by voxel type, see `set_palette`.
-    palette: Vec<[f32; 4]>,
+    /// Materials by voxel type, see `set_materials`.
+    palette: Vec<palette::GpuMaterial>,
     palette_version: u64,
+    /// Whether any material is glossy, for the shadow pass to trace reflections.
+    glossy_palette: bool,
     frame_palette_buffers: Vec<DynamicBuffer>,
     /// The palette version each frame's buffer holds.
     frame_palette_versions: Vec<u64>,
@@ -122,6 +133,23 @@ pub struct Renderer {
     frame_shadow_tables: Vec<DynamicBuffer>,
     /// Reused to build each frame's shadow table in.
     shadow_table: Vec<u32>,
+    /// Which shadow table entries' chunks changed since last frame, a bit each, see
+    /// `write_lighting`.
+    frame_changed_chunks: Vec<DynamicBuffer>,
+    /// Reused to build each frame's changed chunks in.
+    changed_chunks: Vec<u32>,
+    /// Each frame's `lights`.
+    frame_light_buffers: Vec<DynamicBuffer>,
+    /// The serial of each chunk in last frame's shadow table, by chunk coordinate, then level.
+    chunk_serials: std::collections::HashMap<glam::IVec4, u64>,
+    /// This frame's, built while the shadow table is.
+    chunk_serials_next: std::collections::HashMap<glam::IVec4, u64>,
+    /// Last frame's lighting, to notice changes in it.
+    previous_lighting: Option<Lighting>,
+    /// The faster converging probes still under way.
+    convergence: lighting::Convergence,
+    /// This frame's multipliers of the probes' hysteresis for light and distances.
+    hysteresis_scale: [f32; 2],
 
     /// Draws the mesh pool's meshes, pulling their vertices.
     mesh_pipeline: vk::Pipeline,
@@ -129,6 +157,8 @@ pub struct Renderer {
     mesh_depth_pipeline: vk::Pipeline,
     /// Draws the mesh pool's meshes' color over their depth already drawn.
     mesh_over_depth_pipeline: vk::Pipeline,
+    /// Draws the light probes, for `DebugView::Probes`.
+    probes_pipeline: vk::Pipeline,
     /// Draws each frame's own geometry from `frame_vertex_buffers`.
     dynamic_pipeline: vk::Pipeline,
     graphics_pipeline_layout: vk::PipelineLayout,
@@ -191,6 +221,7 @@ impl Renderer {
             self.rebuild_swapchain(surface_extent)?;
         }
         self.prepare_shadow_pass()?;
+        self.track_lighting_changes();
 
         // Every visible mesh is drawn by one counted indirect call.
         if draws.meshes.len() > self.adapter.properties.limits.max_draw_indirect_count as usize {
@@ -325,6 +356,8 @@ impl Drop for Renderer {
                 .iter()
                 .chain(&self.frame_palette_buffers)
                 .chain(&self.frame_shadow_tables)
+                .chain(&self.frame_changed_chunks)
+                .chain(&self.frame_light_buffers)
                 .chain(&self.frame_index_buffers)
                 .chain(&self.frame_vertex_buffers)
             {
@@ -355,6 +388,7 @@ impl Drop for Renderer {
             device.destroy_pipeline(self.mesh_pipeline, None);
             device.destroy_pipeline(self.mesh_depth_pipeline, None);
             device.destroy_pipeline(self.mesh_over_depth_pipeline, None);
+            device.destroy_pipeline(self.probes_pipeline, None);
             device.destroy_pipeline(self.dynamic_pipeline, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             device.destroy_device(None);

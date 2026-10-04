@@ -1,7 +1,8 @@
 // Updates the light probes each frame, after Majercik et al. 2019 and 2021.
 //
 // 1. `classifyProbes` moves each probe to where its cell's chunk says it goes, baked when the
-//    chunk was added, and lists those near voxels, the only ones shading anything.
+//    chunk was added, and lists those near voxels, the only ones shading anything. Every
+//    cascade's probes are classified together, and share the frame's rays.
 // 2. `planRays` shares the frame's rays between the listed probes, so the cost stays steady.
 // 3. `traceProbeRays` traces the probes' rays through the voxels and shades their hits, with
 //    the probes' own light from last frame, which adds a bounce of light every frame.
@@ -22,14 +23,10 @@ static const uint MAX_RAYS_PER_PROBE = 256;
 static const uint TRACE_GROUP = MIN_RAYS_PER_PROBE;
 // Matches `gi::CELL_PLACED`.
 static const uint CELL_PLACED = 1u << 31;
-// How much of a probe's maps each frame keeps [Majercik et al. 2019].
-static const float IRRADIANCE_HYSTERESIS = 0.97;
-static const float DEPTH_HYSTERESIS = 0.97;
-// Sharpens the distance maps' lobes, so their edges follow the voxels [Majercik et al. 2019].
-static const float DEPTH_SHARPNESS = 50.0;
-// The probe's cage's diagonal, plus as far as a probe can be off its cell's center. Rays going
-// further are left out of the distance maps, so a texel's rays passing the edge of a wall
-// don't average its distance out past the wall and leak light through it [Roháček 2022].
+// The probe's cage's diagonal, plus as far as a probe can be off its cell's center, for the
+// finest cascade. Rays going further are left out of the distance maps, so a texel's rays
+// passing the edge of a wall don't average its distance out past the wall and leak light
+// through it [Roháček 2022].
 static const float MAX_PROBE_DEPTH = float(PROBE_SPACING) * 1.7320508 * 1.5;
 
 [[vk::binding(9, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> irradianceAtlas;
@@ -39,50 +36,135 @@ static const float MAX_PROBE_DEPTH = float(PROBE_SPACING) * 1.7320508 * 1.5;
 // The dispatches' group counts and the frame's ray share, then the listed probes' slots.
 [[vk::binding(12, 0)]] RWStructuredBuffer<uint> active;
 
-// The word baked for probe cell `cell` when its chunk was added, see `gi::bake_probe_cells`.
-// A cell without a chunk is empty, with its probe at its center.
-uint probeCellWord(int3 cell) {
-    int edge = int(ubo.lighting.shadowGrid.y);
-    int3 voxel = cell * PROBE_SPACING;
-    int3 chunk = int3(floor(float3(voxel) / float(edge)));
-    bool outside;
-    uint meshIndex = shadowChunk(chunk, outside);
-    if (meshIndex == NO_CHUNK) {
-        uint center = uint(PROBE_SPACING);
-        return CELL_PLACED | center | (center << 6) | (center << 12);
-    }
-    int cells = edge / PROBE_SPACING;
-    int3 local = (voxel - chunk * edge) / PROBE_SPACING;
-    return typeWords[meshes[meshIndex].probesBase + uint(local.x + cells * (local.y + cells * local.z))];
+// The cascade of the probe in slot `slot`.
+int cascadeOf(uint slot) {
+    return int(slot / probesPerCascade());
 }
 
-// Whether any probe cell from `low` to `high` has voxels, from the masks baked after the probe
-// words of the chunks they're in. Each chunk is looked up once.
-bool cellsHaveVoxels(int3 low, int3 high) {
+// Where cascade `cascade`'s probe cell `cell` puts its probe, in the finest voxels, false when
+// it has no room for one. From the chunk of the finest level holding the cell's center, see
+// `chunkAtPoint`: one of the cascade's level has its cells baked when it was added, see
+// `gi::bake_probe_cells`, a finer one has the baked cell holding the center. A coarser one's
+// voxels are bigger than the cell, its probe is at its center when that's empty. A cell
+// without a chunk is empty, with its probe at its center.
+bool probePlacement(int cascade, int3 cell, out float3 position) {
+    int spacing = PROBE_SPACING << cascade;
+    float3 center = (float3(cell) + 0.5) * float(spacing);
+    position = center;
+    int level;
+    int3 chunk;
+    int coverLevel;
+    int3 coverChunk;
+    uint meshIndex = chunkAtPoint(center, level, chunk, coverLevel, coverChunk);
+    if (meshIndex == NO_CHUNK) {
+        return true;
+    }
+    int edge = int(ubo.lighting.shadowGrid.y);
+    float scale = float(1 << level);
+    if (level > cascade) {
+        // The center is a corner of 8 of its voxels. The probe stays there when they're all
+        // empty, else goes to the center of an empty one, so its rays don't start in voxels.
+        int3 low = int3(round(center / scale)) - chunk * edge - 1;
+        int empty = -1;
+        bool allEmpty = true;
+        for (int i = 0; i < 8; i++) {
+            int3 voxel = low + int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+            bool inChunk = all(voxel >= 0) && all(voxel < edge);
+            if (inChunk && typeAt(meshes[meshIndex].typesBase, uint(edge), uint3(voxel)) != 0) {
+                allEmpty = false;
+            } else if (empty < 0) {
+                empty = i;
+            }
+        }
+        if (!allEmpty && empty >= 0) {
+            int3 voxel = low + int3(empty & 1, (empty >> 1) & 1, (empty >> 2) & 1);
+            position = (float3(chunk * edge + voxel) + 0.5) * scale;
+        }
+        return empty >= 0;
+    }
+    int cells = edge / PROBE_SPACING;
+    int3 local = int3(floor(center / scale)) - chunk * edge;
+    int3 bakedCell = local / PROBE_SPACING;
+    uint word = typeWords[meshes[meshIndex].probesBase + uint(bakedCell.x + cells * (bakedCell.y + cells * bakedCell.z))];
+    if ((word & CELL_PLACED) == 0) {
+        return false;
+    }
+    float3 inCell = float3(word & 63, (word >> 6) & 63, (word >> 12) & 63) * 0.5;
+    position = (float3(chunk * edge + bakedCell * PROBE_SPACING) + inCell) * scale;
+    return true;
+}
+
+// Whether any of cascade `cascade`'s probe cells from `low` to `high` has voxels. From the
+// masks baked after the probe words of the chunks they're in, each chunk looked up once, at
+// the cascade's level and coarser. Chunks of finer levels only have chunks with voxels.
+bool cellsHaveVoxels(int cascade, int3 low, int3 high) {
     int edge = int(ubo.lighting.shadowGrid.y);
     int cells = edge / PROBE_SPACING;
-    int3 chunkLow = int3(floor(float3(low) / float(cells)));
-    int3 chunkHigh = int3(floor(float3(high) / float(cells)));
-    for (int z = chunkLow.z; z <= chunkHigh.z; z++) {
-        for (int y = chunkLow.y; y <= chunkHigh.y; y++) {
-            for (int x = chunkLow.x; x <= chunkHigh.x; x++) {
-                int3 chunk = int3(x, y, z);
-                bool outside;
-                uint meshIndex = shadowChunk(chunk, outside);
-                if (meshIndex == NO_CHUNK) {
-                    continue;
-                }
-                uint mask = meshes[meshIndex].probesBase + uint(cells * cells * cells);
-                int3 from = max(low - chunk * cells, 0);
-                int3 to = min(high - chunk * cells, cells - 1);
-                for (int cz = from.z; cz <= to.z; cz++) {
-                    for (int cy = from.y; cy <= to.y; cy++) {
-                        for (int cx = from.x; cx <= to.x; cx++) {
-                            uint index = uint(cx + cells * (cy + cells * cz));
-                            if ((typeWords[mask + index / 32] & (1u << (index % 32))) != 0) {
-                                return true;
+    int spacing = PROBE_SPACING << cascade;
+    // In the finest voxels.
+    int3 regionMin = low * spacing;
+    int3 regionMax = (high + 1) * spacing - 1;
+    for (int level = 0; level < int(ubo.lighting.shadowGrid.w); level++) {
+        int cellSize = PROBE_SPACING << level;
+        int3 cellLow = floorDiv(regionMin, cellSize);
+        int3 cellHigh = floorDiv(regionMax, cellSize);
+        int3 chunkLow = floorDiv(cellLow, cells);
+        int3 chunkHigh = floorDiv(cellHigh, cells);
+        for (int z = chunkLow.z; z <= chunkHigh.z; z++) {
+            for (int y = chunkLow.y; y <= chunkHigh.y; y++) {
+                for (int x = chunkLow.x; x <= chunkHigh.x; x++) {
+                    int3 chunk = int3(x, y, z);
+                    bool outside;
+                    uint meshIndex = levelChunk(level, chunk, outside);
+                    if (meshIndex == NO_CHUNK) {
+                        continue;
+                    }
+                    if (level < cascade) {
+                        return true;
+                    }
+                    uint mask = meshes[meshIndex].probesBase + uint(cells * cells * cells);
+                    int3 from = max(cellLow - chunk * cells, 0);
+                    int3 to = min(cellHigh - chunk * cells, cells - 1);
+                    for (int cz = from.z; cz <= to.z; cz++) {
+                        for (int cy = from.y; cy <= to.y; cy++) {
+                            for (int cx = from.x; cx <= to.x; cx++) {
+                                uint index = uint(cx + cells * (cy + cells * cz));
+                                if ((typeWords[mask + index / 32] & (1u << (index % 32))) != 0) {
+                                    return true;
+                                }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Frames a probe converges faster after nearby chunks changed, for its light, and of those,
+// for its distances [Majercik et al. 2021].
+static const uint FAST_FRAMES = 10;
+static const uint FAST_DEPTH_FRAMES = 7;
+
+// Whether a chunk of any level holding any of cascade `cascade`'s probe cells from `low` to
+// `high` changed since last frame.
+bool chunksChanged(int cascade, int3 low, int3 high) {
+    int edge = int(ubo.lighting.shadowGrid.y);
+    int side = ubo.lighting.shadowTable.w;
+    int spacing = PROBE_SPACING << cascade;
+    int3 regionMin = low * spacing;
+    int3 regionMax = (high + 1) * spacing - 1;
+    for (int level = 0; level < int(ubo.lighting.shadowGrid.w); level++) {
+        int3 corner = ubo.lighting.shadowLevels[level].xyz;
+        int3 chunkLow = floorDiv(regionMin, edge << level) - corner;
+        int3 chunkHigh = floorDiv(regionMax, edge << level) - corner;
+        for (int z = max(chunkLow.z, 0); z <= min(chunkHigh.z, side - 1); z++) {
+            for (int y = max(chunkLow.y, 0); y <= min(chunkHigh.y, side - 1); y++) {
+                for (int x = max(chunkLow.x, 0); x <= min(chunkHigh.x, side - 1); x++) {
+                    uint index = uint(((level * side + z) * side + y) * side + x);
+                    if ((changedChunks[index / 32] & (1u << (index % 32))) != 0) {
+                        return true;
                     }
                 }
             }
@@ -96,18 +178,18 @@ bool cellsHaveVoxels(int3 low, int3 high) {
 void classifyProbes(uint3 threadId: SV_DispatchThreadID) {
     int3 counts = int3(ubo.gi.volumeCounts.xyz);
     uint slot = threadId.x;
-    if (slot >= uint(counts.x * counts.y * counts.z)) {
+    if (slot >= probesPerCascade() * ubo.gi.frame.z) {
         return;
     }
-    // The cell in the volume whose probe this slot holds.
-    int3 local = int3(slot % counts.x, (slot / counts.x) % counts.y, slot / (counts.x * counts.y));
-    int3 volumeMin = ubo.gi.volumeMin.xyz;
+    // The cell in its cascade whose probe this slot holds.
+    int cascade = cascadeOf(slot);
+    uint inCascade = slot % probesPerCascade();
+    int3 local = int3(inCascade % counts.x, (inCascade / counts.x) % counts.y, inCascade / (counts.x * counts.y));
+    int3 volumeMin = ubo.gi.volumeMins[cascade].xyz;
     int3 cell = volumeMin + (((local - volumeMin) % counts) + counts) % counts;
 
-    // Where the cell's chunk says its probe goes, in half voxels.
-    uint word = probeCellWord(cell);
-    bool placed = (word & CELL_PLACED) != 0;
-    float3 position = float3(cell * PROBE_SPACING) + float3(word & 63, (word >> 6) & 63, (word >> 12) & 63) * 0.5;
+    float3 position;
+    bool placed = probePlacement(cascade, cell, position);
     Probe probe = probes[slot];
     bool wasPlaced = (probe.state & PROBE_PLACED) != 0;
     if (any(probe.cell != cell) || placed != wasPlaced || (placed && any(position != probe.position))) {
@@ -122,8 +204,24 @@ void classifyProbes(uint3 threadId: SV_DispatchThreadID) {
         return;
     }
 
+    // Probes next to a chunk added, removed or remeshed converge faster for a while.
+    uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
+    fast = chunksChanged(cascade, cell - 1, cell + 1) ? FAST_FRAMES : (fast > 0 ? fast - 1 : 0);
+    uint state = (probe.state & 0xff) | (fast << PROBE_FAST_SHIFT);
+    if (state != probe.state) {
+        probe.state = state;
+        probes[slot].state = state;
+    }
+
+    // Coarser cascades, further off, update less often: each probe every `2^cascade` frames,
+    // in turn, unless nearby chunks just changed.
+    uint period = 1u << uint(cascade);
+    if (fast == 0 && ((ubo.gi.frame.x + slot) & (period - 1)) != 0) {
+        return;
+    }
+
     // Only probes with voxels in or next to their cell shade any surface.
-    if (!cellsHaveVoxels(cell - 1, cell + 1)) {
+    if (!cellsHaveVoxels(cascade, cell - 1, cell + 1)) {
         return;
     }
     probes[slot].updates = probe.updates + 1;
@@ -166,13 +264,16 @@ void traceProbeRays(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID) {
     uint groupsPerProbe = rays / TRACE_GROUP;
     uint listed = group.x / groupsPerProbe;
     uint ray = (group.x % groupsPerProbe) * TRACE_GROUP + thread.x;
-    Probe probe = probes[active[ACTIVE_LIST + listed]];
+    uint slot = active[ACTIVE_LIST + listed];
+    Probe probe = probes[slot];
     float3 direction = probeRayDirection(ray, rays);
     float4 result;
     VoxelHit hit;
-    if (!traceVoxels(probe.position, direction, ubo.lighting.shadowGrid.z, false, hit)) {
-        // The sky, or the ground past the world.
-        result = float4(ambientLight(direction), 1e9);
+    // Coarser cascades' rays reach further, in proportion.
+    float reach = ubo.gi.rays.x * float(1 << cascadeOf(slot));
+    if (!traceVoxels(probe.position, direction, reach, false, hit)) {
+        // The sky, or the ground past the world, through any see-through voxels.
+        result = float4(ambientLight(direction) * hit.transmittance, 1e9);
     } else if (hit.distance <= 0.0) {
         // Voxels fill the probe's spot, though its chunk says otherwise: dark and close, so
         // it isn't trusted [Majercik et al. 2021].
@@ -180,8 +281,13 @@ void traceProbeRays(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID) {
     } else {
         // Lit as the camera would see it, with last frame's light from the probes.
         float3 worldPosition = (probe.position + direction * hit.distance) * ubo.lighting.shadowGrid.x;
-        float3 light = lightAt(worldPosition, hit.normal, hit.normal, -direction, true, -1.0);
-        result = float4(paletteColor(hit.id) * light, hit.distance);
+        float3 light = lightAt(worldPosition, hit.normal, hit.normal, -direction, true, float3(-1.0))
+            + lightsAtHit(worldPosition, hit.normal, ubo.shadow.lights.w);
+        Material material = materialOf(hit.id);
+        // Glowing voxels light what's around them through the probes, seen through any
+        // see-through voxels on the way.
+        float3 radiance = material.colorRoughness.rgb * light + material.emissionMetalness.rgb;
+        result = float4(radiance * hit.transmittance, hit.distance);
     }
     rayResults[listed * rays + ray] = result;
 }
@@ -251,7 +357,10 @@ void updateIrradiance(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, u
     float3 old = irradianceAtlas[texel].rgb;
     // A probe's first update replaces what was there, and big changes are let through
     // faster [Majercik et al. 2021].
-    float hysteresis = probe.updates <= 1 ? 0.0 : IRRADIANCE_HYSTERESIS;
+    uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
+    float hysteresis = probe.updates <= 1
+        ? 0.0
+        : ubo.gi.tuning.x * ubo.gi.rays.y * (fast > 0 ? 0.5 : 1.0);
     float3 change = abs(irradiance - old);
     float largestChange = max(change.x, max(change.y, change.z));
     if (largestChange > 0.25) {
@@ -267,7 +376,9 @@ void updateIrradiance(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, u
 [numthreads(DEPTH_TEXELS + 2, DEPTH_TEXELS + 2, 1)]
 void updateDepth(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint threadIndex: SV_GroupIndex) {
     uint rays = loadRays(group.x, threadIndex, (DEPTH_TEXELS + 2) * (DEPTH_TEXELS + 2));
-    Probe probe = probes[active[ACTIVE_LIST + group.x]];
+    uint slot = active[ACTIVE_LIST + group.x];
+    Probe probe = probes[slot];
+    float maxDepth = MAX_PROBE_DEPTH * float(1 << cascadeOf(slot));
 
     // The mean distance and squared distance of the rays near the texel's direction that hit
     // voxels within the cage, or far when none did.
@@ -276,10 +387,11 @@ void updateDepth(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint t
     float nearWeight = 0.0;
     float totalWeight = 0.0;
     for (uint i = 0; i < rays; i++) {
-        float weight = pow(max(dot(direction, sharedDirections[i]), 0.0), DEPTH_SHARPNESS);
+        // Sharpened, so the distances' edges follow the voxels [Majercik et al. 2019].
+        float weight = pow(max(dot(direction, sharedDirections[i]), 0.0), ubo.gi.tuning.z);
         float distance = sharedResults[i].w;
         totalWeight += weight;
-        if (distance <= MAX_PROBE_DEPTH) {
+        if (distance <= maxDepth) {
             sum += weight * float2(distance, distance * distance);
             nearWeight += weight;
         }
@@ -289,10 +401,13 @@ void updateDepth(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint t
     }
     float2 moments = nearWeight > 1e-4
         ? sum / nearWeight
-        : float2(MAX_PROBE_DEPTH, MAX_PROBE_DEPTH * MAX_PROBE_DEPTH);
+        : float2(maxDepth, maxDepth * maxDepth);
 
     int2 texel = atlasTexel(group.x, int2(thread.xy), DEPTH_TEXELS);
     float2 old = depthAtlas[texel].xy;
-    float hysteresis = probe.updates <= 1 ? 0.0 : DEPTH_HYSTERESIS;
+    uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
+    float hysteresis = probe.updates <= 1
+        ? 0.0
+        : ubo.gi.tuning.y * ubo.gi.rays.z * (fast > FAST_FRAMES - FAST_DEPTH_FRAMES ? 0.5 : 1.0);
     depthAtlas[texel] = float4(lerp(moments, old, hysteresis), 0.0, 0.0);
 }

@@ -26,6 +26,9 @@ static const float3 FACE_NORMALS[6] = {
 // How far inside a face, in voxels, its fragments are moved to find their voxel: far above
 // the float error of an interpolated position, far below a voxel.
 static const float FACE_NUDGE = 1.0 / 256.0;
+// How far greedy quads are pushed out past their edges, in pixels, so where one quad's corner
+// meets the middle of another's edge, rounding can't open a crack between them.
+static const float QUAD_OVERLAP_PIXELS = 0.25;
 // How much nearer or further, relative to its distance, a shadow texel's surface can be than
 // a pixel's and still shadow it.
 static const float SHADOW_DEPTH_TOLERANCE = 0.08;
@@ -33,6 +36,12 @@ static const float SHADOW_DEPTH_TOLERANCE = 0.08;
 // The sun's visibility and the surface's distance for each block of pixels, when shadows are
 // traced at a fraction of the frame's resolution, see `shadow.slang`.
 [[vk::binding(15, 0)]] Sampler2D<float4> shadowTexels;
+// The lights reaching each tile of pixels, see `cullLights` in `shadow.slang`.
+[[vk::binding(18, 0)]] StructuredBuffer<uint> tileLights;
+// Each block's shadowed lights and how much of each gets through, see `traceShadows`.
+[[vk::binding(20, 0)]] Texture2D<uint2> lightShadowTexels;
+// Each block's sharp reflection when its voxel is glossy, see `traceShadows`.
+[[vk::binding(22, 0)]] Texture2D<float4> reflectionTexels;
 
 struct VSOutput {
     float4 position : SV_Position;
@@ -44,7 +53,15 @@ struct VSOutput {
     nointerpolation uint kind;
     nointerpolation uint typesBase;
     nointerpolation uint voxelsPerEdge;
+    // World units per voxel.
+    nointerpolation float scale;
 };
+
+// Match `renderer::DebugView`.
+static const uint DEBUG_LIGHT = 1;
+static const uint DEBUG_DIRECT = 2;
+static const uint DEBUG_INDIRECT = 3;
+static const uint DEBUG_OCCLUSION = 4;
 
 // Matches `voxel::octahedral_decode`.
 float3 octahedralDecode(uint word) {
@@ -70,10 +87,13 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
     output.kind = mesh.kind;
     output.typesBase = mesh.typesBase;
     output.voxelsPerEdge = mesh.voxelsPerEdge;
+    output.scale = mesh.scale;
     output.color = float3(1.0, 0.0, 1.0);
     output.normal = float3(0.0, 1.0, 0.0);
 
     float3 local;
+    // Away from the middle of the vertex's quad, for greedy quads, which overlap a little.
+    float3 outward = float3(0.0);
     uint word = mesh.vertexBase;
     if (mesh.kind == KIND_COLORED) {
         word += vertexIndex * 4;
@@ -84,6 +104,13 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
         uint positionZFlags = vertexWords[word + 1];
         local = unpackPosition(vertexWords[word], positionZFlags, mesh.positionSteps);
         output.normal = FACE_NORMALS[min((positionZFlags >> 17) & 7, 5)];
+        // Greedy quads are 4 vertices in a row.
+        uint quad = mesh.vertexBase + (vertexIndex & ~3u) * 2;
+        float3 center = float3(0.0);
+        for (uint corner = 0; corner < 4; corner++) {
+            center += unpackPosition(vertexWords[quad + corner * 2], vertexWords[quad + corner * 2 + 1], mesh.positionSteps);
+        }
+        outward = sign(local - center * 0.25);
     } else {
         word += vertexIndex * 3;
         local = unpackPosition(vertexWords[word], vertexWords[word + 1], mesh.positionSteps);
@@ -92,8 +119,14 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
     output.voxelPosition = local;
 
     float4 world = float4(mesh.origin + local * mesh.scale, 1.0);
-    output.worldPosition = world.xyz;
     output.position = mul(ubo.proj, mul(ubo.view, world));
+    if (any(outward != 0.0)) {
+        // A pixel's width in the world at the vertex's distance, for any projection.
+        float pixel = 2.0 * output.position.w / (abs(ubo.proj[1][1]) * float(ubo.shadow.frameSize.y));
+        world.xyz += outward * pixel * QUAD_OVERLAP_PIXELS;
+        output.position = mul(ubo.proj, mul(ubo.view, world));
+    }
+    output.worldPosition = world.xyz;
     return output;
 }
 
@@ -102,36 +135,135 @@ uint3 cellAt(float3 p, uint edge) {
     return uint3(clamp(int3(floor(p)), int3(0), int3(int(edge) - 1)));
 }
 
-// The sun's visibility at the frame pixel centered on `pixel`, whose surface is `distance`
-// from the camera, upscaled from the shadow texels: the 4 nearest, weighted by how near each
-// is, of those whose surface is about as far. With none, the one whose surface is nearest in
-// distance, so shadows don't bleed across edges.
-float upscaledShadow(float2 pixel, float distance) {
+// The 4 shadow texels nearest a frame pixel, weighted by how near each is, of those whose
+// surface is about as far from the camera as the pixel's, so shadows don't bleed across
+// edges. With none, the one whose surface is nearest in distance counts alone.
+struct ShadowTaps {
+    int2 texels[4];
+    float weights[4];
+    float4 sun[4];
+};
+
+// The taps for the frame pixel centered on `pixel`, whose surface is `distance` from the
+// camera.
+ShadowTaps shadowTaps(float2 pixel, float distance) {
+    ShadowTaps taps;
     float scale = float(ubo.shadow.params.x);
     float2 size = float2(ubo.shadow.params.yz);
     // Each texel holds the pixel at its block's center.
     float2 texel = (pixel - 0.5 - floor(scale * 0.5)) / scale;
     int2 base = int2(floor(texel));
     float2 alpha = texel - float2(base);
-    float sum = 0.0;
     float totalWeight = 0.0;
     float closest = 1e9;
-    float closestVisible = 1.0;
+    int closestTap = 0;
     for (int i = 0; i < 4; i++) {
         int2 offset = int2(i & 1, i >> 1);
         float2 tap = clamp(float2(base + offset), 0.0, size - 1.0);
-        float2 shadow = shadowTexels.SampleLevel((tap + 0.5) / size, 0.0).xy;
-        float difference = abs(shadow.y - distance) / max(distance, 1e-3);
+        taps.texels[i] = int2(tap);
+        taps.sun[i] = shadowTexels.SampleLevel((tap + 0.5) / size, 0.0);
+        float difference = abs(taps.sun[i].w - distance) / max(distance, 1e-3);
         if (difference < closest) {
             closest = difference;
-            closestVisible = shadow.x;
+            closestTap = i;
         }
         float2 bilinear = lerp(1.0 - alpha, alpha, float2(offset));
-        float weight = bilinear.x * bilinear.y * saturate(1.0 - difference / SHADOW_DEPTH_TOLERANCE);
-        sum += weight * shadow.x;
-        totalWeight += weight;
+        taps.weights[i] = bilinear.x * bilinear.y * saturate(1.0 - difference / SHADOW_DEPTH_TOLERANCE);
+        totalWeight += taps.weights[i];
     }
-    return totalWeight > 1e-4 ? sum / totalWeight : closestVisible;
+    for (int i = 0; i < 4; i++) {
+        taps.weights[i] = totalWeight > 1e-4 ? taps.weights[i] / totalWeight : float(i == closestTap);
+    }
+    return taps;
+}
+
+// The sun's visibility, tinted by see-through voxels, upscaled from `taps`.
+float3 upscaledShadow(ShadowTaps taps) {
+    float3 visible = float3(0.0);
+    for (int i = 0; i < 4; i++) {
+        visible += taps.weights[i] * taps.sun[i].rgb;
+    }
+    return visible;
+}
+
+// The sharp reflection of face number `face`, upscaled from `taps`, from those of the same
+// face. `found` is false when none were.
+float3 upscaledReflection(ShadowTaps taps, uint face, out bool found) {
+    float3 reflection = float3(0.0);
+    float totalWeight = 0.0;
+    for (int i = 0; i < 4; i++) {
+        if (taps.weights[i] <= 0.0) {
+            continue;
+        }
+        float4 texel = reflectionTexels.Load(int3(taps.texels[i], 0));
+        if (uint(texel.w + 0.5) == face) {
+            reflection += taps.weights[i] * texel.rgb;
+            totalWeight += taps.weights[i];
+        }
+    }
+    found = totalWeight > 0.0;
+    return found ? reflection / totalWeight : float3(0.0);
+}
+
+// How much of light `lightIndex`'s light gets through, upscaled from `taps`, from those that
+// shadowed it. Lights none of them shadowed aren't shadowed.
+float upscaledLightShadow(ShadowTaps taps, uint lightIndex) {
+    float visible = 0.0;
+    float totalWeight = 0.0;
+    for (int i = 0; i < 4; i++) {
+        if (taps.weights[i] <= 0.0) {
+            continue;
+        }
+        uint2 shadowed = lightShadowTexels.Load(int3(taps.texels[i], 0));
+        for (uint k = 0; k < 4; k++) {
+            if (((shadowed.x >> (k * 8)) & 0xff) == lightIndex) {
+                visible += taps.weights[i] * float((shadowed.y >> (k * 8)) & 0xff) / 255.0;
+                totalWeight += taps.weights[i];
+                break;
+            }
+        }
+    }
+    return totalWeight > 0.0 ? visible / totalWeight : 1.0;
+}
+
+// Whether chunk voxel `cell` blocks light from reaching a corner: solid and not see-through.
+// Past the chunk's edges, the shadow grid's voxel at `gridCell`, when the chunk is the grid's
+// size, otherwise open.
+bool occludes(VSOutput input, int3 cell, int3 gridCell) {
+    int edge = int(input.voxelsPerEdge);
+    uint id;
+    if (all(cell >= 0) && all(cell < edge)) {
+        id = typeAt(input.typesBase, uint(edge), uint3(cell));
+    } else if (ubo.lighting.shadowTable.w > 0 && abs(input.scale - ubo.lighting.shadowGrid.x) < 1e-5 && int(ubo.lighting.shadowGrid.y) == edge) {
+        id = gridVoxel(gridCell);
+    } else {
+        return false;
+    }
+    return id != 0 && !seeThrough(id);
+}
+
+// How open a greedy face is where `input` lies on it, from 0, enclosed, to 1: each corner of
+// its voxel darkens with the voxels around it in front of the face, two solid sides closing
+// it entirely, and the pixel blends its voxel's four corners [classic voxel ambient
+// occlusion].
+float voxelOcclusion(VSOutput input, int3 normal) {
+    // The face's voxel, the empty one in front, and the same in the shadow grid.
+    int3 solid = int3(floor(input.voxelPosition - float3(normal) * FACE_NUDGE));
+    int3 front = solid + normal;
+    int3 gridFront = int3(floor(input.worldPosition / ubo.lighting.shadowGrid.x - float3(normal) * FACE_NUDGE)) + normal;
+    int3 u = normal.x != 0 ? int3(0, 1, 0) : int3(1, 0, 0);
+    int3 v = normal.z != 0 ? int3(0, 1, 0) : int3(0, 0, 1);
+    float2 along = float2(frac(dot(input.voxelPosition, float3(u))), frac(dot(input.voxelPosition, float3(v))));
+
+    float corners[4];
+    for (int i = 0; i < 4; i++) {
+        int2 side = int2(i & 1, i >> 1) * 2 - 1;
+        bool sideU = occludes(input, front + u * side.x, gridFront + u * side.x);
+        bool sideV = occludes(input, front + v * side.y, gridFront + v * side.y);
+        bool corner = occludes(input, front + u * side.x + v * side.y, gridFront + u * side.x + v * side.y);
+        corners[i] = sideU && sideV ? 0.0 : (3.0 - float(sideU) - float(sideV) - float(corner)) / 3.0;
+    }
+    return lerp(lerp(corners[0], corners[1], along.x), lerp(corners[2], corners[3], along.x), along.y);
 }
 
 [shader("fragment")]
@@ -156,7 +288,82 @@ float4 meshFrag(VSOutput input) : SV_Target {
     float3 normal = input.kind == KIND_GREEDY ? input.normal : normalize(input.normal);
     float3 fromCamera = input.worldPosition - ubo.gi.cameraPosition.xyz;
     float3 toViewer = -normalize(fromCamera);
-    float sunVisible = ubo.shadow.params.x > 1 ? upscaledShadow(input.position.xy, length(fromCamera)) : -1.0;
-    float3 light = lightAt(input.worldPosition, normal, faceNormal, toViewer, false, sunVisible);
-    return float4(paletteColor(id) * light, 1.0);
+    // With the shadow pass, the sun's and the lights' shadows are upscaled from it.
+    bool shadowPass = ubo.shadow.frameSize.z != 0;
+    ShadowTaps taps;
+    float3 sunVisible = float3(-1.0);
+    if (shadowPass) {
+        taps = shadowTaps(input.position.xy, length(fromCamera));
+        sunVisible = upscaledShadow(taps);
+    }
+    SurfaceLight light = lightParts(input.worldPosition, normal, faceNormal, toViewer, false, sunVisible);
+    Material material = materialOf(id);
+    float roughness = material.colorRoughness.w;
+    // The sun's and the lights' highlights, which smooth faces reflect.
+    float3 highlights = float3(0.0);
+    bool glossy = roughness < GLOSSY_ROUGHNESS;
+    if (glossy) {
+        highlights += light.direct * highlight(normal, toViewer, ubo.lighting.sunDirection.xyz, roughness);
+    }
+
+    // The lights reaching the pixel's tile.
+    if (shadowPass && ubo.shadow.lights.x > 0) {
+        uint2 pixel = uint2(input.position.xy);
+        uint tile = (pixel.y / LIGHT_TILE) * ubo.shadow.lights.y + pixel.x / LIGHT_TILE;
+        uint count = tileLights[tile * (TILE_LIGHTS + 1)];
+        for (uint i = 0; i < count; i++) {
+            uint lightIndex = tileLights[tile * (TILE_LIGHTS + 1) + 1 + i];
+            float3 toLight;
+            float distance;
+            float3 reaching = lightReaching(lights[lightIndex], input.worldPosition, normal, toLight, distance);
+            if (any(reaching > 0.0)) {
+                float3 reached = reaching * upscaledLightShadow(taps, lightIndex);
+                light.direct += reached;
+                if (glossy) {
+                    highlights += reached * highlight(normal, toViewer, toLight, roughness);
+                }
+            }
+        }
+    }
+
+    // Corners and crevices get less of the light from everywhere else.
+    float openness = 1.0;
+    float occlusionStrength = ubo.lighting.options.x;
+    if (input.kind == KIND_GREEDY && occlusionStrength > 0.0) {
+        openness = lerp(1.0, voxelOcclusion(input, int3(round(normal))), occlusionStrength);
+    }
+    light.indirect *= openness;
+
+    // What the face reflects: the light reaching it from everywhere when it's rough, and when
+    // it's glossy, blending into a sharp reflection, traced by the shadow pass where it could,
+    // or the probes' light from the way the viewer's reflected.
+    float3 lit = light.direct + light.indirect;
+    float3 reflection = lit;
+    if (glossy) {
+        float3 reflected = reflect(-toViewer, normal);
+        bool found = false;
+        float3 sharp = float3(0.0);
+        if (shadowPass) {
+            sharp = upscaledReflection(taps, faceNumber(round(normal)), found);
+        }
+        if (!found) {
+            float3 gridPosition = input.worldPosition / max(ubo.lighting.shadowGrid.x, 1e-6);
+            sharp = indirectLight(gridPosition, reflected, toViewer, false);
+        }
+        float sharpness = saturate(1.0 - roughness / GLOSSY_ROUGHNESS);
+        reflection = lerp(lit, sharp + highlights, sharpness);
+    }
+
+    switch (uint(ubo.lighting.options.y)) {
+    case DEBUG_LIGHT:
+        return float4(light.direct + light.indirect, 1.0);
+    case DEBUG_DIRECT:
+        return float4(light.direct, 1.0);
+    case DEBUG_INDIRECT:
+        return float4(light.indirect, 1.0);
+    case DEBUG_OCCLUSION:
+        return float4(float3(openness), 1.0);
+    default:
+        return float4(shadeSurface(material, normal, toViewer, lit, reflection), 1.0);
+    }
 }

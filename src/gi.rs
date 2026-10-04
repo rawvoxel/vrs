@@ -15,7 +15,7 @@ use std::slice;
 const GI_SPV: &[u8] = include_bytes!("../assets/shader/gi.spv");
 /// Interior texels along a probe's irradiance and distance maps, each with a one texel border.
 /// Match `IRRADIANCE_TEXELS` and `DEPTH_TEXELS` in `common.slang`.
-const IRRADIANCE_TEXELS: u32 = 6;
+const IRRADIANCE_TEXELS: u32 = 8;
 const DEPTH_TEXELS: u32 = 14;
 /// Base storage formats every device supports.
 const ATLAS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -35,9 +35,11 @@ const UPDATE_GROUPS: vk::DeviceSize = 3 * size_of::<u32>() as vk::DeviceSize;
 /// A probe cell that no probe holds, so every probe is placed on the first frame.
 const UNPLACED: u32 = 0x8000_0000;
 
-/// Voxels along each edge of a probe's cell, and between neighboring probes. Matches
-/// `PROBE_SPACING` in `common.slang`.
+/// Voxels along each edge of a probe's cell, and between neighboring probes, in the finest
+/// cascade. Matches `PROBE_SPACING` in `common.slang`.
 pub const PROBE_CELL: u32 = 16;
+/// The most cascades of probes. Matches `MAX_CASCADES` in `common.slang`.
+pub const MAX_CASCADES: u32 = 4;
 /// Set in a cell's baked word when it has room for a probe. Matches `CELL_PLACED` in `gi.slang`.
 const CELL_PLACED: u32 = 1 << 31;
 
@@ -112,23 +114,29 @@ pub(crate) fn bake_probe_cells(types: &VoxelTypes) -> Vec<u32> {
     words
 }
 
-/// The light probe volume, see `RendererConfig::global_illumination`.
+/// The light probe volumes, see `RendererConfig::global_illumination`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GiConfig {
-    /// Probes along each axis of the volume, which is centered on the camera with probes
-    /// 16 voxels of the `ShadowGrid` apart. Each probe takes about 2.6 KB.
+    /// Probes along each axis of each cascade, which is centered on the camera with probes
+    /// 16 of the `ShadowGrid`'s finest voxels apart in the first, and twice as far apart in
+    /// each next. Each probe takes about 2.9 KB.
     pub probe_counts: [u32; 3],
-    /// Rays traced each frame, shared between the probes near voxels so the cost stays
-    /// steady: each traces a power of two of them from 32 to 256. Past `rays_per_frame / 32`
-    /// such probes, each still traces 32.
+    /// Cascades of probes, from 1 to `MAX_CASCADES`. Each reaches twice as far as the last,
+    /// with probes twice as far apart, for chunks of coarser `ShadowGrid::levels`. Surfaces
+    /// are lit by the finest one around them.
+    pub cascades: u32,
+    /// Rays traced each frame, shared between every cascade's probes near voxels so the cost
+    /// stays steady: each traces a power of two of them from 32 to 256. Past
+    /// `rays_per_frame / 32` such probes, each still traces 32.
     pub rays_per_frame: u32,
 }
 
 impl Default for GiConfig {
-    /// 512 by 256 by 512 voxels, with 64 Ki rays a frame.
+    /// One cascade, 512 by 256 by 512 voxels, with 64 Ki rays a frame.
     fn default() -> Self {
         Self {
             probe_counts: [32, 16, 32],
+            cascades: 1,
             rays_per_frame: 1 << 16,
         }
     }
@@ -138,16 +146,53 @@ impl Default for GiConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GiUniforms {
-    /// The probe cell at the volume's low corner, w is 1 when the volume is lit this frame.
-    pub volume_min: [i32; 4],
-    /// Probes along each axis, w is probes per row of the atlases.
+    /// Each cascade's probe cell at its low corner, in its own cells, w is 1 when the probes
+    /// light the frame.
+    pub volume_mins: [[i32; 4]; MAX_CASCADES as usize],
+    /// Probes along each axis of each cascade, w is probes per row of the atlases.
     pub volume_counts: [u32; 4],
     /// This frame's random rotation of the probes' rays, a quaternion.
     pub ray_rotation: [f32; 4],
     /// The camera's world position, w unused.
     pub camera_position: [f32; 4],
-    /// x is the frame's number, y the rays traced each frame, the rest unused.
+    /// x is the frame's number, y the rays traced each frame, z how many cascades there are.
     pub frame: [u32; 4],
+    /// `ProbeTuning`'s hysteresis, depth hysteresis, depth sharpness and self-shadow bias.
+    pub tuning: [f32; 4],
+    /// `ProbeTuning`'s ray distance, the rest unused.
+    pub rays: [f32; 4],
+}
+
+/// How the light probes blend what they see and are sampled, see `Lighting::probe_tuning`.
+/// The defaults are the papers' [Majercik et al. 2019 and 2021].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ProbeTuning {
+    /// How much of a probe's light each frame keeps, from 0 to 1. Higher is steadier but
+    /// slower to follow changes.
+    pub hysteresis: f32,
+    /// How much of a probe's distances each frame keeps, from 0 to 1.
+    pub depth_hysteresis: f32,
+    /// How narrowly each distance texel averages its rays. Higher follows voxels' edges more
+    /// closely but is noisier.
+    pub depth_sharpness: f32,
+    /// How far off a surface probes' visibility is tested, in probe spacings. Higher leaks
+    /// less shadow into lit areas, too high leaks light through thin walls.
+    pub self_shadow_bias: f32,
+    /// How far probes' rays reach, in the `ShadowGrid`'s voxels. Further finds more distant
+    /// light, at more cost.
+    pub ray_distance: f32,
+}
+
+impl Default for ProbeTuning {
+    fn default() -> Self {
+        Self {
+            hysteresis: 0.97,
+            depth_hysteresis: 0.97,
+            depth_sharpness: 50.0,
+            self_shadow_bias: 0.3,
+            ray_distance: 512.0,
+        }
+    }
 }
 
 /// A probe volume's buffers, atlases and compute pipelines.
@@ -156,7 +201,9 @@ pub struct GiUniforms {
 /// camera, probes leaving it are reused by those entering it, which `classifyProbes` notices
 /// and resets. Both atlases stay in `GENERAL` layout, written as storage images and sampled.
 pub(crate) struct ProbeVolume {
+    /// Probes along each axis of each cascade.
     pub counts: [u32; 3],
+    pub cascades: u32,
     pub rays_per_frame: u32,
     pub atlas_columns: u32,
     pub probe_buffer: Buffer,
@@ -180,6 +227,7 @@ impl ProbeVolume {
     pub fn null() -> Self {
         Self {
             counts: [0; 3],
+            cascades: 0,
             rays_per_frame: 0,
             atlas_columns: 0,
             probe_buffer: Buffer::null(),
@@ -208,6 +256,7 @@ impl ProbeVolume {
     ) -> VkResult<Self> {
         let mut volume = Self::null();
         volume.counts = config.map_or([1; 3], |config| config.probe_counts.map(|n| n.max(1)));
+        volume.cascades = config.map_or(1, |config| config.cascades.clamp(1, MAX_CASCADES));
         volume.rays_per_frame = config.map_or(0, |config| config.rays_per_frame);
         if let Err(err) = volume.create(adapter, logical_device, layout) {
             unsafe { volume.destroy(logical_device) };
@@ -216,9 +265,10 @@ impl ProbeVolume {
         Ok(volume)
     }
 
+    /// Every cascade's.
     #[inline]
     pub fn probe_count(&self) -> u32 {
-        self.counts.iter().product()
+        self.counts.iter().product::<u32>() * self.cascades
     }
 
     /// Fills in a null volume, leaving whatever it created behind if it fails.

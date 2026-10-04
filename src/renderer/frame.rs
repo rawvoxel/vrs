@@ -14,8 +14,11 @@ pub(super) struct FrameData {
     pub view_proj: Mat4,
     /// Whether the light probes are updated and sampled.
     pub gi: bool,
-    /// Frame pixels along each axis that share a shadow ray, see `Renderer::shadow_scale`.
-    pub shadow_scale: u32,
+    /// Whether the frame's depth is drawn first, for the shadow pass, see
+    /// `Renderer::uses_shadow_pass`.
+    pub shadow_pass: bool,
+    /// Whether the light probes are drawn over the frame, see `DebugView::Probes`.
+    pub draw_probes: bool,
 }
 
 impl FrameData {
@@ -64,6 +67,32 @@ impl Renderer {
             .sampler(self.shadow_pass.sampler)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         let shadow_sampled = shadow_storage.sampler(self.shadow_pass.sampler);
+        let late_buffers = [
+            (16, self.frame_changed_chunks[frame].buffer.handle),
+            (17, self.frame_light_buffers[frame].buffer.handle),
+            (18, self.shadow_pass.tiles.handle),
+        ]
+        .map(|(binding, buffer)| {
+            (
+                binding,
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer)
+                    .range(vk::WHOLE_SIZE),
+            )
+        });
+        let late_writes = late_buffers.each_ref().map(|(binding, info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.frame_desc_sets[frame])
+                .dst_binding(*binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(slice::from_ref(info))
+        });
+        let light_shadow = vk::DescriptorImageInfo::default()
+            .image_view(self.shadow_pass.light_view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let reflection = vk::DescriptorImageInfo::default()
+            .image_view(self.shadow_pass.reflection_view)
+            .image_layout(vk::ImageLayout::GENERAL);
         let image_writes = [
             (13, vk::DescriptorType::STORAGE_IMAGE, &shadow_storage),
             (
@@ -76,6 +105,10 @@ impl Renderer {
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 &shadow_sampled,
             ),
+            (19, vk::DescriptorType::STORAGE_IMAGE, &light_shadow),
+            (20, vk::DescriptorType::SAMPLED_IMAGE, &light_shadow),
+            (21, vk::DescriptorType::STORAGE_IMAGE, &reflection),
+            (22, vk::DescriptorType::SAMPLED_IMAGE, &reflection),
         ]
         .map(|(binding, ty, info)| {
             vk::WriteDescriptorSet::default()
@@ -86,6 +119,7 @@ impl Renderer {
         });
         unsafe {
             self.render_device.update_descriptor_sets(&writes, &[]);
+            self.render_device.update_descriptor_sets(&late_writes, &[]);
             self.render_device
                 .update_descriptor_sets(&image_writes, &[]);
         }
@@ -150,6 +184,7 @@ impl Renderer {
     ) -> VkResult<FrameData> {
         let lighting = unsafe {
             self.write_palette(frame)?;
+            self.write_lights(frame)?;
             let lighting = self.write_lighting(frame, draws.view)?;
             self.write_frame_descriptors(frame);
             self.frame_index_buffers[frame].write(
@@ -186,7 +221,8 @@ impl Renderer {
             dynamic_index_count: draws.indices.len() as u32,
             view_proj: draws.proj * draws.view,
             gi: self.gi_enabled(),
-            shadow_scale: self.shadow_scale(),
+            shadow_pass: self.uses_shadow_pass(),
+            draw_probes: self.lighting.debug_view == super::DebugView::Probes && self.gi_enabled(),
         })
     }
 

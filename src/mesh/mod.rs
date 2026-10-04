@@ -87,6 +87,9 @@ pub struct Mesh {
     pub voxels_per_edge: u32,
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
+    /// Unique to this mesh for its pool's life, so a chunk remeshed in place of another,
+    /// even in the same slot, can be told from it.
+    pub serial: u64,
 }
 
 impl Mesh {

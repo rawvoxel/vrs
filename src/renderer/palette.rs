@@ -1,17 +1,95 @@
-//! The colors chunk meshes take from their voxels' types.
+//! What chunk meshes' voxels look like by type: their materials.
 
 use super::Renderer;
 use ash::prelude::VkResult;
 
+/// Materials below this roughness reflect sharply. Matches `GLOSSY_ROUGHNESS` in
+/// `common.slang`.
+const GLOSSY_ROUGHNESS: f32 = 0.5;
+
+/// How voxels of a type look and light, see `Renderer::set_materials`. Colors are linear.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Material {
+    /// The surface's color, which light reflects off and, for see-through voxels, passes
+    /// through tinted by.
+    pub color: [f32; 3],
+    /// The light it gives off itself, whatever its color, lighting what's around it through
+    /// the light probes. Over 1 glows brighter.
+    pub emission: [f32; 3],
+    /// How rough it is, from 0, a mirror, to 1, matte. Below 1 it reflects what's around it.
+    pub roughness: f32,
+    /// How metallic it is, from 0 to 1. Metals reflect in their own color, and reflect
+    /// rather than scatter their light.
+    pub metalness: f32,
+    /// Whether light passes through it, tinted by its color, such as glass. It's still drawn
+    /// as solid faces.
+    pub see_through: bool,
+}
+
+impl Material {
+    /// A matte, opaque material of `color`, giving off no light.
+    pub const fn color(color: [f32; 3]) -> Self {
+        Self {
+            color,
+            emission: [0.0; 3],
+            roughness: 1.0,
+            metalness: 0.0,
+            see_through: false,
+        }
+    }
+}
+
+impl Default for Material {
+    /// Matte, opaque light gray.
+    fn default() -> Self {
+        Self::color([0.8; 3])
+    }
+}
+
+/// A `Material` as `common.slang` reads it. Matches `Material` there.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct GpuMaterial {
+    /// The color, then the roughness.
+    color_roughness: [f32; 4],
+    /// The emission, then the metalness, plus 2 when it's see-through.
+    emission_metalness: [f32; 4],
+}
+
+impl From<&Material> for GpuMaterial {
+    fn from(material: &Material) -> Self {
+        let [r, g, b] = material.color;
+        let [er, eg, eb] = material.emission;
+        let see_through = match material.see_through {
+            true => 2.0,
+            false => 0.0,
+        };
+        Self {
+            color_roughness: [r, g, b, material.roughness.clamp(0.0, 1.0)],
+            emission_metalness: [er, eg, eb, material.metalness.clamp(0.0, 1.0) + see_through],
+        }
+    }
+}
+
 impl Renderer {
-    /// Linear colors indexed by voxel type, which chunk meshes are colored with from the
-    /// next `submit`. Types past the end show magenta.
-    pub fn set_palette(&mut self, colors: &[[f32; 3]]) {
-        self.palette = colors.iter().map(|&[r, g, b]| [r, g, b, 1.0]).collect();
+    /// Materials indexed by voxel type, which chunk meshes are drawn with from the next
+    /// `submit`. Type 0 is empty space, and types past the end show magenta.
+    pub fn set_materials(&mut self, materials: &[Material]) {
+        self.palette = materials.iter().map(GpuMaterial::from).collect();
         self.palette_version += 1;
+        self.glossy_palette = materials
+            .iter()
+            .any(|material| material.roughness < GLOSSY_ROUGHNESS);
     }
 
-    /// Copies the palette into `frame`'s buffer when it's changed since that frame last ran.
+    /// Matte, opaque materials of linear `colors`, indexed by voxel type, see `set_materials`.
+    pub fn set_palette(&mut self, colors: &[[f32; 3]]) {
+        let materials: Vec<Material> = colors.iter().map(|&color| Material::color(color)).collect();
+        self.set_materials(&materials);
+    }
+
+    /// Copies the materials into `frame`'s buffer when they've changed since that frame last
+    /// ran.
     ///
     /// # Safety
     /// The device must not be using `frame`'s palette buffer.
@@ -20,13 +98,17 @@ impl Renderer {
             return Ok(());
         }
         // An empty buffer can't be bound, a placeholder entry makes every type magenta.
-        let magenta = [[1.0, 0.0, 1.0, 1.0]];
-        let colors = match self.palette.is_empty() {
+        let magenta = [GpuMaterial::from(&Material::color([1.0, 0.0, 1.0]))];
+        let materials = match self.palette.is_empty() {
             true => &magenta[..],
             false => &self.palette[..],
         };
         unsafe {
-            self.frame_palette_buffers[frame].write(&self.adapter, &self.render_device, colors)?;
+            self.frame_palette_buffers[frame].write(
+                &self.adapter,
+                &self.render_device,
+                materials,
+            )?;
         }
         self.frame_palette_versions[frame] = self.palette_version;
         Ok(())

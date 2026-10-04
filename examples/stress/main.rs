@@ -16,6 +16,9 @@
 //! an indirect draw reads though, and the pixel check only sees a race the device loses,
 //! so a missing barrier before those reads can still go unnoticed.
 
+mod gi;
+#[path = "../common/greedy.rs"]
+mod greedy;
 mod pixels;
 mod scenarios;
 mod scene;
@@ -91,6 +94,7 @@ impl Stress {
         let size = target.size();
         self.messages_at_start = debug::message_counts();
         self.check_failed_construction(&app, size);
+        self.check_global_illumination(&app);
 
         // Only the growth scenario grows the pool, the rest keep it nearly full.
         let config = RendererConfig {
@@ -145,6 +149,21 @@ impl Stress {
             }
         }
         self.check_messages("failed construction");
+    }
+
+    /// The light probes' lighting of scenes with known answers, see `gi`.
+    fn check_global_illumination(&mut self, app: &App) {
+        println!("global illumination");
+        match gi::check(app) {
+            Ok(Some(failures)) => {
+                for failure in failures {
+                    self.fail(format!("global illumination: {failure}"));
+                }
+            }
+            Ok(None) => println!("  frames can't be captured, so it isn't checked"),
+            Err(err) => self.fail(format!("global illumination failed with {err}")),
+        }
+        self.check_messages("global illumination");
     }
 
     fn start_scenario(&mut self) {

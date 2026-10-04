@@ -63,7 +63,7 @@ impl Renderer {
             }
 
             self.cmd_begin_attachments(cmd_buffer, image_index);
-            let shaded = data.shadow_scale == 1;
+            let shaded = !data.shadow_pass;
             let (color, mesh_pipeline) = match shaded {
                 true => (Some(color_view), self.mesh_pipeline),
                 false => (None, self.mesh_depth_pipeline),
@@ -135,6 +135,15 @@ impl Renderer {
                 if data.dynamic_index_count > 0 {
                     self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
                 }
+                self.render_device.cmd_end_rendering(cmd_buffer);
+            }
+
+            if data.draw_probes {
+                self.cmd_begin_rendering(cmd_buffer, Some((color_view, load)), load);
+                self.cmd_bind_graphics(cmd_buffer, frame);
+                self.cmd_bind_pipeline(cmd_buffer, self.probes_pipeline);
+                self.render_device
+                    .cmd_draw(cmd_buffer, 36, self.probe_volume.probe_count(), 0, 0);
                 self.render_device.cmd_end_rendering(cmd_buffer);
             }
 

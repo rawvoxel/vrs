@@ -15,7 +15,9 @@ use glam::Vec3;
 /// A chunk's vertices, in whichever format its mesher suits.
 #[derive(Clone, Copy, Debug)]
 pub enum ChunkVertices<'a> {
-    /// Axis aligned faces only, such as from greedy meshing, 8 bytes a vertex.
+    /// Axis aligned faces only, such as from greedy meshing, 8 bytes a vertex. Each quad is 4
+    /// vertices in a row, which the renderer overlaps a little with its neighbors so no
+    /// cracks open where one quad's corner meets the middle of another's edge.
     Greedy(&'a [GreedyVertex]),
     /// Any surface, such as from surface nets or marching cubes, 12 bytes a vertex.
     Packed(&'a [PackedVertex]),

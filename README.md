@@ -9,7 +9,11 @@ every frame, as chunks are remeshed, without stalling.
 
 Chunks use compact vertex formats, 8 bytes a vertex for greedy meshes and 12 for any
 other, and are colored per voxel: each pixel finds the voxel it belongs to in the chunk's
-palette packed voxel types, then that type's color in the renderer's palette.
+palette packed voxel types, then that type's material in the renderer's palette.
+
+They're lit by a sun whose shadows are traced through the voxels, point and spot lights, and
+dynamic diffuse global illumination from light probes around the camera, with glossy
+reflections, glowing and see-through voxels, and levels of detail.
 
 ## Usage
 
@@ -61,38 +65,67 @@ drop(renderer);
   for any surface. Positions are chunk local, placed by the chunk's `origin` and `voxel_size`,
   which includes its LOD. Its `voxel::VoxelTypes` are palette compressed, and already packed
   words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the
-  palette from `set_palette`, 0 is empty space. Cells past a chunk's edge take the chunk's own
+  palette from `set_materials`, or `set_palette` for plain colors, 0 is empty space. Cells past a chunk's edge take the chunk's own
   edge voxel, there's no lookup into neighbors, and see-through faces are drawn like any other.
 - **Colored meshes** come from `create_mesh`, `vertex::Vertex`es in world space with colors of
   their own, for anything that isn't a chunk. They aren't lit.
+- **Materials**: each palette entry is a `Material`: a color, light it gives off, roughness,
+  metalness, and whether it's see-through. Glowing voxels light what's around them through
+  the light probes. See-through voxels, such as glass, are drawn as solid faces, but light
+  passes through them tinted by their color, once per pane. Smooth materials reflect what's
+  around them, more at grazing angles, and metals reflect in their own color.
 - **Lighting**: `Renderer::lighting` lights chunks with sky and ground colors, blended by
-  which way a face points, and a sun. With a `ShadowGrid`, each pixel facing the sun traces a
-  ray toward it through the voxels with a DDA, across chunks, so hills shadow their
-  neighbors. Each chunk also keeps one bit per 8³ block of voxels saying whether any is
-  solid, and rays cross empty blocks in one step. The grid is the chunks of one voxel size and
-  width, placed on a grid from the world's origin. Chunks of other sizes are lit but cast no
-  shadows, and chunks with no faces, such as under the ground, should still be created for
-  their voxels to cast shadows.
-  `Lighting::shadow_resolution` traces one shadow ray per 2x2 or 4x4 pixels instead of every
-  pixel: frames draw their depth first, trace the shadows from it, then draw their color over
-  it, upscaling the shadows by distance so they don't bleed across edges.
+  which way a face points, and a sun. With a `ShadowGrid`, shadow rays are traced toward the
+  sun through the voxels with a DDA, across chunks, so hills shadow their neighbors. Each
+  chunk also keeps one bit per 8³ block of voxels saying whether any is solid, and rays cross
+  empty blocks in one step. The grid is the chunks of one voxel size and width, placed on a
+  grid from the world's origin, and with `ShadowGrid::levels`, coarser levels of detail of
+  them, each of voxels twice as big. Rays go through the finest level's chunk wherever there
+  is one. Chunks of other sizes are lit but cast no shadows, and chunks with no faces, such as
+  under the ground, should still be created for their voxels to cast shadows.
+  With shadows or lights, frames draw their depth first, trace the shadows from it, then draw
+  their color over it, which saves tracing for pixels drawn over. `Lighting::shadow_resolution`
+  traces one shadow ray per 2x2 or 4x4 pixels instead of every pixel, upscaling the shadows by
+  distance so they don't bleed across edges.
+  Greedy faces' corners and crevices are darkened by voxel ambient occlusion, from the voxels
+  around each face, `Lighting::ambient_occlusion`.
+- **Lights**: `Renderer::lights` holds up to 255 point and spot lights. Each frame lists the
+  lights reaching each 16x16 pixel tile, the brightest when more than fit, and each pixel's
+  brightest `Lighting::shadowed_lights`, up to 4, are shadowed at the shadow resolution.
+  Shadow rays start from the light, past any voxels it's inside, so a light can sit inside a
+  glowing block as its lamp.
+  The light probes see the lights too.
+- **Reflections**: smooth voxels, with a roughness under 0.5, have a reflection ray traced
+  for each shadow texel and upscaled like the shadows, which blends into the probes' light
+  from the reflected direction as they get rougher. The sun's and the lights' highlights are
+  added on top.
 - **Global illumination**: with `RendererConfig::global_illumination`, a volume of light
   probes 16 voxels apart follows the camera, and lights chunks inside it with light bounced
-  off the voxels around them, in place of the sky and ground colors. It's dynamic diffuse
-  global illumination (Majercik et al. 2019 and 2021):
+  off the voxels around them, in place of the sky and ground colors. With
+  `GiConfig::cascades`, further volumes follow it too, each with probes twice as far apart,
+  reaching twice as far, for coarser levels of detail. It's dynamic diffuse global
+  illumination (Majercik et al. 2019 and 2021):
   - When a chunk is added, each 16³ cell of it bakes where its probe goes: the largest empty
     part of the cell nearest its center, found breadth first, or none when it's solid.
   - Every frame, the probes with voxels in or next to their cell share a fixed budget of
-    rays, `GiConfig::rays_per_frame`, so the cost stays steady. Each traces its share
-    through the voxels with the same DDA, shades what they hit with the sun and last frame's
-    probes, which adds a bounce every frame, and blends the result into small octahedral
-    maps of the light reaching it and how far away voxels are.
-  - Shading blends the 8 probes around each point, weighted by distance, which way they face
-    and whether their distances say they can see it, which keeps light from leaking
-    through walls.
+    rays, `GiConfig::rays_per_frame`, so the cost stays steady, those of coarser cascades
+    every few frames. Each traces its share through the voxels with the same DDA, shades
+    what they hit with the sun, the lights and last frame's probes, which adds a bounce every
+    frame, and blends the result into small octahedral maps of the light reaching it and how
+    far away voxels are.
+  - Probes converge faster for a while after the sun or sky change, or chunks near them are
+    added, removed or remeshed. `Renderer::converge_lighting` does it for everything, such as
+    after a cut to another place. `Lighting::probe_tuning` sets how they blend and sample.
+  - Shading blends the 8 probes around each point, weighted by where each actually is, which
+    way they face and whether their distances say they can see it, which keeps light from
+    leaking through walls. The finest cascade covering a point lights it, blending into the
+    next at its edge.
 
   It needs a `ShadowGrid` whose chunks are a multiple of 16 voxels wide, and
-  `Lighting::global_illumination` turns it off and on.
+  `Lighting::global_illumination` turns it off and on. Probes spaced wider than a room can
+  leak light into it, so coarser cascades suit far away terrain rather than interiors.
+- **Debug views**: `Lighting::debug_view` shows all the light reaching chunks, only the
+  sun's and lights', only the rest, the ambient occlusion, or the probes drawn as cubes.
 - **Winding**: front faces wind counter-clockwise on screen, backface culling skips the rest.
 - **Cameras**: `DrawList::proj` maps into Vulkan's clip space, where y points down and depth
   runs from 0 to 1. Flip y in an OpenGL style projection, such as glam's `perspective_rh`,
@@ -126,6 +159,7 @@ drop(renderer);
 ```sh
 cargo run -p vrs --example triangle
 cargo run -p vrs --example cube
+cargo run -p vrs --example materials --release
 cargo run -p vrs --example terrain --release
 cargo run -p vrs --example screenshot --release -- terrain.ppm
 cargo run -p vrs --example stress
@@ -135,13 +169,17 @@ cargo run -p vrs --example stress -- --headless
 - `triangle` is the classic Vulkan triangle, drawn as a colored mesh.
 - `cube` circles a cube of 8³ voxels checkered in two types. Greedy meshing makes each side
   one quad, and the colors still come from the voxels.
-- `terrain` is rolling hills of greedy meshed chunks, under a low sun casting shadows and lit
-  by light probes near the camera, to fly around: click to look with the mouse, WASD to
-  move, Space and Ctrl for up and down, Shift to go faster. The title shows how many chunks
-  were drawn, the rest culled behind hills.
+- `materials` circles rows of red lacquer and gold blocks, each rougher than the last, with
+  blocks glowing in six colors between them on a glossy checkered floor. Space pauses the
+  camera, and L turns on and off a point light inside each glowing block.
+- `terrain` is rolling hills of greedy meshed chunks, ringed by coarser chunks of the next
+  level of detail, under a low sun casting shadows and lit by two cascades of light probes,
+  to fly around: click to look with the mouse, WASD to move, Space and Ctrl for up and down,
+  Shift to go faster, L to drop a light and Backspace to take them away. The title shows how
+  many chunks were drawn, the rest culled behind hills.
 - `screenshot` renders the terrain without a window and saves the frame as a PPM image.
 
-`cube`, `terrain` and `screenshot` share a greedy mesher for 64³ chunks in
+`cube`, `materials`, `terrain` and `screenshot` share a greedy mesher for 64³ chunks in
 `examples/common`, to show how a mesher's output becomes a chunk mesh.
 
 `stress` checks the renderer the way a voxel game uses it and exits with a failure code if
@@ -159,6 +197,13 @@ anything's wrong:
   each half must show its type's color, which catches chunks colored by anything but their
   voxels, drawn from missing data, or culled while visible.
 - A renderer failing partway through being built must leak nothing.
+- Lighting is checked against scenes with known answers: a floor under a white sky must come
+  out at its color, no light may leak into a sealed box, bounced light must reach the inside
+  of a box with a hole in its roof, glass must dim it, the probes must catch up with changes
+  within a few frames, glowing voxels and point lights must light their surroundings, walls
+  of fine and coarse chunks must shadow lights, spot lights must light only their cone, a
+  mirror must reflect what's out of view, and coarser cascades must reach further without
+  leaking or darkening coarse chunks.
 - Debug builds fail on any validation message, with synchronization validation on.
 
 Synchronization validation can't see which vertices an indirect draw reads, and the pixel
@@ -189,7 +234,8 @@ For tests and tools, these stall the GPU:
 | `renderer` | `Renderer`, building it, each frame's stages and command recording |
 | `mesh` | Mesh ids and the shared mesh pool, its staging, range allocator and repacking |
 | `voxel` | Chunk meshes: compact vertex formats and packed voxel types |
-| `gi` | The light probe volume and its configuration |
+| `gi` | The light probe cascades and their configuration |
+| `shadows`, `lights` | Low resolution shadows, reflections and light culling, and the lights |
 | `cull`, `hiz` | GPU culling, and the depth pyramid occlusion culling tests against |
 | `app`, `adapter`, `surface`, `swapchain` | The instance, GPUs, and what frames are drawn into |
 | `buffer`, `image`, `pipeline`, `descriptors`, `commands`, `sync` | Vulkan building blocks |

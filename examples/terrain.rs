@@ -2,7 +2,8 @@
 //!
 //! Run with `cargo run -p vrs --example terrain --release`, debug builds take a few seconds
 //! to mesh the world. Click to look around with the mouse, Escape to let go of it. WASD
-//! moves, Space and Ctrl go up and down, and Shift moves faster.
+//! moves, Space and Ctrl go up and down, and Shift moves faster. L drops a light where the
+//! camera is, Backspace takes them all away.
 //!
 //! The title shows how many chunks were drawn of those in the frame: chunks behind hills
 //! are culled.
@@ -22,7 +23,7 @@ use std::{
 use vrs::{
     App,
     mesh::MeshId,
-    renderer::{DrawList, Renderer},
+    renderer::{DrawList, Light, Renderer},
 };
 use winit::{
     application::ApplicationHandler,
@@ -39,6 +40,16 @@ const SPEED: f32 = 40.0;
 const FAST_SPEED: f32 = 160.0;
 /// Radians per pixel of mouse movement.
 const LOOK_SPEED: f32 = 0.003;
+/// The colors dropped lights take turns at, in linear color.
+const LIGHT_COLORS: [[f32; 3]; 4] = [
+    [1.0, 0.55, 0.2],
+    [0.3, 0.6, 1.0],
+    [1.0, 0.3, 0.6],
+    [0.5, 1.0, 0.4],
+];
+/// Dropped lights' brightness at their center, and how far their light reaches, in voxels.
+const LIGHT_BRIGHTNESS: f32 = 300.0;
+const LIGHT_RANGE: f32 = 48.0;
 /// How often the title's draw counts are read back, which stalls the device.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -162,6 +173,20 @@ impl Terrain {
         self.mouse_captured = capture;
     }
 
+    fn drop_light(&mut self) {
+        let Some(vulkan) = &mut self.vulkan else {
+            return;
+        };
+        let lights = &mut vulkan.renderer.lights;
+        let color = LIGHT_COLORS[lights.len() % LIGHT_COLORS.len()];
+        lights.push(Light {
+            position: self.camera.position,
+            color: color.map(|channel| channel * LIGHT_BRIGHTNESS),
+            range: LIGHT_RANGE,
+            spot: None,
+        });
+    }
+
     fn redraw(&mut self) {
         let (Some(window), Some(vulkan)) = (&self.window, &mut self.vulkan) else {
             return;
@@ -250,6 +275,12 @@ impl ApplicationHandler for Terrain {
                 ..
             } => match state {
                 ElementState::Pressed if key == KeyCode::Escape => self.capture_mouse(false),
+                ElementState::Pressed if key == KeyCode::KeyL => self.drop_light(),
+                ElementState::Pressed if key == KeyCode::Backspace => {
+                    if let Some(vulkan) = &mut self.vulkan {
+                        vulkan.renderer.lights.clear();
+                    }
+                }
                 ElementState::Pressed => {
                     self.keys.insert(key);
                 }
