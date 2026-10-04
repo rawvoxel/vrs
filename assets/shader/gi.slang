@@ -14,9 +14,12 @@
 // Matches `gi::ACTIVE_LIST`: tracing's group counts, the updates' group counts, how many
 // probes are listed and how many rays each traces come first.
 static const uint ACTIVE_LIST = 8;
+static const uint ACTIVE_TRACE_GROUPS = 0;
+static const uint ACTIVE_UPDATE_GROUPS = 3;
 static const uint ACTIVE_COUNT = 6;
 static const uint ACTIVE_RAYS = 7;
-// The fewest and most rays a probe traces in a frame. Match `gi::MIN_RAYS_PER_PROBE`.
+// The fewest rays a probe traces in a frame, which matches `gi::MIN_RAYS_PER_PROBE`, and the
+// most.
 static const uint MIN_RAYS_PER_PROBE = 32;
 static const uint MAX_RAYS_PER_PROBE = 256;
 // Rays traced by each group of `traceProbeRays`, the fewest a probe traces.
@@ -27,7 +30,7 @@ static const uint CELL_PLACED = 1u << 31;
 // finest cascade. Rays going further are left out of the distance maps, so a texel's rays
 // passing the edge of a wall don't average its distance out past the wall and leak light
 // through it [Roháček 2022].
-static const float MAX_PROBE_DEPTH = float(PROBE_SPACING) * 1.7320508 * 1.5;
+static const float MAX_PROBE_DEPTH = float(PROBE_CELL) * 1.7320508 * 1.5;
 
 [[vk::binding(9, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> irradianceAtlas;
 [[vk::binding(10, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> depthAtlas;
@@ -36,9 +39,9 @@ static const float MAX_PROBE_DEPTH = float(PROBE_SPACING) * 1.7320508 * 1.5;
 // The dispatches' group counts and the frame's ray share, then the listed probes' slots.
 [[vk::binding(12, 0)]] RWStructuredBuffer<uint> active;
 
-// The cascade of the probe in slot `slot`.
-int cascadeOf(uint slot) {
-    return int(slot / probesPerCascade());
+// The frames a probe whose state is `state` has left converging faster.
+uint fastFrames(uint state) {
+    return (state >> PROBE_FAST_SHIFT) & 0xff;
 }
 
 // Frames between the updates of the probe in slot `slot`, which converges faster for `fast`
@@ -55,7 +58,7 @@ uint updatePeriod(uint slot, uint fast) {
 // voxels are bigger than the cell, its probe is at its center when that's empty. A cell
 // without a chunk is empty, with its probe at its center.
 bool probePlacement(int cascade, int3 cell, out float3 position) {
-    int spacing = PROBE_SPACING << cascade;
+    int spacing = PROBE_CELL << cascade;
     float3 center = (float3(cell) + 0.5) * float(spacing);
     position = center;
     int level;
@@ -89,15 +92,15 @@ bool probePlacement(int cascade, int3 cell, out float3 position) {
         }
         return empty >= 0;
     }
-    int cells = edge / PROBE_SPACING;
+    int cells = edge / PROBE_CELL;
     int3 local = int3(floor(center / scale)) - chunk * edge;
-    int3 bakedCell = local / PROBE_SPACING;
+    int3 bakedCell = local / PROBE_CELL;
     uint word = typeWords[meshes[meshIndex].probesBase + uint(bakedCell.x + cells * (bakedCell.y + cells * bakedCell.z))];
     if ((word & CELL_PLACED) == 0) {
         return false;
     }
     float3 inCell = float3(word & 63, (word >> 6) & 63, (word >> 12) & 63) * 0.5;
-    position = (float3(chunk * edge + bakedCell * PROBE_SPACING) + inCell) * scale;
+    position = (float3(chunk * edge + bakedCell * PROBE_CELL) + inCell) * scale;
     return true;
 }
 
@@ -106,13 +109,13 @@ bool probePlacement(int cascade, int3 cell, out float3 position) {
 // the cascade's level and coarser. Chunks of finer levels only have chunks with voxels.
 bool cellsHaveVoxels(int cascade, int3 low, int3 high) {
     int edge = int(ubo.lighting.shadowGrid.y);
-    int cells = edge / PROBE_SPACING;
-    int spacing = PROBE_SPACING << cascade;
+    int cells = edge / PROBE_CELL;
+    int spacing = PROBE_CELL << cascade;
     // In the finest voxels.
     int3 regionMin = low * spacing;
     int3 regionMax = (high + 1) * spacing - 1;
     for (int level = 0; level < int(ubo.lighting.shadowGrid.w); level++) {
-        int cellSize = PROBE_SPACING << level;
+        int cellSize = PROBE_CELL << level;
         int3 cellLow = floorDiv(regionMin, cellSize);
         int3 cellHigh = floorDiv(regionMax, cellSize);
         int3 chunkLow = floorDiv(cellLow, cells);
@@ -159,7 +162,7 @@ static const uint FAST_DEPTH_FRAMES = 7;
 bool chunksChanged(int cascade, int3 low, int3 high) {
     int edge = int(ubo.lighting.shadowGrid.y);
     int side = ubo.lighting.shadowTable.w;
-    int spacing = PROBE_SPACING << cascade;
+    int spacing = PROBE_CELL << cascade;
     int3 regionMin = low * spacing;
     int3 regionMax = (high + 1) * spacing - 1;
     for (int level = 0; level < int(ubo.lighting.shadowGrid.w); level++) {
@@ -212,9 +215,9 @@ void classifyProbes(uint3 threadId: SV_DispatchThreadID) {
     }
 
     // Probes next to a chunk added, removed or remeshed converge faster for a while.
-    uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
+    uint fast = fastFrames(probe.state);
     fast = chunksChanged(cascade, cell - 1, cell + 1) ? FAST_FRAMES : (fast > 0 ? fast - 1 : 0);
-    uint state = (probe.state & 0xff) | (fast << PROBE_FAST_SHIFT);
+    uint state = (probe.state & ((1u << PROBE_FAST_SHIFT) - 1)) | (fast << PROBE_FAST_SHIFT);
     if (state != probe.state) {
         probe.state = state;
         probes[slot].state = state;
@@ -247,15 +250,15 @@ void planRays() {
         rays *= 2;
     }
     active[ACTIVE_RAYS] = rays;
-    active[0] = count * (rays / TRACE_GROUP);
-    active[3] = count;
+    active[ACTIVE_TRACE_GROUPS] = count * (rays / TRACE_GROUP);
+    active[ACTIVE_UPDATE_GROUPS] = count;
 }
 
 // Ray `index` of `count` of every probe this frame: evenly spread over the sphere
 // [Marques et al. 2013], rotated randomly each frame so probes see every direction over time.
 float3 probeRayDirection(uint index, uint count) {
     float goldenRatio = (sqrt(5.0) + 1.0) * 0.5;
-    float phi = 2.0 * 3.14159265 * frac(float(index) * (goldenRatio - 1.0));
+    float phi = 2.0 * PI * frac(float(index) * (goldenRatio - 1.0));
     float cosTheta = 1.0 - (2.0 * float(index) + 1.0) / float(count);
     float sinTheta = sqrt(saturate(1.0 - cosTheta * cosTheta));
     float3 direction = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
@@ -277,7 +280,7 @@ void traceProbeRays(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID) {
     VoxelHit hit;
     // Coarser cascades' rays reach further, in proportion.
     float reach = ubo.gi.rays.x * float(1 << cascadeOf(slot));
-    if (!traceVoxels(probe.position, direction, reach, false, hit)) {
+    if (!traceVoxels(probe.position, direction, reach, false, false, hit)) {
         // The sky, or the ground past the world, through any see-through voxels.
         result = float4(ambientLight(direction) * hit.transmittance, 1e9);
     } else if (hit.distance <= 0.0) {
@@ -363,10 +366,9 @@ void updateIrradiance(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, u
     int2 texel = atlasTexel(group.x, int2(thread.xy), IRRADIANCE_TEXELS);
     float3 old = irradianceAtlas[texel].rgb;
     // A probe's first update replaces what was there, and big changes are let through
-    // faster [Majercik et al. 2021].
-    // Probes updated every few frames keep as much less each time, so they follow changes as
-    // fast.
-    uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
+    // faster [Majercik et al. 2021]. Probes updated every few frames keep as much less each
+    // time, so they follow changes as fast.
+    uint fast = fastFrames(probe.state);
     float hysteresis = probe.updates <= 1
         ? 0.0
         : pow(ubo.gi.tuning.x * ubo.gi.rays.y * (fast > 0 ? 0.5 : 1.0), float(updatePeriod(slot, fast)));
@@ -414,7 +416,7 @@ void updateDepth(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint t
 
     int2 texel = atlasTexel(group.x, int2(thread.xy), DEPTH_TEXELS);
     float2 old = depthAtlas[texel].xy;
-    uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
+    uint fast = fastFrames(probe.state);
     float hysteresis = probe.updates <= 1
         ? 0.0
         : pow(ubo.gi.tuning.y * ubo.gi.rays.z * (fast > FAST_FRAMES - FAST_DEPTH_FRAMES ? 0.5 : 1.0), float(updatePeriod(slot, fast)));

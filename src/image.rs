@@ -66,6 +66,75 @@ impl Image {
     }
 }
 
+/// A 2D image compute shaders write and others sample, with its view, in device memory.
+pub(crate) struct StorageImage {
+    pub image: Image,
+    pub view: vk::ImageView,
+}
+
+impl StorageImage {
+    /// Owns nothing, destroying it does nothing.
+    pub fn null() -> Self {
+        Self {
+            image: Image::null(),
+            view: vk::ImageView::null(),
+        }
+    }
+
+    /// `extent` texels of `format`, usable for `usage` too.
+    pub fn new(
+        adapter: &Adapter,
+        logical_device: &ash::Device,
+        extent: vk::Extent2D,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+    ) -> VkResult<Self> {
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(extent.into())
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = Image::new(
+            adapter,
+            logical_device,
+            info,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        let view = create_image_view(
+            logical_device,
+            image.handle,
+            format,
+            vk::ComponentMapping::default(),
+            vk::ImageAspectFlags::COLOR,
+        );
+        match view {
+            Ok(view) => Ok(Self { image, view }),
+            Err(err) => {
+                unsafe { image.destroy(logical_device) };
+                Err(err)
+            }
+        }
+    }
+
+    /// Leaves it null.
+    ///
+    /// # Safety
+    /// The device must be done with it.
+    pub unsafe fn destroy(&mut self, logical_device: &ash::Device) {
+        unsafe {
+            logical_device.destroy_image_view(self.view, None);
+            self.image.destroy(logical_device);
+        }
+        *self = Self::null();
+    }
+}
+
 #[inline]
 pub fn create_image_view(
     logical_device: &ash::Device,

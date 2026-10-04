@@ -1,9 +1,11 @@
-// Shadows from the frame's depth, traced at a fraction of the frame's resolution, one ray for
-// each block of pixels and light, for shading to upscale, see `upscaledShadow` in
-// `mesh.slang`.
+// The shadow pass: from the frame's depth, at a fraction of the frame's resolution or all of
+// it, for shading to upscale, see `shadowTaps` in `mesh.slang`.
 //
-// `cullLights` first lists the lights reaching each 16x16 pixel tile, then `traceShadows`
-// traces the sun's shadows and those of each block's brightest few lights.
+// `cullLights` first lists the lights reaching each `LIGHT_TILE` wide tile of pixels. Then
+// `traceShadows`, for each block of pixels, traces the sun's shadow and those of the block's
+// brightest few lights, finds the voxel it shows, and traces its reflection when it's glossy.
+// Below full resolution, it also finds the light reaching it from everywhere but the sun,
+// with its ambient occlusion.
 
 #include "common.slang"
 
@@ -11,10 +13,10 @@
 // the camera.
 [[vk::binding(13, 0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> shadowImage;
 [[vk::binding(14, 0)]] Sampler2D<float> depthBuffer;
-// For each tile, how many lights reach it, then which, `TILE_LIGHTS + 1` words a tile.
+// For each tile, how many lights reach it, then which, `TILE_WORDS` words a tile.
 [[vk::binding(18, 0)]] RWStructuredBuffer<uint> tileLights;
-// Each texel's shadowed lights, 8 bits each in x, `0xff` for none, and how much of each gets
-// through, 8 bits each in y.
+// Each texel's shadowed lights, 8 bits each in x, `NO_LIGHT` for none, and how much of each
+// gets through, 8 bits each in y.
 [[vk::binding(19, 0)]] [[vk::image_format("rg32ui")]] RWTexture2D<uint2> lightShadowImage;
 // Each texel's sharp reflection when its voxel is glossy, and its face's number, 0 for none.
 [[vk::binding(21, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> reflectionImage;
@@ -74,19 +76,17 @@ void cullLights(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint in
                 uint slot;
                 InterlockedAdd(tileCount, 1, slot);
                 tileList[slot] = i;
-                float x = distance / light.positionRange.w;
-                float window = saturate(1.0 - x * x * x * x);
-                tileStrengths[slot] = dot(light.colorSpot.rgb, float3(0.3, 0.6, 0.1)) * window * window / (distance * distance + 1.0);
+                tileStrengths[slot] = dot(light.colorSpot.rgb, LUMINANCE) * lightFalloff(distance, light.positionRange.w);
             }
         }
     }
     GroupMemoryBarrierWithGroupSync();
 
     // With more than fit, the brightest are kept, ranked by how many are brighter.
-    uint tile = group.y * ubo.shadow.lights.y + group.x;
+    uint tile = (group.y * ubo.shadow.lights.y + group.x) * TILE_WORDS;
     uint total = tileCount;
     if (index == 0) {
-        tileLights[tile * (TILE_LIGHTS + 1)] = min(total, TILE_LIGHTS);
+        tileLights[tile] = min(total, TILE_LIGHTS);
     }
     for (uint i = index; i < total; i += LIGHT_TILE * LIGHT_TILE) {
         uint rank = i;
@@ -99,7 +99,7 @@ void cullLights(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint in
             }
         }
         if (rank < TILE_LIGHTS) {
-            tileLights[tile * (TILE_LIGHTS + 1) + 1 + rank] = tileList[i];
+            tileLights[tile + 1 + rank] = tileList[i];
         }
     }
 }
@@ -120,7 +120,7 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
     if (depth >= 1.0) {
         // Nothing drawn, the sky.
         shadowImage[threadId.xy] = float4(1.0, 1.0, 1.0, 1e9);
-        lightShadowImage[threadId.xy] = uint2(0xffffffff, 0);
+        lightShadowImage[threadId.xy] = NO_SHADOWED_LIGHTS;
         reflectionImage[threadId.xy] = float4(0.0);
         indirectImage[threadId.xy] = float4(0.0);
         return;
@@ -131,7 +131,8 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
     float distance = length(position - camera);
     // Rays start just off the surface toward the camera, which is always on its open side.
     float3 toCamera = (camera - position) / max(distance, 1e-6);
-    float3 gridPosition = position / max(ubo.lighting.shadowGrid.x, 1e-6) + toCamera * SHADOW_RAY_OFFSET;
+    float3 onSurface = toGrid(position);
+    float3 gridPosition = onSurface + toCamera * SHADOW_RAY_OFFSET;
 
     float3 visible = float3(1.0);
     if (ubo.lighting.shadowTable.w > 0) {
@@ -139,23 +140,24 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
     }
     shadowImage[threadId.xy] = float4(visible, distance);
 
-    // The voxel the pixel shows and the face it's seen through, found by a short ray from
-    // just in front of it, then the light reaching that face from everywhere but the sun, and
-    // what it reflects when it's glossy.
+    // The voxel the pixel shows and the face it's seen through, see-through ones too, found by
+    // a short ray from just in front of it, then the light reaching that face from everywhere
+    // but the sun, and what it reflects when it's glossy.
     float4 reflection = float4(0.0);
     float4 indirect = float4(0.0);
     bool lightsIndirect = ubo.shadow.frameSize.w != 0;
     if ((ubo.shadow.params.w != 0 || lightsIndirect) && ubo.lighting.shadowTable.w > 0) {
         float3 view = -toCamera;
-        float3 start = position / ubo.lighting.shadowGrid.x - view;
+        float3 start = onSurface - view;
         VoxelHit surface;
-        if (traceVoxels(start, view, 2.0, false, surface) && surface.distance > 0.0) {
+        if (traceVoxels(start, view, 2.0, false, true, surface) && surface.distance > 0.0) {
             float3 onFace = start + view * surface.distance;
             float face = float(faceNumber(surface.normal));
             if (lightsIndirect) {
                 float3 light = indirectLight(onFace, surface.normal, toCamera, false);
+                // Only greedy faces are darkened, as when each pixel finds its own.
                 float occlusionStrength = ubo.lighting.options.x;
-                if (occlusionStrength > 0.0) {
+                if (occlusionStrength > 0.0 && meshes[surface.mesh].kind == KIND_GREEDY) {
                     float3 inLevel = onFace / float(1 << surface.level);
                     light *= lerp(1.0, gridOpenness(surface.level, inLevel, int3(surface.normal)), occlusionStrength);
                 }
@@ -173,33 +175,18 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
     indirectImage[threadId.xy] = indirect;
 
     // The block's tile's brightest lights here, as many as are shadowed, brightest first.
-    uint shadowed = ubo.shadow.lights.w;
-    uint brightest[4] = { 0xff, 0xff, 0xff, 0xff };
-    float strengths[4] = { 0.0, 0.0, 0.0, 0.0 };
-    uint tile = (pixel.y / LIGHT_TILE) * ubo.shadow.lights.y + pixel.x / LIGHT_TILE;
-    uint count = tileLights[tile * (TILE_LIGHTS + 1)];
+    uint shadowed = min(ubo.shadow.lights.w, MAX_SHADOWED_LIGHTS);
+    BrightestLights brightest = noBrightestLights();
+    uint tile = tileOf(pixel) * TILE_WORDS;
+    uint count = tileLights[tile];
     for (uint i = 0; i < count; i++) {
-        uint lightIndex = tileLights[tile * (TILE_LIGHTS + 1) + 1 + i];
-        float strength = lightStrength(lights[lightIndex], position);
-        for (uint k = 0; k < shadowed; k++) {
-            if (strength > strengths[k]) {
-                for (uint j = shadowed - 1; j > k; j--) {
-                    strengths[j] = strengths[j - 1];
-                    brightest[j] = brightest[j - 1];
-                }
-                strengths[k] = strength;
-                brightest[k] = lightIndex;
-                break;
-            }
-        }
+        uint lightIndex = tileLights[tile + 1 + i];
+        keepBrightest(brightest, shadowed, lightIndex, lightStrength(lights[lightIndex], position), float3(0.0));
     }
-    uint2 result = uint2(0xffffffff, 0);
-    for (uint k = 0; k < shadowed; k++) {
-        if (brightest[k] == 0xff) {
-            break;
-        }
-        float lit = lightShadow(lights[brightest[k]], gridPosition);
-        result.x = (result.x & ~(0xffu << (k * 8))) | (brightest[k] << (k * 8));
+    uint2 result = NO_SHADOWED_LIGHTS;
+    for (uint k = 0; k < shadowed && brightest.lights[k] != NO_LIGHT; k++) {
+        float lit = lightShadow(lights[brightest.lights[k]], gridPosition);
+        result.x = (result.x & ~(NO_LIGHT << (k * 8))) | (brightest.lights[k] << (k * 8));
         result.y |= uint(round(saturate(lit) * 255.0)) << (k * 8);
     }
     lightShadowImage[threadId.xy] = result;

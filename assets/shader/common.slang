@@ -1,5 +1,6 @@
-// Shared by `mesh.slang` and `gi.slang`: the frame's bindings, decoding voxels, tracing rays
-// through them, and lighting from the sun, the sky and the light probes.
+// Shared by every shader but the culling ones: the frame's bindings, decoding voxels, tracing
+// rays through them, and lighting from the sun, the sky, the light probes and the lights,
+// with ambient occlusion and glossy reflections.
 //
 // `gi.slang` defines `GI_WRITES` first, for the bindings only its compute shaders write.
 
@@ -21,6 +22,11 @@ struct MeshInfo {
     uint probesBase;
 };
 
+// Matches `mesh::MeshKind`.
+static const uint KIND_COLORED = 0;
+static const uint KIND_GREEDY = 1;
+static const uint KIND_PACKED = 2;
+
 // The most levels of chunks the shadow grid has, each of voxels twice as big as the last.
 // Matches `lighting::MAX_SHADOW_LEVELS`.
 static const int MAX_SHADOW_LEVELS = 4;
@@ -35,8 +41,8 @@ struct LightingUniforms {
     float4 sunColor;
     float4 skyColor;
     float4 groundColor;
-    // The chunk coordinate of the finest level's shadow table's corner, and chunks per side,
-    // 0 without shadows.
+    // Chunks per side of each level's shadow table in w, 0 without shadows. The corners are
+    // in `shadowLevels`.
     int4 shadowTable;
     // The grid's voxel size, voxels per edge and the shadow distance in voxels, then how many
     // levels of chunks it has.
@@ -71,8 +77,8 @@ struct GiUniforms {
 struct ShadowUniforms {
     // From clip space back to the world.
     float4x4 inverseViewProj;
-    // Frame pixels per shadow texel along each axis, 1 when shading traces its own, then the
-    // shadow image's width and height.
+    // Frame pixels per shadow texel along each axis, then the shadow images' width and
+    // height, then 1 when any material is glossy, for reflections to be traced.
     uint4 params;
     // The frame's width and height, then 1 when the shadow pass ran this frame, then 1 when it
     // also lit faces with the light from everywhere but the sun.
@@ -92,6 +98,14 @@ struct Light {
     float4 directionOuter;
     // The cosine of the spot's inner angle.
     float4 inner;
+};
+
+// How voxels of a type look and light, in linear color. Matches `palette::GpuMaterial`.
+struct Material {
+    // The surface's color, then its roughness.
+    float4 colorRoughness;
+    // The light it gives off, then its metalness, plus `SEE_THROUGH` when it's see-through.
+    float4 emissionMetalness;
 };
 
 // Matches `uniforms::FrameUniforms`.
@@ -123,8 +137,12 @@ static const uint PROBE_FAST_SHIFT = 8;
 
 // Matches `lighting::NO_CHUNK`, a shadow table entry without a chunk.
 static const uint NO_CHUNK = 0xffffffff;
+// Added to a material's metalness when it's see-through. Matches `palette::GpuMaterial`.
+static const float SEE_THROUGH = 2.0;
 // How far off a surface, in voxels, its shadow ray starts, so it starts in the cell in front.
 static const float SHADOW_RAY_OFFSET = 1.0 / 64.0;
+// Moves a point on a face into the voxel behind it, in voxels.
+static const float FACE_NUDGE = 1.0 / 256.0;
 // Matches `voxel::OCCUPANCY_BLOCK`, voxels along each edge of a block of a chunk's occupancy.
 static const int OCCUPANCY_BLOCK = 8;
 // Moves a ray just past the boundary it's on, in voxels.
@@ -133,9 +151,9 @@ static const float RAY_EPSILON = 1.0 / 4096.0;
 static const uint MAX_RAY_CHUNKS = 256;
 static const uint MAX_RAY_VOXELS = 1024;
 
-// Voxels along each edge of a probe's cell, and between neighboring probes. Matches
-// `gi::PROBE_CELL`.
-static const int PROBE_SPACING = 16;
+// Voxels along each edge of a probe's cell, and between neighboring probes, in the finest
+// cascade. Matches `gi::PROBE_CELL`.
+static const int PROBE_CELL = 16;
 // Matches `gi::IRRADIANCE_TEXELS` and `gi::DEPTH_TEXELS`, each with a one texel border.
 static const int IRRADIANCE_TEXELS = 8;
 static const int DEPTH_TEXELS = 14;
@@ -143,39 +161,62 @@ static const int DEPTH_TEXELS = 14;
 // rise looks [Majercik et al. 2021].
 static const float IRRADIANCE_GAMMA = 5.0;
 
+// Pixels along each edge of a tile lights are culled for. Matches `shadows::LIGHT_TILE`.
+static const uint LIGHT_TILE = 16;
+// The most lights a tile keeps, its brightest. Matches `shadows::TILE_LIGHTS`.
+static const uint TILE_LIGHTS = 63;
+// Words a tile's light list takes: its count, then its lights.
+static const uint TILE_WORDS = TILE_LIGHTS + 1;
+// The most lights a frame has. Matches `lights::MAX_LIGHTS`.
+static const uint MAX_LIGHTS = 255;
+// The most of a pixel's lights that are shadowed. Matches `lighting::MAX_SHADOWED_LIGHTS`.
+static const uint MAX_SHADOWED_LIGHTS = 4;
+// No light, in 8 bits. Lights are numbered below `MAX_LIGHTS`, so it's never one.
+static const uint NO_LIGHT = 0xff;
+// A light shadow texel without shadowed lights: every 8 bits `NO_LIGHT`.
+static const uint2 NO_SHADOWED_LIGHTS = uint2(0xffffffff, 0);
+
+// How bright each channel of linear color looks.
+static const float3 LUMINANCE = float3(0.3, 0.6, 0.1);
+static const float PI = 3.14159265;
+
 [[vk::binding(0, 0)]] ConstantBuffer<Uniforms> ubo;
 [[vk::binding(1, 0)]] StructuredBuffer<uint> vertexWords;
 [[vk::binding(2, 0)]] StructuredBuffer<MeshInfo> meshes;
-// Every chunk's voxel types, laid out as `voxel::VoxelTypes` packs them, then its occupancy.
+// Every chunk's voxel types, laid out as `voxel::VoxelTypes` packs them, then its occupancy,
+// then its probe cells' words and voxel masks, see `gi::bake_probe_cells`.
 [[vk::binding(3, 0)]] StructuredBuffer<uint> typeWords;
-// How voxels of a type look and light, in linear color. Matches `palette::GpuMaterial`.
-struct Material {
-    // The surface's color, then its roughness.
-    float4 colorRoughness;
-    // The light it gives off, then its metalness, plus 2 when it's see-through.
-    float4 emissionMetalness;
-};
-
 // Materials indexed by voxel type.
 [[vk::binding(4, 0)]] StructuredBuffer<Material> palette;
-// The mesh index of the chunk at each chunk coordinate around the camera, or `NO_CHUNK`.
-// `lighting.shadowTable.w` chunks per side, x-fastest.
+// The mesh index of the chunk at each chunk coordinate around the camera, or `NO_CHUNK`. A
+// table for each level, finest first, of `lighting.shadowTable.w` chunks per side, x-fastest.
 [[vk::binding(5, 0)]] StructuredBuffer<uint> shadowTable;
-// Each probe slot's probe, slots x-fastest by probe cell modulo the volume's size.
+// Each probe slot's probe, cascade by cascade, slots x-fastest by probe cell modulo the
+// cascade's size.
 #ifdef GI_WRITES
 [[vk::binding(6, 0)]] RWStructuredBuffer<Probe> probes;
 #else
 [[vk::binding(6, 0)]] StructuredBuffer<Probe> probes;
 #endif
-// The frame's lights, see `Renderer::lights`.
-[[vk::binding(17, 0)]] StructuredBuffer<Light> lights;
-// A bit for each shadow table entry, set when its chunk was added, removed or remeshed since
-// last frame.
-[[vk::binding(16, 0)]] StructuredBuffer<uint> changedChunks;
 // Each probe's irradiance and distance maps, octahedral with a border, in rows of
 // `gi.volumeCounts.w` probes. Distance maps hold the mean distance and its square.
 [[vk::binding(7, 0)]] Sampler2D<float4> probeIrradiance;
 [[vk::binding(8, 0)]] Sampler2D<float4> probeDepth;
+// A bit for each shadow table entry, set when its chunk was added, removed or remeshed since
+// last frame.
+[[vk::binding(16, 0)]] StructuredBuffer<uint> changedChunks;
+// The frame's lights, see `Renderer::lights`.
+[[vk::binding(17, 0)]] StructuredBuffer<Light> lights;
+
+// World position `world` in the shadow grid's finest voxels.
+float3 toGrid(float3 world) {
+    return world / max(ubo.lighting.shadowGrid.x, 1e-6);
+}
+
+// `value` divided by `divisor`, rounded down.
+int3 floorDiv(int3 value, int divisor) {
+    return int3(floor(float3(value) / float(divisor)));
+}
 
 // The type id of voxel `cell` of the chunk whose types start at word `base`.
 // Matches `voxel::VoxelTypes::type_at`.
@@ -204,6 +245,45 @@ Material materialOf(uint id) {
     return magenta;
 }
 
+// Whether light passes through `material`, see `Material`.
+bool isSeeThrough(Material material) {
+    return material.emissionMetalness.w >= SEE_THROUGH;
+}
+
+// Whether voxel type `id` is see-through.
+bool seeThrough(uint id) {
+    return isSeeThrough(materialOf(id));
+}
+
+// How metallic `material` is, from 0 to 1.
+float metalnessOf(Material material) {
+    float packed = material.emissionMetalness.w;
+    return isSeeThrough(material) ? packed - SEE_THROUGH : packed;
+}
+
+// Blocks of a chunk's occupancy along each edge, for chunks `edge` voxels wide.
+int occupancyBlocks(int edge) {
+    return (edge + OCCUPANCY_BLOCK - 1) / OCCUPANCY_BLOCK;
+}
+
+// Whether any voxel of block `block` of the chunk whose occupancy starts at word `base` isn't
+// empty. Matches `voxel::VoxelTypes::occupancy`.
+bool blockOccupied(uint base, int blocksPerEdge, int3 block) {
+    uint index = uint(block.x + blocksPerEdge * (block.y + blocksPerEdge * block.z));
+    return (typeWords[base + index / 32] & (1u << (index % 32))) != 0;
+}
+
+// Whether voxel `local` of the chunk whose types start at `typesBase` and occupancy at
+// `occupancyBase`, `edge` voxels wide, blocks light: solid and not see-through.
+bool voxelOccludes(uint typesBase, uint occupancyBase, int edge, int3 local) {
+    // Most voxels around a face are in the open, in blocks with none.
+    if (!blockOccupied(occupancyBase, occupancyBlocks(edge), local / OCCUPANCY_BLOCK)) {
+        return false;
+    }
+    uint id = typeAt(typesBase, uint(edge), uint3(local));
+    return id != 0 && !seeThrough(id);
+}
+
 // The mesh index of level `level`'s chunk at chunk coordinate `chunk`, in that level's
 // chunks, `NO_CHUNK` for none, or `outside` set when it's past the level's shadow table.
 uint levelChunk(int level, int3 chunk, out bool outside) {
@@ -214,11 +294,6 @@ uint levelChunk(int level, int3 chunk, out bool outside) {
         return NO_CHUNK;
     }
     return shadowTable[((level * side + relative.z) * side + relative.y) * side + relative.x];
-}
-
-// The finest level's chunk at `chunk`, see `levelChunk`.
-uint shadowChunk(int3 chunk, out bool outside) {
-    return levelChunk(0, chunk, outside);
 }
 
 // The mesh index of the chunk of the finest level with one holding point `position`, in the
@@ -251,39 +326,56 @@ uint chunkAtPoint(float3 position, out int level, out int3 chunk, out int coverL
     return NO_CHUNK;
 }
 
-// `value` divided by `divisor`, rounded down.
-int3 floorDiv(int3 value, int divisor) {
-    return int3(floor(float3(value) / float(divisor)));
-}
-
-// Whether any voxel of block `block` of the chunk whose occupancy starts at word `base` isn't
-// empty. Matches `voxel::VoxelTypes::occupancy`.
-bool blockOccupied(uint base, int blocksPerEdge, int3 block) {
-    uint index = uint(block.x + blocksPerEdge * (block.y + blocksPerEdge * block.z));
-    return (typeWords[base + index / 32] & (1u << (index % 32))) != 0;
-}
-
-// Whether voxel type `id` is see-through, see `Material`.
-bool seeThrough(uint id) {
-    return materialOf(id).emissionMetalness.w >= 2.0;
-}
-
-// How metallic `material` is, from 0 to 1.
-float metalnessOf(Material material) {
-    float packed = material.emissionMetalness.w;
-    return packed >= 2.0 ? packed - 2.0 : packed;
-}
-
-// The type of the shadow grid's voxel `voxel`, 0 where there's no chunk.
-uint gridVoxel(int3 voxel) {
+// Whether level `level`'s voxel `voxel`, in that level's voxels, blocks light. Open where
+// there's no chunk.
+bool gridOccludes(int level, int3 voxel) {
     int edge = int(ubo.lighting.shadowGrid.y);
-    int3 chunk = int3(floor(float3(voxel) / float(edge)));
+    int3 chunk = floorDiv(voxel, edge);
     bool outside;
-    uint meshIndex = shadowChunk(chunk, outside);
+    uint meshIndex = levelChunk(level, chunk, outside);
     if (meshIndex == NO_CHUNK) {
-        return 0;
+        return false;
     }
-    return typeAt(meshes[meshIndex].typesBase, uint(edge), uint3(voxel - chunk * edge));
+    MeshInfo mesh = meshes[meshIndex];
+    return voxelOccludes(mesh.typesBase, mesh.occupancyBase, edge, voxel - chunk * edge);
+}
+
+// The two axes along a face facing unit axis `normal`.
+void faceAxes(int3 normal, out int3 u, out int3 v) {
+    u = normal.x != 0 ? int3(0, 1, 0) : int3(1, 0, 0);
+    v = normal.z != 0 ? int3(0, 1, 0) : int3(0, 0, 1);
+}
+
+// How open a face is at `along` across its voxel, from 0 to 1 on each axis, with `around`
+// the 8 voxels around the one in front of it, 3 to a row, whether each blocks light: each
+// corner darkens with those around it, two solid sides closing it entirely, and the point
+// blends the four corners [classic voxel ambient occlusion].
+float cornerOpenness(bool around[9], float2 along) {
+    float corners[4];
+    for (int i = 0; i < 4; i++) {
+        int2 side = int2(i & 1, i >> 1) * 2 - 1;
+        bool sideU = around[4 + side.x];
+        bool sideV = around[4 + 3 * side.y];
+        bool corner = around[4 + side.x + 3 * side.y];
+        corners[i] = sideU && sideV ? 0.0 : (3.0 - float(sideU) - float(sideV) - float(corner)) / 3.0;
+    }
+    return lerp(lerp(corners[0], corners[1], along.x), lerp(corners[2], corners[3], along.x), along.y);
+}
+
+// How open the face of a level `level` chunk facing unit axis `normal` is at `position` on
+// it, in that level's voxels, see `cornerOpenness`.
+float gridOpenness(int level, float3 position, int3 normal) {
+    int3 front = int3(floor(position - float3(normal) * FACE_NUDGE)) + normal;
+    int3 u;
+    int3 v;
+    faceAxes(normal, u, v);
+    float2 along = float2(frac(dot(position, float3(u))), frac(dot(position, float3(v))));
+    bool around[9];
+    for (int i = 0; i < 9; i++) {
+        int2 at = int2(i % 3, i / 3) - 1;
+        around[i] = i != 4 && gridOccludes(level, front + u * at.x + v * at.y);
+    }
+    return cornerOpenness(around, along);
 }
 
 // Where a ray from `origin` along `direction`, with `inverse` its reciprocal, leaves the box
@@ -306,29 +398,33 @@ struct VoxelHit {
     // How much light passes along the ray to it, or to its end without a hit, through the
     // see-through voxels on the way, tinted by them.
     float3 transmittance;
-    // The level of the chunk it's in.
+    // The level of the chunk it's in, and the chunk's mesh index.
     int level;
+    uint mesh;
 };
 
 // Whether a ray from `origin` along unit `direction`, both in the shadow grid's finest voxels,
 // enters a solid voxel within `maxDistance`, and which. Rays leaving every level's shadow
-// table hit nothing.
+// table hit nothing, as do rays out of their budget of `MAX_RAY_CHUNKS` chunks and
+// `MAX_RAY_VOXELS` voxels, which only very long rays through busy chunks run out of.
 //
 // An Amanatides-Woo DDA, visiting every voxel the ray passes through in order. It runs a
 // chunk at a time, through the finest level's chunk wherever there is one, in that chunk's
 // own voxels. It crosses a chunk without voxels in one step, and within a chunk crosses each
 // block its occupancy says is empty in one step. With `skipStartSolid`, solid voxels the
-// ray starts in are the surface it starts on, such as on a curved surface, so they're skipped.
-bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipStartSolid, out VoxelHit hit) {
+// ray starts in are the surface it starts on, such as on a curved surface, so they're
+// skipped. Light passes through see-through voxels, unless `stopAtSeeThrough`.
+bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipStartSolid, bool stopAtSeeThrough, out VoxelHit hit) {
     hit.distance = 0.0;
     hit.normal = float3(0.0);
     hit.id = 0;
     hit.transmittance = float3(1.0);
     hit.level = 0;
+    hit.mesh = NO_CHUNK;
     // Whether the last voxel was see-through, so each pane tints the light once.
     bool inGlass = false;
     int edge = int(ubo.lighting.shadowGrid.y);
-    int blocksPerEdge = (edge + OCCUPANCY_BLOCK - 1) / OCCUPANCY_BLOCK;
+    int blocksPerEdge = occupancyBlocks(edge);
     // A ray along an axis would divide by zero.
     direction = select(abs(direction) < 1e-6, select(direction < 0.0, -1e-6, 1e-6), direction);
     float3 inverse = 1.0 / direction;
@@ -399,30 +495,31 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
             }
 
             uint id = typeAt(mesh.typesBase, uint(edge), uint3(local));
-            bool glass = id != 0 && seeThrough(id);
-            if (id != 0 && !glass) {
-                if (leftSurface) {
-                    hit.distance = t;
-                    hit.id = id;
-                    hit.level = level;
-                    if (axis >= 0) {
-                        hit.normal[axis] = -float(stepDirection[axis]);
-                    }
-                    return true;
+            bool glass = false;
+            bool solid = false;
+            if (id != 0) {
+                Material material = materialOf(id);
+                glass = isSeeThrough(material) && !stopAtSeeThrough;
+                solid = !glass;
+                // Light passes through see-through voxels, tinted by each pane once, and ones
+                // tinting it to next to nothing are as good as solid.
+                if (glass && !inGlass) {
+                    hit.transmittance *= material.colorRoughness.rgb;
+                    solid = all(hit.transmittance < 1.0 / 256.0);
                 }
-            } else {
-                leftSurface = true;
             }
-            // Light passes through see-through voxels, tinted by each pane once.
-            if (glass && !inGlass) {
-                hit.transmittance *= materialOf(id).colorRoughness.rgb;
-                if (all(hit.transmittance < 1.0 / 256.0)) {
-                    // As good as opaque.
-                    hit.distance = t;
-                    hit.id = id;
-                    hit.level = level;
-                    return true;
+            if (solid && leftSurface) {
+                hit.distance = t;
+                hit.id = id;
+                hit.level = level;
+                hit.mesh = meshIndex;
+                if (axis >= 0) {
+                    hit.normal[axis] = -float(stepDirection[axis]);
                 }
+                return true;
+            }
+            if (!solid) {
+                leftSurface = true;
             }
             inGlass = glass;
 
@@ -455,7 +552,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
 // tinted by any see-through ones.
 float3 sunVisibility(float3 origin, float3 direction) {
     VoxelHit hit;
-    return traceVoxels(origin, direction, ubo.lighting.shadowGrid.z, true, hit) ? float3(0.0) : hit.transmittance;
+    return traceVoxels(origin, direction, ubo.lighting.shadowGrid.z, true, false, hit) ? float3(0.0) : hit.transmittance;
 }
 
 // Folds a unit direction onto the square from -1 to 1, +z at its center [Cigolle et al. 2014].
@@ -480,6 +577,11 @@ float3 octahedralDecodeSquare(float2 encoded) {
 // Probes in each cascade.
 uint probesPerCascade() {
     return ubo.gi.volumeCounts.x * ubo.gi.volumeCounts.y * ubo.gi.volumeCounts.z;
+}
+
+// The cascade of the probe in slot `slot`.
+int cascadeOf(uint slot) {
+    return int(slot / probesPerCascade());
 }
 
 // The slot of the probe of cascade `cascade`'s probe cell `cell`, false outside it.
@@ -516,7 +618,7 @@ float2 atlasUV(uint slot, float3 direction, int texels) {
 // weights follow where each probe actually is in its cell, not its cell's center, so probes
 // moved off center blend smoothly [Roháček 2022].
 float3 sampleIrradiance(int cascade, float3 position, float3 normal, float3 toViewer, uint minUpdates, out float coverage, out bool found) {
-    float spacing = float(PROBE_SPACING << cascade);
+    float spacing = float(PROBE_CELL << cascade);
     float3 biased = position + (normal * 0.2 + toViewer * 0.8) * (0.75 * spacing * ubo.gi.tuning.w);
     // Probes sit at the centers of their cells unless voxels are in the way.
     float3 gridPosition = biased / spacing - 0.5;
@@ -593,24 +695,23 @@ float3 ambientLight(float3 normal) {
     return lerp(ubo.lighting.groundColor.rgb, ubo.lighting.skyColor.rgb, normal.y * 0.5 + 0.5);
 }
 
-// The light reaching a surface, straight from the sun and from everywhere else.
-struct SurfaceLight {
-    float3 direct;
-    float3 indirect;
-};
-
 // The light from everywhere but the sun reaching a surface at `gridPosition`, in the shadow
 // grid's voxels, with unit normal `normal`, seen from direction `toViewer`: the probes', or
-// the sky and ground's outside them. See `lightParts` for `probeRay`.
+// the sky and ground's outside them.
 //
 // The finest cascade covering the surface lights it, blending into the next over its last
-// cell. Where a cascade covers it but none of its probes count, the probes' own rays get no
-// light, see `lightParts`.
+// cell. For the probes' own rays, `probeRay` is true: only probes updated before count, and
+// where a cascade covers the surface but none of its probes count, there's no light yet. The
+// sky's would leak into closed rooms, and with every bounce adding to the next, take many
+// frames to fade.
 float3 indirectLight(float3 gridPosition, float3 normal, float3 toViewer, bool probeRay) {
     float3 ambient = ambientLight(normal);
     if (ubo.gi.volumeMins[0].w == 0) {
         return ambient;
     }
+    // Probes the probes' rays sample must have been updated once before, so the rays don't
+    // see this frame's own update.
+    uint minUpdates = probeRay ? 2 : 1;
     float3 probesLight = float3(0.0);
     // How much is left for coarser cascades, and how much of that none of the probes lit.
     float remaining = 1.0;
@@ -618,7 +719,7 @@ float3 indirectLight(float3 gridPosition, float3 normal, float3 toViewer, bool p
     for (int cascade = 0; cascade < int(ubo.gi.frame.z) && remaining > 0.0; cascade++) {
         float coverage;
         bool found;
-        float3 light = sampleIrradiance(cascade, gridPosition, normal, toViewer, probeRay ? 2 : 1, coverage, found);
+        float3 light = sampleIrradiance(cascade, gridPosition, normal, toViewer, minUpdates, coverage, found);
         float share = remaining * coverage;
         if (found) {
             probesLight += share * light;
@@ -630,24 +731,10 @@ float3 indirectLight(float3 gridPosition, float3 normal, float3 toViewer, bool p
     return probesLight + remaining * ambient + (probeRay ? 0.0 : unlit) * ambient;
 }
 
-// The light reaching a surface at `worldPosition` with unit normal `normal`, seen from
-// direction `toViewer`. `faceNormal` is the triangle's own, which rays leave the surface
-// along. `sunVisible` is how much of the sun reaches it, tinted by any see-through voxels in
-// the way, when already known, or negative for a shadow ray to find out.
-//
-// For the probes' own rays, `probeRay` is true: only probes that have been updated before
-// count, and where none covers the surface inside the volume, there's no indirect light yet.
-// The sky's would leak into closed rooms, and with every bounce adding to the next, take
-// many frames to fade.
-SurfaceLight lightParts(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay, float3 sunVisible) {
-    SurfaceLight light;
-    float3 gridPosition = worldPosition / max(ubo.lighting.shadowGrid.x, 1e-6);
-    light.indirect = indirectLight(gridPosition, normal, toViewer, probeRay);
-    light.direct = sunLight(worldPosition, normal, faceNormal, sunVisible);
-    return light;
-}
-
-// The sun's light reaching a surface, see `lightParts`.
+// The sun's light reaching a surface at `worldPosition` with unit normal `normal`.
+// `faceNormal` is the triangle's own, which rays leave the surface along. `sunVisible` is how
+// much of the sun reaches it, tinted by any see-through voxels in the way, when already known,
+// or negative for a shadow ray to find out.
 float3 sunLight(float3 worldPosition, float3 normal, float3 faceNormal, float3 sunVisible) {
     LightingUniforms lighting = ubo.lighting;
     float facing = dot(normal, lighting.sunDirection.xyz);
@@ -656,102 +743,101 @@ float3 sunLight(float3 worldPosition, float3 normal, float3 faceNormal, float3 s
     }
     float3 visible = sunVisible;
     if (visible.x < 0.0) {
-        float3 gridPosition = worldPosition / max(lighting.shadowGrid.x, 1e-6);
         visible = lighting.shadowTable.w > 0
-            ? sunVisibility(gridPosition + faceNormal * SHADOW_RAY_OFFSET, lighting.sunDirection.xyz)
+            ? sunVisibility(toGrid(worldPosition) + faceNormal * SHADOW_RAY_OFFSET, lighting.sunDirection.xyz)
             : float3(1.0);
     }
     return lighting.sunColor.rgb * facing * visible;
 }
 
-// Moves a point on a face into the voxel behind it, in voxels.
-static const float FACE_NUDGE = 1.0 / 256.0;
+// The light reaching a surface, straight from the sun and the lights, and from everywhere else.
+struct SurfaceLight {
+    float3 direct;
+    float3 indirect;
+};
 
-// Whether level `level`'s voxel `voxel`, in that level's voxels, blocks light from reaching a
-// corner: solid and not see-through.
-bool gridOccludes(int level, int3 voxel) {
-    int edge = int(ubo.lighting.shadowGrid.y);
-    int3 chunk = floorDiv(voxel, edge);
-    bool outside;
-    uint meshIndex = levelChunk(level, chunk, outside);
-    if (meshIndex == NO_CHUNK) {
-        return false;
-    }
-    MeshInfo mesh = meshes[meshIndex];
-    int3 local = voxel - chunk * edge;
-    int blocksPerEdge = (edge + OCCUPANCY_BLOCK - 1) / OCCUPANCY_BLOCK;
-    if (!blockOccupied(mesh.occupancyBase, blocksPerEdge, local / OCCUPANCY_BLOCK)) {
-        return false;
-    }
-    uint id = typeAt(mesh.typesBase, uint(edge), uint3(local));
-    return id != 0 && !seeThrough(id);
+// All the light from the sun and everywhere else reaching a surface, see `sunLight` and
+// `indirectLight`.
+float3 lightAt(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay, float3 sunVisible) {
+    return sunLight(worldPosition, normal, faceNormal, sunVisible)
+        + indirectLight(toGrid(worldPosition), normal, toViewer, probeRay);
 }
 
-// How open the face of a level `level` chunk facing unit axis `normal` is at `position` on
-// it, in that level's voxels, as `voxelOcclusion` in `mesh.slang` finds it.
-float gridOpenness(int level, float3 position, int3 normal) {
-    int3 front = int3(floor(position - float3(normal) * FACE_NUDGE)) + normal;
-    int3 u = normal.x != 0 ? int3(0, 1, 0) : int3(1, 0, 0);
-    int3 v = normal.z != 0 ? int3(0, 1, 0) : int3(0, 0, 1);
-    float2 along = float2(frac(dot(position, float3(u))), frac(dot(position, float3(v))));
-    bool around[9];
-    for (int i = 0; i < 9; i++) {
-        int2 at = int2(i % 3, i / 3) - 1;
-        around[i] = i != 4 && gridOccludes(level, front + u * at.x + v * at.y);
-    }
-    return cornerOpenness(around, along);
+// The tile of lights pixel `pixel` is in.
+uint tileOf(uint2 pixel) {
+    return (pixel.y / LIGHT_TILE) * ubo.shadow.lights.y + pixel.x / LIGHT_TILE;
 }
 
-// How open a face is at `along` across its voxel, from 0 to 1 on each axis, with `around`
-// the 8 voxels around the one in front of it, 3 to a row, whether each blocks light: each
-// corner darkens with those around it, two solid sides closing it entirely, and the point
-// blends the four corners [classic voxel ambient occlusion].
-float cornerOpenness(bool around[9], float2 along) {
-    float corners[4];
-    for (int i = 0; i < 4; i++) {
-        int2 side = int2(i & 1, i >> 1) * 2 - 1;
-        bool sideU = around[4 + side.x];
-        bool sideV = around[4 + 3 * side.y];
-        bool corner = around[4 + side.x + 3 * side.y];
-        corners[i] = sideU && sideV ? 0.0 : (3.0 - float(sideU) - float(sideV) - float(corner)) / 3.0;
-    }
-    return lerp(lerp(corners[0], corners[1], along.x), lerp(corners[2], corners[3], along.x), along.y);
+// How much of a light's brightness gets `distance` from it, with `range` its reach: with the
+// square of the distance, windowed to nothing at its range.
+float lightFalloff(float distance, float range) {
+    float x = distance / range;
+    float window = saturate(1.0 - x * x * x * x);
+    return window * window / (distance * distance + 1.0);
 }
 
-// Pixels along each edge of a tile lights are culled for. Matches `shadows::LIGHT_TILE`.
-static const uint LIGHT_TILE = 16;
-// The most lights a tile keeps, after its count, in `shadow.slang`'s tile lists, the
-// brightest.
-static const uint TILE_LIGHTS = 63;
-// The most lights a frame has. Matches `lights::MAX_LIGHTS`.
-static const uint MAX_LIGHTS = 255;
-
-// The light `light` gives a surface at `worldPosition` facing `normal`, before shadows: its
-// color, fading with the square of the distance to nothing at its range, within its cone.
-// Also where it is, from the surface, in world units.
-float3 lightReaching(Light light, float3 worldPosition, float3 normal, out float3 toLight, out float distance) {
+// The light `light` gives a point at `worldPosition`, before shadows and whichever way it
+// faces: its color, fading with distance, within its cone. Also where it is, from the point,
+// in world units.
+float3 lightColorAt(Light light, float3 worldPosition, out float3 toLight, out float distance) {
     float3 offset = light.positionRange.xyz - worldPosition;
     distance = length(offset);
     toLight = offset / max(distance, 1e-6);
-    float range = light.positionRange.w;
-    float x = distance / range;
-    float window = saturate(1.0 - x * x * x * x);
-    float falloff = window * window / (distance * distance + 1.0);
     float cone = 1.0;
     if (light.colorSpot.w > 0.0) {
         float along = dot(-toLight, light.directionOuter.xyz);
         cone = smoothstep(light.directionOuter.w, light.inner.x, along);
     }
-    return light.colorSpot.rgb * falloff * cone * max(dot(normal, toLight), 0.0);
+    return light.colorSpot.rgb * lightFalloff(distance, light.positionRange.w) * cone;
 }
 
-// How bright `light` is at `worldPosition`, ignoring which way the surface faces, to choose
+// The light `light` gives a surface at `worldPosition` facing `normal`, before shadows, see
+// `lightColorAt`.
+float3 lightReaching(Light light, float3 worldPosition, float3 normal, out float3 toLight, out float distance) {
+    return lightColorAt(light, worldPosition, toLight, distance) * max(dot(normal, toLight), 0.0);
+}
+
+// How bright `light` is at `worldPosition`, whichever way a surface there faces, to choose
 // which lights to shadow.
 float lightStrength(Light light, float3 worldPosition) {
     float3 toLight;
     float distance;
-    float3 reaching = lightReaching(light, worldPosition, -normalize(worldPosition - light.positionRange.xyz), toLight, distance);
-    return dot(reaching, float3(0.3, 0.6, 0.1));
+    return dot(lightColorAt(light, worldPosition, toLight, distance), LUMINANCE);
+}
+
+// A few of the brightest lights, brightest first, by light number, `NO_LIGHT` past the last.
+struct BrightestLights {
+    uint lights[MAX_SHADOWED_LIGHTS];
+    float strengths[MAX_SHADOWED_LIGHTS];
+    // The light each gives, for those that keep it.
+    float3 colors[MAX_SHADOWED_LIGHTS];
+};
+
+BrightestLights noBrightestLights() {
+    BrightestLights brightest;
+    for (uint k = 0; k < MAX_SHADOWED_LIGHTS; k++) {
+        brightest.lights[k] = NO_LIGHT;
+        brightest.strengths[k] = 0.0;
+        brightest.colors[k] = float3(0.0);
+    }
+    return brightest;
+}
+
+// Keeps light `light` of `strength`, giving `color`, among the brightest `kept` of `brightest`.
+void keepBrightest(inout BrightestLights brightest, uint kept, uint light, float strength, float3 color) {
+    for (uint k = 0; k < kept; k++) {
+        if (strength > brightest.strengths[k]) {
+            for (uint j = kept - 1; j > k; j--) {
+                brightest.lights[j] = brightest.lights[j - 1];
+                brightest.strengths[j] = brightest.strengths[j - 1];
+                brightest.colors[j] = brightest.colors[j - 1];
+            }
+            brightest.lights[k] = light;
+            brightest.strengths[k] = strength;
+            brightest.colors[k] = color;
+            return;
+        }
+    }
 }
 
 // How much of `light`'s light gets to `origin`, in the shadow grid's voxels: 0 behind solid
@@ -762,69 +848,52 @@ float lightShadow(Light light, float3 origin) {
     if (ubo.lighting.shadowTable.w == 0) {
         return 1.0;
     }
-    float3 position = light.positionRange.xyz / ubo.lighting.shadowGrid.x;
+    float3 position = toGrid(light.positionRange.xyz);
     float3 offset = origin - position;
     float distance = length(offset);
     if (distance <= 0.5) {
         return 1.0;
     }
     VoxelHit hit;
-    if (traceVoxels(position, offset / distance, distance - 0.5, true, hit)) {
+    if (traceVoxels(position, offset / distance, distance - 0.5, true, false, hit)) {
         return 0.0;
     }
     return dot(hit.transmittance, float3(1.0 / 3.0));
 }
 
 // The light the frame's lights give a ray's hit at `worldPosition`, facing `normal`: each
-// light's, the brightest `shadowed` shadowed, at most 4.
+// light's, the brightest `shadowed` shadowed.
 float3 lightsAtHit(float3 worldPosition, float3 normal, uint shadowed) {
-    uint count = ubo.shadow.lights.x;
-    float3 origin = worldPosition / ubo.lighting.shadowGrid.x + normal * SHADOW_RAY_OFFSET;
-    // The brightest, by light index.
-    uint brightest[4] = { 0xff, 0xff, 0xff, 0xff };
-    float strengths[4] = { 0.0, 0.0, 0.0, 0.0 };
+    shadowed = min(shadowed, MAX_SHADOWED_LIGHTS);
+    float3 origin = toGrid(worldPosition) + normal * SHADOW_RAY_OFFSET;
+    BrightestLights brightest = noBrightestLights();
     float3 total = float3(0.0);
-    for (uint i = 0; i < count; i++) {
+    for (uint i = 0; i < ubo.shadow.lights.x; i++) {
         float3 toLight;
         float distance;
         float3 reaching = lightReaching(lights[i], worldPosition, normal, toLight, distance);
-        float strength = dot(reaching, float3(0.3, 0.6, 0.1));
-        if (strength <= 0.0) {
-            continue;
-        }
-        total += reaching;
-        // Kept in order, brightest first.
-        for (uint k = 0; k < shadowed; k++) {
-            if (strength > strengths[k]) {
-                for (uint j = shadowed - 1; j > k; j--) {
-                    strengths[j] = strengths[j - 1];
-                    brightest[j] = brightest[j - 1];
-                }
-                strengths[k] = strength;
-                brightest[k] = i;
-                break;
-            }
+        float strength = dot(reaching, LUMINANCE);
+        if (strength > 0.0) {
+            total += reaching;
+            keepBrightest(brightest, shadowed, i, strength, reaching);
         }
     }
     // The brightest are shadowed, by taking away what doesn't get through.
-    for (uint k = 0; k < shadowed; k++) {
-        if (brightest[k] == 0xff) {
-            break;
-        }
-        Light light = lights[brightest[k]];
-        float3 toLight;
-        float distance;
-        float3 reaching = lightReaching(light, worldPosition, normal, toLight, distance);
-        total -= reaching * (1.0 - lightShadow(light, origin));
+    for (uint k = 0; k < shadowed && brightest.lights[k] != NO_LIGHT; k++) {
+        total -= brightest.colors[k] * (1.0 - lightShadow(lights[brightest.lights[k]], origin));
     }
     return max(total, 0.0);
 }
 
-// Faces narrower than this reflect what's around them sharply, traced by the shadow pass,
-// blending into the probes' blurry light toward it.
+// Faces with a roughness below this reflect what's around them sharply, traced by the shadow
+// pass, blending into the probes' blurry light toward it.
 static const float GLOSSY_ROUGHNESS = 0.5;
+// How many of the lights a reflection ray's hit shadows: one, the brightest, as reflections
+// are traced for many pixels.
+static const uint REFLECTION_SHADOWED_LIGHTS = 1;
 
-// The number of the face whose outward normal is the unit axis `normal`, from 1 to 6.
+// The number of the side of a voxel `normal` faces most, from 1 to 6, for exact and
+// interpolated normals alike.
 uint faceNumber(float3 normal) {
     float3 size = abs(normal);
     uint axis = size.x > size.y && size.x > size.z ? 0 : (size.y > size.z ? 1 : 2);
@@ -836,15 +905,16 @@ uint faceNumber(float3 normal) {
 // sky, through any see-through voxels on the way.
 float3 radianceAlong(float3 origin, float3 direction, float maxDistance) {
     VoxelHit hit;
-    if (!traceVoxels(origin, direction, maxDistance, false, hit)) {
+    if (!traceVoxels(origin, direction, maxDistance, false, false, hit)) {
         return ambientLight(direction) * hit.transmittance;
     }
     if (hit.distance <= 0.0) {
         return float3(0.0);
     }
     float3 worldPosition = (origin + direction * hit.distance) * ubo.lighting.shadowGrid.x;
+    uint shadowed = min(ubo.shadow.lights.w, REFLECTION_SHADOWED_LIGHTS);
     float3 light = lightAt(worldPosition, hit.normal, hit.normal, -direction, false, float3(-1.0))
-        + lightsAtHit(worldPosition, hit.normal, min(ubo.shadow.lights.w, 1));
+        + lightsAtHit(worldPosition, hit.normal, shadowed);
     Material material = materialOf(hit.id);
     return (material.colorRoughness.rgb * light + material.emissionMetalness.rgb) * hit.transmittance;
 }
@@ -856,7 +926,7 @@ float highlight(float3 normal, float3 toViewer, float3 toLight, float roughness)
     float alpha = max(roughness * roughness, 0.002);
     float exponent = 2.0 / (alpha * alpha) - 2.0;
     float3 halfway = normalize(toLight + toViewer);
-    return (exponent + 8.0) / (8.0 * 3.14159265) * pow(saturate(dot(normal, halfway)), exponent);
+    return (exponent + 8.0) / (8.0 * PI) * pow(saturate(dot(normal, halfway)), exponent);
 }
 
 // The color a surface of `material` with unit normal `normal` shows toward `toViewer`, lit by
@@ -875,10 +945,4 @@ float3 shadeSurface(Material material, float3 normal, float3 toViewer, float3 li
     float3 dielectric = base * (1.0 - reflected) * lit + reflected * reflection;
     float3 metal = fresnel * reflection;
     return lerp(dielectric, metal, metalness) + material.emissionMetalness.rgb;
-}
-
-// All the light `lightParts` finds reaching a surface.
-float3 lightAt(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay, float3 sunVisible) {
-    SurfaceLight light = lightParts(worldPosition, normal, faceNormal, toViewer, probeRay, sunVisible);
-    return light.direct + light.indirect;
 }

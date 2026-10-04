@@ -16,7 +16,8 @@ pub struct Material {
     /// The light it gives off itself, whatever its color, lighting what's around it through
     /// the light probes. Over 1 glows brighter.
     pub emission: [f32; 3],
-    /// How rough it is, from 0, a mirror, to 1, matte. Below 1 it reflects what's around it.
+    /// How rough it is, from 0, a mirror, to 1, matte. Below 0.5 it's glossy: it reflects
+    /// what's around it, more sharply the smoother it is, and the sun's and lights' highlights.
     pub roughness: f32,
     /// How metallic it is, from 0 to 1. Metals reflect in their own color, and reflect
     /// rather than scatter their light.
@@ -60,10 +61,8 @@ impl From<&Material> for GpuMaterial {
     fn from(material: &Material) -> Self {
         let [r, g, b] = material.color;
         let [er, eg, eb] = material.emission;
-        let see_through = match material.see_through {
-            true => 2.0,
-            false => 0.0,
-        };
+        // Flagged by adding 2 to the metalness. Matches `seeThrough` in `common.slang`.
+        let see_through = if material.see_through { 2.0 } else { 0.0 };
         Self {
             color_roughness: [r, g, b, material.roughness.clamp(0.0, 1.0)],
             emission_metalness: [er, eg, eb, material.metalness.clamp(0.0, 1.0) + see_through],

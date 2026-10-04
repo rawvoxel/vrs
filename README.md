@@ -65,8 +65,9 @@ drop(renderer);
   for any surface. Positions are chunk local, placed by the chunk's `origin` and `voxel_size`,
   which includes its LOD. Its `voxel::VoxelTypes` are palette compressed, and already packed
   words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the
-  palette from `set_materials`, or `set_palette` for plain colors, 0 is empty space. Cells past a chunk's edge take the chunk's own
-  edge voxel, there's no lookup into neighbors, and see-through faces are drawn like any other.
+  palette from `set_materials`, or `set_palette` for plain colors, 0 is empty space. Cells
+  past a chunk's edge take the chunk's own edge voxel, there's no lookup into neighbors, and
+  see-through faces are drawn like any other.
 - **Colored meshes** come from `create_mesh`, `vertex::Vertex`es in world space with colors of
   their own, for anything that isn't a chunk. They aren't lit.
 - **Materials**: each palette entry is a `Material`: a color, light it gives off, roughness,
@@ -147,7 +148,7 @@ drop(renderer);
   fields, vsync is `set_vsync`.
 - **Headless**: `App::headless` renders into images of the renderer's own, with no window.
 
-`App` and `Renderer` are `Send + Sync`, such as for Bevy resources.
+`App` and `Renderer` are `Send + Sync`, so they can be shared with other threads.
 
 ## Requirements
 
@@ -168,8 +169,8 @@ cargo run -p vrs --example cube
 cargo run -p vrs --example materials --release
 cargo run -p vrs --example terrain --release
 cargo run -p vrs --example screenshot --release -- terrain.ppm
-cargo run -p vrs --example stress
-cargo run -p vrs --example stress -- --headless
+cargo run -p vrs --example stress --release
+cargo run -p vrs --example stress --release -- --headless
 ```
 
 - `triangle` is the classic Vulkan triangle, drawn as a colored mesh.
@@ -180,20 +181,26 @@ cargo run -p vrs --example stress -- --headless
   camera, and L turns on and off a point light inside each glowing block.
 - `terrain` is rolling hills of greedy meshed chunks, ringed by coarser chunks of the next
   level of detail, under a low sun casting shadows and lit by two cascades of light probes,
-  to fly around: click to look with the mouse, WASD to move, Space and Ctrl for up and down,
-  Shift to go faster, L to drop a light and Backspace to take them away. The title shows how
-  many chunks were drawn, the rest culled behind hills.
+  to fly around: click to look with the mouse and Escape to let go, WASD to move, Space and
+  Ctrl for up and down, Shift to go faster, L to drop a light and Backspace to take them
+  away. The title also shows how many chunks were drawn, the rest culled behind hills.
 - `screenshot` renders the terrain without a window and saves the frame as a PPM image.
 
-`cube`, `materials`, `terrain` and `screenshot` share a greedy mesher for 64³ chunks in
-`examples/common`, to show how a mesher's output becomes a chunk mesh.
+The windowed examples' titles show frames a second and how long frames take on the GPU,
+split into updating the light probes, tracing shadows and drawing, from
+`Renderer::debug_gpu_timings`.
+
+The examples share a greedy mesher for 64³ chunks in `examples/common`, to show how a
+mesher's output becomes a chunk mesh, the Vulkan projection, and the title.
+
+Debug builds run the stress test much slower, but check every Vulkan validation message.
 
 `stress` checks the renderer the way a voxel game uses it and exits with a failure code if
 anything's wrong:
 
 - Voxel chunks behind a wall, greedy and packed, are culled with different cameras. Draw
-  counts read back from the GPU must match the meshes in view, and with occlusion culling, at least every
-  mesh the wall can't hide.
+  counts read back from the GPU must match the meshes in view, and with occlusion culling,
+  at least every mesh the wall can't hide.
 - A wall facing away from the camera must be skipped by backface culling.
 - Chunks are remeshed every frame against a nearly full mesh pool, while the window is
   resized and minimized.
@@ -204,12 +211,13 @@ anything's wrong:
   voxels, drawn from missing data, or culled while visible.
 - A renderer failing partway through being built must leak nothing.
 - Lighting is checked against scenes with known answers: a floor under a white sky must come
-  out at its color, no light may leak into a sealed box, bounced light must reach the inside
-  of a box with a hole in its roof, glass must dim it, the probes must catch up with changes
-  within a few frames, glowing voxels and point lights must light their surroundings, walls
-  of fine and coarse chunks must shadow lights, spot lights must light only their cone, a
-  mirror must reflect what's out of view, and coarser cascades must reach further without
-  leaking or darkening coarse chunks.
+  out at its color, no light may leak into a sealed box, both at full and half shadow
+  resolution, bounced light must reach the inside of a box with a hole in its roof, glass
+  must dim it, the probes must catch up with changes within a few frames, glowing voxels and
+  point lights must light their surroundings, walls of fine and coarse chunks must shadow
+  lights, a light inside a glowing block must light past it, spot lights must light only
+  their cone, a mirror must reflect what's out of view, and coarser cascades must reach
+  further without leaking or darkening coarse chunks.
 - Debug builds fail on any validation message, with synchronization validation on.
 
 Synchronization validation can't see which vertices an indirect draw reads, and the pixel
@@ -231,8 +239,8 @@ For tests and tools, these stall the GPU unless they say otherwise:
 - `Renderer::debug_frame_stats` reads back how many meshes the last frame drew.
 - `Renderer::debug_capture_next_frame` and `debug_read_capture` copy a frame back.
 - `Renderer::debug_mesh_pool_stats` reports the mesh pool's size and how often it repacked.
-- `Renderer::debug_gpu_timings` reports how long each stage of a recent frame took on the GPU,
-  from timestamps, without stalling.
+- `Renderer::debug_gpu_timings` reports how long each `GpuStage` of a recent frame took on the
+  GPU, from timestamps, without stalling.
 - `debug::message_counts` counts validation errors and warnings.
 
 ## Layout

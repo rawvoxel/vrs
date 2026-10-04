@@ -1,5 +1,5 @@
 use crate::{
-    adapter::Adapter, buffer::Buffer, gi::GiUniforms, renderer::LightingUniforms,
+    adapter::Adapter, bindings, buffer::Buffer, gi::GiUniforms, renderer::LightingUniforms,
     shadows::ShadowUniforms,
 };
 use ash::{prelude::VkResult, vk};
@@ -7,7 +7,7 @@ use glam::{Mat4, Vec4};
 use std::slice;
 
 /// Everything in a frame's uniform buffer. Starts with `MvpMatrices`, all the dynamic
-/// geometry's shader reads, and matches `Uniforms` in `mesh.slang`.
+/// geometry's shader reads, and matches `Uniforms` in `common.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FrameUniforms {
@@ -87,7 +87,7 @@ pub fn write_uniform_descriptor_sets(
         .map(|(&set, buffer_info)| {
             vk::WriteDescriptorSet::default()
                 .dst_set(set)
-                .dst_binding(0)
+                .dst_binding(bindings::UNIFORMS)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(slice::from_ref(buffer_info))
         })

@@ -4,7 +4,7 @@
 // phase 1 draws what was visible last frame, phase 2 tests everything against the
 // pyramid, draws what's newly visible and remembers what's visible for next frame.
 
-// Matches `mesh::MeshInfo`, and `MeshInfo` in `mesh.slang`.
+// Matches `mesh::MeshInfo`, and `MeshInfo` in `common.slang`.
 struct MeshInfo {
     float3 boundsMin;
     uint indexCount;

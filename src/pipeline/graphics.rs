@@ -1,4 +1,4 @@
-//! The renderer's graphics pipeline.
+//! The renderer's graphics pipelines.
 
 use crate::{surface::Surface, vertex::Vertex};
 use ash::{prelude::VkResult, vk};
@@ -11,6 +11,9 @@ pub fn create_pipeline_layout(
     let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(set_layouts);
     unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
 }
+
+/// The constant id of `PER_PIXEL_INDIRECT` in `mesh.slang`.
+const PER_PIXEL_INDIRECT_ID: u32 = 0;
 
 /// What a graphics pipeline draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,7 +45,7 @@ pub fn create_graphics_pipeline(
     // `PER_PIXEL_INDIRECT` off.
     let per_pixel_indirect = vk::FALSE;
     let entry = vk::SpecializationMapEntry::default()
-        .constant_id(0)
+        .constant_id(PER_PIXEL_INDIRECT_ID)
         .size(size_of::<vk::Bool32>());
     let upscaled_indirect = vk::SpecializationInfo::default()
         .map_entries(slice::from_ref(&entry))
@@ -91,14 +94,9 @@ pub fn create_graphics_pipeline(
     let multisample_state_info = vk::PipelineMultisampleStateCreateInfo::default()
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
 
+    // Colors replace what's there.
     let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState::default()
         .blend_enable(false)
-        .src_color_blend_factor(vk::BlendFactor::SRC_COLOR)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_DST_COLOR)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .alpha_blend_op(vk::BlendOp::ADD)
         .color_write_mask(vk::ColorComponentFlags::RGBA)];
 
     let color_attachments = match pass {
@@ -106,7 +104,6 @@ pub fn create_graphics_pipeline(
         _ => 1,
     };
     let color_blend_state_info = vk::PipelineColorBlendStateCreateInfo::default()
-        .logic_op(vk::LogicOp::CLEAR)
         .attachments(&color_blend_attachment_states[..color_attachments]);
 
     let noop_stencil_state = vk::StencilOpState::default()

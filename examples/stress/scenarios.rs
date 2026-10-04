@@ -1,5 +1,6 @@
 //! What the stress test runs, and what it expects of each run.
 
+use crate::camera;
 use glam::{Mat4, Vec3};
 
 #[derive(Clone, Copy, Debug)]
@@ -18,10 +19,7 @@ impl Camera {
             Camera::Perspective => {
                 let view =
                     Mat4::look_at_rh(Vec3::new(0.0, 0.0, -1.5), Vec3::new(0.0, 0.0, 0.5), Vec3::Y);
-                // glam's projection is OpenGL's, with y up, Vulkan's clip space has y down.
-                let mut proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 10.0);
-                proj.y_axis.y = -proj.y_axis.y;
-                (view, proj)
+                (view, camera::perspective(60.0, aspect, 0.1, 10.0))
             }
         }
     }

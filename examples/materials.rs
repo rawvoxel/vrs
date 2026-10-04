@@ -7,12 +7,15 @@
 //! and how long frames take on the GPU.
 //!
 //! Along +x, roughness goes 0, 0.1, 0.2, 0.3, 0.4 and 1. The smoothest blocks show sharp
-//! reflections of the floor's checks, the glowing blocks and each other, blurring as they get rougher,
+//! reflections of the floor's checks, the glowing blocks and each other, blurring as they get
+//! rougher,
 //! until past 0.5 they only reflect the probes' blurry light, and at 1 not at all. Gold
 //! reflects in its own color, the lacquer mostly at grazing angles. The glowing blocks light
 //! what's around them through the light probes, softly, and their reflections in the floor.
 //! The point lights add sharp light and shadows close by.
 
+#[path = "common/camera.rs"]
+mod camera;
 #[path = "common/greedy.rs"]
 mod greedy;
 #[path = "common/title.rs"]
@@ -20,16 +23,16 @@ mod title;
 
 use anyhow::Result;
 use ash::vk;
-use glam::{Mat4, Vec3};
-use greedy::{ChunkMask, EDGE};
+use glam::{IVec3, Mat4, Vec3};
+use greedy::EDGE;
 use std::time::Instant;
 use vrs::{
     App,
     mesh::MeshId,
     renderer::{
         DrawList, GiConfig, Light, Lighting, Material, Renderer, RendererConfig, ShadowGrid,
+        ShadowResolution,
     },
-    voxel::{ChunkMesh, ChunkVertices, VoxelTypes},
 };
 use winit::{
     application::ApplicationHandler,
@@ -56,10 +59,11 @@ const GLOWS: [[f32; 3]; 6] = [
 ];
 const LACQUER: [f32; 3] = [0.4, 0.04, 0.04];
 const GOLD: [f32; 3] = [1.0, 0.78, 0.34];
-/// Voxel types: empty space, the floor's two checks, then each row's blocks, then the glowing
-/// blocks.
+// Voxel types: empty space, the floor's two checks, then each row's blocks, then the glowing
+// blocks.
 const FLOOR: u16 = 1;
-const FIRST_LACQUER: u16 = 3;
+const FLOOR_CHECK: u16 = FLOOR + 1;
+const FIRST_LACQUER: u16 = FLOOR_CHECK + 1;
 const FIRST_GOLD: u16 = FIRST_LACQUER + ROUGHNESS.len() as u16;
 const FIRST_GLOW: u16 = FIRST_GOLD + ROUGHNESS.len() as u16;
 
@@ -79,7 +83,15 @@ const GLOW_ROW: i32 = 31;
 const GLOW: i32 = 2;
 const GLOW_BOTTOM: i32 = FLOOR_TOP + 2;
 
-/// Radians a second the camera circles the materials, how far out and how high.
+/// The chunk's voxels' size. Its shadow grid's must be the same, for its voxels to cast
+/// shadows, light the probes and be reflected.
+const VOXEL_SIZE: f32 = 1.0;
+/// The middle of the chunk's floor, which the camera circles.
+const CENTER: Vec3 = Vec3::new(EDGE as f32 / 2.0, 0.0, EDGE as f32 / 2.0);
+
+/// Where the camera starts around the materials, in radians, how fast it circles them, how far
+/// out and how high.
+const START_ANGLE: f32 = 0.6;
 const ORBIT_SPEED: f32 = 0.25;
 const ORBIT_RADIUS: f32 = 46.0;
 const ORBIT_HEIGHT: f32 = 34.0;
@@ -94,8 +106,7 @@ fn materials() -> Vec<Material> {
         roughness: 0.3,
         ..Material::color([gray; 3])
     }));
-    for color in [LACQUER, GOLD] {
-        let metalness = if color == GOLD { 1.0 } else { 0.0 };
+    for (color, metalness) in [(LACQUER, 0.0), (GOLD, 1.0)] {
         materials.extend(ROUGHNESS.map(|roughness| Material {
             roughness,
             metalness,
@@ -113,7 +124,8 @@ fn materials() -> Vec<Material> {
 /// The voxel type at chunk voxel `x`, `y`, `z`.
 fn voxel(x: i32, y: i32, z: i32) -> u16 {
     if y < FLOOR_TOP {
-        return FLOOR + ((x / CHECK + z / CHECK) % 2) as u16;
+        let check = (x.div_euclid(CHECK) + z.div_euclid(CHECK)).rem_euclid(2);
+        return if check == 0 { FLOOR } else { FLOOR_CHECK };
     }
     let index = (x - FIRST_BLOCK).div_euclid(BLOCK_SPACING);
     let along = (x - FIRST_BLOCK).rem_euclid(BLOCK_SPACING);
@@ -128,21 +140,21 @@ fn voxel(x: i32, y: i32, z: i32) -> u16 {
     if block && (GOLD_ROW..GOLD_ROW + BLOCK).contains(&z) {
         return FIRST_GOLD + index;
     }
-    // Centered under the blocks.
-    let glow_x = (BLOCK - GLOW) / 2;
-    let glowing = (glow_x..glow_x + GLOW).contains(&along)
-        && (GLOW_BOTTOM..GLOW_BOTTOM + GLOW).contains(&y)
-        && (GLOW_ROW..GLOW_ROW + GLOW).contains(&z);
+    let [glow_x, glow_y, glow_z] = glow_corner(index as usize).to_array();
+    let glowing = (glow_x..glow_x + GLOW).contains(&x)
+        && (glow_y..glow_y + GLOW).contains(&y)
+        && (glow_z..glow_z + GLOW).contains(&z);
     if glowing {
         return FIRST_GLOW + index;
     }
     0
 }
 
-/// The middle of the chunk's floor, which the camera circles. The chunk itself is at the
-/// origin: the shadow grid only holds chunks on the grid of chunks from there, so shadows,
-/// the light probes and reflections trace through it.
-const CENTER: Vec3 = Vec3::new(EDGE as f32 / 2.0, 0.0, EDGE as f32 / 2.0);
+/// The low corner of glowing block `index`, between the rows and centered under their blocks.
+fn glow_corner(index: usize) -> IVec3 {
+    let x = FIRST_BLOCK + index as i32 * BLOCK_SPACING + (BLOCK - GLOW) / 2;
+    IVec3::new(x, GLOW_BOTTOM, GLOW_ROW)
+}
 
 /// A point light in the middle of each glowing block, of its color.
 fn glow_lights() -> Vec<Light> {
@@ -150,18 +162,9 @@ fn glow_lights() -> Vec<Light> {
         .iter()
         .enumerate()
         .map(|(index, glow)| {
-            let corner = Vec3::new(
-                (FIRST_BLOCK + index as i32 * BLOCK_SPACING + (BLOCK - GLOW) / 2) as f32,
-                GLOW_BOTTOM as f32,
-                GLOW_ROW as f32,
-            );
-            let middle = corner + GLOW as f32 / 2.0;
-            Light {
-                position: middle,
-                color: glow.map(|channel| channel * LIGHT_BRIGHTNESS),
-                range: LIGHT_RANGE,
-                spot: None,
-            }
+            let middle = glow_corner(index).as_vec3() + GLOW as f32 / 2.0;
+            let color = glow.map(|channel| channel * LIGHT_BRIGHTNESS);
+            Light::point(middle * VOXEL_SIZE, color, LIGHT_RANGE)
         })
         .collect()
 }
@@ -174,27 +177,23 @@ fn create_scene(renderer: &mut Renderer) -> Result<MeshId> {
         sun_color: [0.8, 0.5, 0.3],
         sky_color: [0.16, 0.2, 0.3],
         ground_color: [0.05, 0.05, 0.05],
-        shadow_grid: Some(ShadowGrid::new(1.0, EDGE as u32)),
+        shadow_grid: Some(ShadowGrid::new(VOXEL_SIZE, EDGE as u32)),
+        // Shadows, reflections and the probes' light found for each 2x2 pixels, which looks
+        // nearly the same for a fraction of the cost.
+        shadow_resolution: ShadowResolution::Half,
         ..Lighting::default()
     };
     let solid = |x: i32, y: i32, z: i32| {
         let inside = [x, y, z].iter().all(|&v| (0..EDGE as i32).contains(&v));
         inside && voxel(x, y, z) != 0
     };
-    let mesh = greedy::mesh(&ChunkMask::from_fn(solid));
-    let types: Vec<u16> = (0..EDGE.pow(3))
-        .map(|index| {
-            let (x, y, z) = (index % EDGE, index / EDGE % EDGE, index / EDGE.pow(2));
-            voxel(x as i32, y as i32, z as i32)
-        })
-        .collect();
-    Ok(renderer.create_chunk_mesh(&ChunkMesh {
-        indices: &mesh.indices,
-        vertices: ChunkVertices::Greedy(&mesh.vertices),
-        origin: Vec3::ZERO,
-        voxel_size: 1.0,
-        types: &VoxelTypes::pack(EDGE as u32, &types),
-    })?)
+    let types = greedy::chunk_types(voxel);
+    // The shadow grid only holds chunks whose origin is a whole number of chunks from the
+    // world's origin on every axis. Elsewhere a chunk is lit, but casts no shadows, lights no
+    // probes and isn't reflected.
+    let origin = Vec3::ZERO;
+    let scene = greedy::create_chunk(renderer, origin, VOXEL_SIZE, &types, solid)?;
+    Ok(scene.expect("The scene has voxels."))
 }
 
 /// The view and projection for the camera `angle` radians around the materials.
@@ -205,16 +204,14 @@ fn view_proj(angle: f32, aspect: f32) -> (Mat4, Mat4) {
             ORBIT_HEIGHT,
             ORBIT_RADIUS * angle.cos(),
         );
-    let view = Mat4::look_at_rh(eye, CENTER + Vec3::new(0.0, 4.0, 0.0), Vec3::Y);
-    // glam's projection is OpenGL's, with y up, Vulkan's clip space has y down.
-    let mut proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 500.0);
-    proj.y_axis.y = -proj.y_axis.y;
-    (view, proj)
+    let target = CENTER + Vec3::Y * FLOOR_TOP as f32;
+    let view = Mat4::look_at_rh(eye * VOXEL_SIZE, target * VOXEL_SIZE, Vec3::Y);
+    (view, camera::perspective(60.0, aspect, 0.1, 500.0))
 }
 
 struct Vulkan {
     scene: MeshId,
-    // NOTE: Field order matters, the renderer must be dropped before the app.
+    // Fields drop in order, so the renderer drops before the app.
     renderer: Renderer,
     _app: App,
 }
@@ -252,7 +249,7 @@ struct Materials {
     paused: bool,
     last_frame: Instant,
     title: title::FrameTitle,
-    // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
+    // Fields drop in order, so Vulkan drops before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
 }
@@ -344,7 +341,7 @@ impl ApplicationHandler for Materials {
 fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut Materials {
-        angle: 0.6,
+        angle: START_ANGLE,
         paused: false,
         last_frame: Instant::now(),
         title: title::FrameTitle::new("materials"),

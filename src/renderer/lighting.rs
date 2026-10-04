@@ -1,10 +1,11 @@
-//! How chunk meshes are lit: light from the sky and the ground, and a sun whose shadows are
-//! traced through the voxels.
+//! How chunk meshes are lit: the sky and the ground, or the light probes in their place, a
+//! sun and the `Renderer::lights`, whose shadows are traced through the voxels, ambient
+//! occlusion, and reflections off glossy voxels.
 
 use super::Renderer;
 use crate::{
     gi::{GiUniforms, PROBE_CELL, ProbeTuning},
-    lights::{GpuLight, Light},
+    lights::GpuLight,
     mesh::MeshKind,
     shadows::ShadowUniforms,
 };
@@ -53,7 +54,13 @@ impl Convergence {
 const SHADOW_TABLE_CHUNKS: i32 = 32;
 /// The most levels a `ShadowGrid` has. Matches `MAX_SHADOW_LEVELS` in `common.slang`.
 pub const MAX_SHADOW_LEVELS: u32 = 4;
-/// A shadow table entry without a chunk. Matches `NO_CHUNK` in `mesh.slang`.
+/// The most of each pixel's lights that are shadowed, see `Lighting::shadowed_lights`. Each
+/// shadow texel keeps that many, 8 bits each. Matches `MAX_SHADOWED_LIGHTS` in
+/// `common.slang`.
+pub const MAX_SHADOWED_LIGHTS: u32 = 4;
+/// The longest `ProbeTuning::update_interval`.
+const MAX_UPDATE_INTERVAL: u32 = 16;
+/// A shadow table entry without a chunk. Matches `NO_CHUNK` in `common.slang`.
 const NO_CHUNK: u32 = u32::MAX;
 
 /// The chunks shadow rays are traced through: those `voxels_per_edge` voxels wide of
@@ -62,8 +69,8 @@ const NO_CHUNK: u32 = u32::MAX;
 /// the last, as many to a chunk. Other chunks are lit, but cast no shadows.
 ///
 /// Each level's chunks are found in a table 32 chunks wide around the camera, so coarser
-/// levels reach further. Rays go through the finest level's chunk wherever there is one,
-/// so where a level's chunks overlap a coarser one's, the finer ones count.
+/// levels reach further. Rays go through the finest level's chunk wherever there is one, so
+/// where a level's chunks overlap a coarser one's, the finer ones count.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShadowGrid {
     pub voxel_size: f32,
@@ -82,13 +89,19 @@ impl ShadowGrid {
         }
     }
 
+    /// With `levels` levels of detail.
+    pub fn with_levels(self, levels: u32) -> Self {
+        Self { levels, ..self }
+    }
+
     /// Levels the shaders trace through.
     fn level_count(self) -> u32 {
         self.levels.clamp(1, MAX_SHADOW_LEVELS)
     }
 }
 
-/// How finely sun shadows are traced, see `Lighting::shadow_resolution`.
+/// How finely the shadow pass traces shadows and reflections, and finds the light from
+/// everywhere but the sun, see `Lighting::shadow_resolution`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ShadowResolution {
     /// A shadow ray for every pixel.
@@ -113,7 +126,8 @@ impl ShadowResolution {
 }
 
 /// What chunk meshes show instead of their colors, for seeing how they're lit, see
-/// `Lighting::debug_view`. Matches the `DEBUG_` constants in `mesh.slang`.
+/// `Lighting::debug_view`. Matches the `DEBUG_` constants in `mesh.slang`, but for `Probes`,
+/// which shades chunks as usual.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DebugView {
     /// Their colors, lit, as usual.
@@ -121,7 +135,7 @@ pub enum DebugView {
     Off,
     /// All the light reaching them, as if they were white.
     Light,
-    /// Only the sun's.
+    /// Only the sun's and the lights'.
     Direct,
     /// Only the light from everywhere else: the probes', or the sky and ground's.
     Indirect,
@@ -134,8 +148,10 @@ pub enum DebugView {
 
 /// How chunk meshes are lit, see `Renderer::lighting`. Colored meshes keep their own colors.
 ///
-/// A face's light is the sky's and the ground's, blended by how far it faces up or down,
-/// plus the sun's when it faces the sun and no voxel is in the way.
+/// A face's light is the sky's and the ground's, blended by how far it faces up or down, or
+/// with `global_illumination`, the light probes' in their place, darkened in corners by
+/// ambient occlusion. Then the sun's and the `Renderer::lights`' where they face it and no
+/// voxel is in the way, and with a glossy `Material`, what it reflects.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lighting {
     /// Toward the sun, in the world. Needn't be normalized.
@@ -148,7 +164,8 @@ pub struct Lighting {
     pub ground_color: [f32; 3],
     /// The chunks that cast shadows, `None` for no shadows.
     pub shadow_grid: Option<ShadowGrid>,
-    /// How far shadow rays reach, in the grid's voxels. Light probes' rays reach as far.
+    /// How far the sun's shadow rays and reflection rays reach, in the grid's finest voxels.
+    /// The light probes' reach `ProbeTuning::ray_distance`.
     pub shadow_distance: f32,
     /// Whether the light probes from `RendererConfig::global_illumination` light chunks, in
     /// place of the sky and ground colors, with light bounced off the voxels around them.
@@ -163,13 +180,14 @@ pub struct Lighting {
     pub ambient_occlusion: f32,
     /// What chunk meshes show, to see how they're lit.
     pub debug_view: DebugView,
-    /// How finely shadows are traced. With shadows, frames draw their depth first, trace a
-    /// shadow ray for each block of pixels and shadowed light from it, then draw their color
-    /// over it, upscaling the shadows. Below full resolution, shadows' edges are a little
-    /// softer.
+    /// How finely shadows are traced. With shadows or lights, frames draw their depth first,
+    /// trace a shadow ray for each block of pixels and shadowed light from it, and reflection
+    /// rays for glossy voxels, then draw their color over it, upscaling them. Below full
+    /// resolution, the light from everywhere but the sun is found for each block too, and
+    /// edges are a little softer.
     pub shadow_resolution: ShadowResolution,
     /// How many of the `Renderer::lights` reaching each pixel are shadowed, its brightest, at
-    /// most 4. The rest light through voxels.
+    /// most `MAX_SHADOWED_LIGHTS`. The rest light through voxels.
     pub shadowed_lights: u32,
 }
 
@@ -193,16 +211,17 @@ impl Default for Lighting {
     }
 }
 
-/// `Lighting` as `mesh.slang` reads it. Matches `LightingUniforms` there.
+/// `Lighting` as the shaders read it. Matches `LightingUniforms` in `common.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct LightingUniforms {
+pub(crate) struct LightingUniforms {
     /// Normalized, w unused, as is every color's.
     pub sun_direction: [f32; 4],
     pub sun_color: [f32; 4],
     pub sky_color: [f32; 4],
     pub ground_color: [f32; 4],
-    /// The chunk coordinate of the shadow table's corner, and chunks per side, 0 without shadows.
+    /// The finest level's table's corner, which the shaders read from `shadow_levels`, and
+    /// chunks per side of each level's, 0 without shadows.
     pub shadow_table: [i32; 4],
     /// The grid's voxel size, voxels per edge and the shadow distance in voxels, then how many
     /// levels it has.
@@ -300,7 +319,7 @@ impl Renderer {
         let extent = self.shadow_pass.extent;
         let frame = self.swapchain.extent;
         let shadowed = match self.lighting.shadow_grid {
-            Some(_) => self.lighting.shadowed_lights.min(4),
+            Some(_) => self.lighting.shadowed_lights.min(MAX_SHADOWED_LIGHTS),
             None => 0,
         };
         let [tiles_x, tiles_y] = self.shadow_pass.tile_counts;
@@ -324,10 +343,14 @@ impl Renderer {
 
     /// Whether the shadow pass lights faces with the light from everywhere but the sun,
     /// probes and ambient occlusion, for shading to upscale, which below full resolution is
-    /// cheaper than every pixel finding it.
+    /// cheaper than every pixel finding it. Not for `DebugView::AmbientOcclusion`, which shows
+    /// each pixel's.
     pub(super) fn lights_indirect_in_shadow_pass(&self) -> bool {
         let indirect_work = self.gi_enabled() || self.lighting.ambient_occlusion > 0.0;
-        self.uses_shadow_pass() && self.shadow_scale() > 1 && indirect_work
+        self.uses_shadow_pass()
+            && self.shadow_scale() > 1
+            && indirect_work
+            && self.lighting.debug_view != DebugView::AmbientOcclusion
     }
 
     /// How many of `lights` light the frame.
@@ -340,21 +363,22 @@ impl Renderer {
     /// # Safety
     /// The device must not be using `frame`'s light buffer.
     pub(super) unsafe fn write_lights(&mut self, frame: usize) -> VkResult<()> {
+        self.gpu_lights.clear();
+        self.gpu_lights.extend(
+            self.lights[..self.light_count() as usize]
+                .iter()
+                .map(GpuLight::from),
+        );
         // An empty buffer can't be bound, a placeholder entry stands in.
-        let mut lights: Vec<GpuLight> = self.lights[..self.light_count() as usize]
-            .iter()
-            .map(GpuLight::from)
-            .collect();
-        if lights.is_empty() {
-            lights.push(GpuLight::from(&Light {
-                position: Vec3::ZERO,
-                color: [0.0; 3],
-                range: 1.0,
-                spot: None,
-            }));
+        if self.gpu_lights.is_empty() {
+            self.gpu_lights.push(GpuLight::NONE);
         }
         unsafe {
-            self.frame_light_buffers[frame].write(&self.adapter, &self.render_device, &lights)
+            self.frame_light_buffers[frame].write(
+                &self.adapter,
+                &self.render_device,
+                &self.gpu_lights,
+            )
         }
     }
 
@@ -399,11 +423,16 @@ impl Renderer {
                 self.frame_number as u32,
                 self.probe_volume.rays_per_frame,
                 cascades,
-                tuning.update_interval.clamp(1, 16).next_power_of_two(),
+                tuning
+                    .update_interval
+                    .clamp(1, MAX_UPDATE_INTERVAL)
+                    .next_power_of_two(),
             ],
             ..Default::default()
         };
-        if let (true, Some(grid)) = (self.gi_enabled(), self.lighting.shadow_grid) {
+        if self.gi_enabled()
+            && let Some(grid) = self.lighting.shadow_grid
+        {
             for cascade in 0..cascades {
                 let cell_size = grid.voxel_size * (PROBE_CELL << cascade) as f32;
                 let center = (camera / cell_size).floor().as_ivec3();
@@ -414,11 +443,11 @@ impl Renderer {
         uniforms
     }
 
-    /// Fills in `frame`'s shadow table around the camera, from the chunks in the mesh pool,
-    /// and returns the lighting for its uniforms.
+    /// The lighting for `frame`'s uniforms, filling in its shadow table around the camera and
+    /// which chunks changed since last frame.
     ///
     /// # Safety
-    /// The device must not be using `frame`'s shadow table.
+    /// The device must not be using `frame`'s shadow table or changed chunks.
     pub(super) unsafe fn write_lighting(
         &mut self,
         frame: usize,
@@ -447,29 +476,40 @@ impl Renderer {
             return Ok(uniforms);
         };
 
-        let levels = grid.level_count();
-        let camera = view.inverse().w_axis.truncate();
-        // Each level's table's corner, in that level's chunks.
-        let corners: Vec<IVec3> = (0..levels)
-            .map(|level| {
-                let chunk_size = grid.voxel_size * (grid.voxels_per_edge << level) as f32;
-                (camera / chunk_size).floor().as_ivec3() - IVec3::splat(SHADOW_TABLE_CHUNKS / 2)
-            })
-            .collect();
-        let side = SHADOW_TABLE_CHUNKS as usize;
-        // A table entry's index, from its level and chunk, when the table holds it.
-        let entry = |chunk: IVec4| {
-            let relative = chunk.truncate() - corners[chunk.w as usize];
-            let inside =
-                relative.min_element() >= 0 && relative.max_element() < SHADOW_TABLE_CHUNKS;
-            inside.then(|| {
-                let [x, y, z] = relative.to_array().map(|axis| axis as usize);
-                ((chunk.w as usize * side + z) * side + y) * side + x
-            })
-        };
+        let table = TableLayout::around(grid, view.inverse().w_axis.truncate());
+        self.fill_shadow_table(grid, &table);
+        self.mark_changed_chunks(&table);
+        unsafe {
+            self.frame_shadow_tables[frame].write(
+                &self.adapter,
+                &self.render_device,
+                &self.shadow_table,
+            )?;
+            self.frame_changed_chunks[frame].write(
+                &self.adapter,
+                &self.render_device,
+                &self.changed_chunks,
+            )?;
+        }
+
+        uniforms.shadow_table = table.corners[0].extend(SHADOW_TABLE_CHUNKS).to_array();
+        uniforms.shadow_grid = [
+            grid.voxel_size,
+            grid.voxels_per_edge as f32,
+            lighting.shadow_distance,
+            table.levels as f32,
+        ];
+        for (level, corner) in table.corners[..table.levels as usize].iter().enumerate() {
+            uniforms.shadow_levels[level] = corner.extend(0).to_array();
+        }
+        Ok(uniforms)
+    }
+
+    /// Puts each chunk of `grid`'s levels in the mesh pool in its `table` entry, noting its
+    /// serial for `mark_changed_chunks`.
+    fn fill_shadow_table(&mut self, grid: ShadowGrid, table: &TableLayout) {
         self.shadow_table.clear();
-        self.shadow_table
-            .resize(levels as usize * side.pow(3), NO_CHUNK);
+        self.shadow_table.resize(table.entries(), NO_CHUNK);
         for (slot, mesh) in self.mesh_pool.meshes() {
             if mesh.kind == MeshKind::Colored || mesh.voxels_per_edge != grid.voxels_per_edge {
                 continue;
@@ -478,7 +518,7 @@ impl Renderer {
             let ratio = mesh.scale / grid.voxel_size;
             let level = ratio.log2().round();
             let level_size = level.exp2();
-            if !(0.0..levels as f32).contains(&level)
+            if !(0.0..table.levels as f32).contains(&level)
                 || (ratio - level_size).abs() > level_size * 1e-5
             {
                 continue;
@@ -490,21 +530,21 @@ impl Renderer {
                 continue;
             }
             let chunk = chunk.as_ivec3().extend(level as i32);
-            if let Some(index) = entry(chunk) {
+            if let Some(index) = table.entry(chunk) {
                 self.shadow_table[index] = slot;
                 self.chunk_serials_next.insert(chunk, mesh.serial);
             }
         }
-        // Chunks added, removed or remeshed since last frame, a bit for each table entry, so
-        // the probes around them converge faster.
+    }
+
+    /// Sets a bit for each `table` entry whose chunk was added, removed or remeshed since last
+    /// frame, so the probes around it converge faster.
+    fn mark_changed_chunks(&mut self, table: &TableLayout) {
         let previous = std::mem::take(&mut self.chunk_serials);
         self.changed_chunks.clear();
-        self.changed_chunks
-            .resize((levels as usize * side.pow(3)).div_ceil(32), 0);
+        self.changed_chunks.resize(table.entries().div_ceil(32), 0);
         let mut changed = |chunk: IVec4| {
-            if (chunk.w as u32) < levels
-                && let Some(index) = entry(chunk)
-            {
+            if let Some(index) = table.entry(chunk) {
                 self.changed_chunks[index / 32] |= 1 << (index % 32);
             }
         };
@@ -520,30 +560,44 @@ impl Renderer {
         }
         self.chunk_serials = std::mem::replace(&mut self.chunk_serials_next, previous);
         self.chunk_serials_next.clear();
-        unsafe {
-            self.frame_shadow_tables[frame].write(
-                &self.adapter,
-                &self.render_device,
-                &self.shadow_table,
-            )?;
-            self.frame_changed_chunks[frame].write(
-                &self.adapter,
-                &self.render_device,
-                &self.changed_chunks,
-            )?;
-        }
+    }
+}
 
-        uniforms.shadow_table = corners[0].extend(SHADOW_TABLE_CHUNKS).to_array();
-        uniforms.shadow_grid = [
-            grid.voxel_size,
-            grid.voxels_per_edge as f32,
-            lighting.shadow_distance,
-            levels as f32,
-        ];
-        for (level, corner) in corners.iter().enumerate() {
-            uniforms.shadow_levels[level] = corner.extend(0).to_array();
+/// Where each level's shadow table is, `SHADOW_TABLE_CHUNKS` chunks wide around the camera.
+struct TableLayout {
+    levels: u32,
+    /// Each level's corner, in that level's chunks.
+    corners: [IVec3; MAX_SHADOW_LEVELS as usize],
+}
+
+impl TableLayout {
+    fn around(grid: ShadowGrid, camera: Vec3) -> Self {
+        Self {
+            levels: grid.level_count(),
+            corners: std::array::from_fn(|level| {
+                let chunk_size = grid.voxel_size * (grid.voxels_per_edge << level) as f32;
+                (camera / chunk_size).floor().as_ivec3() - IVec3::splat(SHADOW_TABLE_CHUNKS / 2)
+            }),
         }
-        Ok(uniforms)
+    }
+
+    /// Every level's entries.
+    fn entries(&self) -> usize {
+        self.levels as usize * (SHADOW_TABLE_CHUNKS as usize).pow(3)
+    }
+
+    /// The entry of a chunk, by its coordinate and then level, when the table holds it.
+    fn entry(&self, chunk: IVec4) -> Option<usize> {
+        if !(0..self.levels as i32).contains(&chunk.w) {
+            return None;
+        }
+        let relative = chunk.truncate() - self.corners[chunk.w as usize];
+        let inside = relative.min_element() >= 0 && relative.max_element() < SHADOW_TABLE_CHUNKS;
+        let side = SHADOW_TABLE_CHUNKS as usize;
+        inside.then(|| {
+            let [x, y, z] = relative.to_array().map(|axis| axis as usize);
+            ((chunk.w as usize * side + z) * side + y) * side + x
+        })
     }
 }
 

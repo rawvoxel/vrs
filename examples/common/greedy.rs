@@ -3,10 +3,13 @@
 //! Every face of a solid voxel next to an empty one is found with bit operations, a row of
 //! voxels at a time, then merged with its neighbors on the same plane into rectangles.
 
+use ash::prelude::VkResult;
 use glam::{Vec3, Vec3Swizzles};
 use vrs::{
+    mesh::MeshId,
+    renderer::Renderer,
     vertex::Index,
-    voxel::{Face, GreedyVertex},
+    voxel::{ChunkMesh, ChunkVertices, Face, GreedyVertex, VoxelTypes},
 };
 
 /// Voxels along each edge of a chunk, one per bit of a word.
@@ -176,7 +179,7 @@ fn push_quad(mesh: &mut GreedyMesh, n: usize, plane: f32, b: f32, c: f32, h: f32
     let vi = Vec3::new(plane, b, c);
     let vo = Vec3::new(vi.x, vi.y + h, vi.z + d);
 
-    // Build quad vertices. Bottom left origin, CW.
+    // The corners, from the bottom left one, clockwise in the face's frame.
     let mut vertices = [
         vi,
         Vec3::new(vi.x, vi.y + h, vi.z),
@@ -184,7 +187,7 @@ fn push_quad(mesh: &mut GreedyMesh, n: usize, plane: f32, b: f32, c: f32, h: f32
         Vec3::new(vo.x, vo.y - h, vo.z),
     ];
 
-    // Swizzle vertices based on axis.
+    // Into the chunk's frame, by the face's axis.
     match n >> 1 {
         1 => {
             for vertex in vertices.iter_mut() {
@@ -199,12 +202,12 @@ fn push_quad(mesh: &mut GreedyMesh, n: usize, plane: f32, b: f32, c: f32, h: f32
         _ => {}
     }
 
-    // Reverse draw order based on axis sign.
+    // Faces looking along an axis's positive side wind the other way.
     if n & 1 == 1 {
         vertices.reverse();
     }
 
-    // Create indices, CCW.
+    // Two triangles, counter-clockwise on screen when the face looks at the camera.
     let l = mesh.vertices.len() as Index;
     mesh.indices.extend([l, l + 3, l + 1, l + 1, l + 3, l + 2]);
 
@@ -212,4 +215,39 @@ fn push_quad(mesh: &mut GreedyMesh, n: usize, plane: f32, b: f32, c: f32, h: f32
     mesh.vertices.extend(vertices.map(|vertex| {
         GreedyVertex::new(vertex, face, EDGE as u32).expect("Quads stay inside the chunk.")
     }));
+}
+
+/// The type of each of a chunk's voxels, x-fastest, from `voxel`, asked about each in it.
+pub fn chunk_types(voxel: impl Fn(i32, i32, i32) -> u16) -> Vec<u16> {
+    (0..EDGE.pow(3))
+        .map(|index| {
+            let (x, y, z) = (index % EDGE, index / EDGE % EDGE, index / EDGE.pow(2));
+            voxel(x as i32, y as i32, z as i32)
+        })
+        .collect()
+}
+
+/// Meshes a chunk of voxels of `types`, see `chunk_types`, and adds it to `renderer` at
+/// `origin`, of voxels `voxel_size` wide, unless it's all empty space. `solid` says which
+/// voxels are solid, those just around the chunk too, see `ChunkMask::from_fn`.
+pub fn create_chunk(
+    renderer: &mut Renderer,
+    origin: Vec3,
+    voxel_size: f32,
+    types: &[u16],
+    solid: impl Fn(i32, i32, i32) -> bool,
+) -> VkResult<Option<MeshId>> {
+    if types.iter().all(|&id| id == 0) {
+        return Ok(None);
+    }
+    let mesh = mesh(&ChunkMask::from_fn(solid));
+    renderer
+        .create_chunk_mesh(&ChunkMesh {
+            indices: &mesh.indices,
+            vertices: ChunkVertices::Greedy(&mesh.vertices),
+            origin,
+            voxel_size,
+            types: &VoxelTypes::pack(EDGE as u32, types),
+        })
+        .map(Some)
 }

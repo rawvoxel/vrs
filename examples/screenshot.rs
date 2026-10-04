@@ -4,14 +4,16 @@
 //! `screenshot.ppm` by default. PPM is the simplest image format there is, so it needs no
 //! image library. Most image editors and viewers open it, such as GIMP or IrfanView.
 
+#[path = "common/camera.rs"]
+mod camera;
 #[path = "common/greedy.rs"]
 mod greedy;
 #[path = "common/terrain.rs"]
 mod terrain;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ash::vk;
-use std::{fs, path::PathBuf};
+use std::{env, fs, path::PathBuf};
 use vrs::{
     App,
     mesh::MeshId,
@@ -20,6 +22,9 @@ use vrs::{
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
+/// Frames before the capture, for the light probes to settle: several bounces of light, with
+/// each probe updating every few frames.
+const SETTLE_FRAMES: u32 = 60;
 
 /// The frame as a binary PPM: a short text header, then each pixel's red, green and blue
 /// bytes, sRGB encoded as viewers expect.
@@ -51,17 +56,15 @@ fn srgb_encode(linear: u8) -> u8 {
 }
 
 fn main() -> Result<()> {
-    let path = PathBuf::from(
-        std::env::args()
-            .nth(1)
-            .unwrap_or_else(|| "screenshot.ppm".to_string()),
-    );
+    let path = env::args_os()
+        .nth(1)
+        .map_or_else(|| "screenshot.ppm".into(), PathBuf::from);
     let app_info = vk::ApplicationInfo::default()
         .application_name(c"vrs screenshot")
         .api_version(vk::API_VERSION_1_3);
     let app = App::headless(app_info)?;
     let mut renderer = Renderer::with_config(&app, WIDTH, HEIGHT, terrain::config())?;
-    let chunks = terrain::create(&mut renderer)?;
+    let chunks = terrain::create_world(&mut renderer)?;
 
     let (view, proj) = terrain::view_proj(
         terrain::START_POSITION,
@@ -75,10 +78,13 @@ fn main() -> Result<()> {
         proj,
         ..Default::default()
     };
-    // The first frame uploads the chunks and draws them, the capture is of the second.
-    renderer.submit(WIDTH, HEIGHT, &draws)?;
+    // The first frame uploads the chunks, and the probes take a while to light them.
+    renderer.converge_lighting();
+    for _ in 0..SETTLE_FRAMES {
+        renderer.submit(WIDTH, HEIGHT, &draws)?;
+    }
     if !renderer.debug_capture_next_frame() {
-        anyhow::bail!("This device's frames can't be copied back.");
+        bail!("This device's frames can't be copied back.");
     }
     renderer.submit(WIDTH, HEIGHT, &draws)?;
     let capture = renderer
@@ -87,7 +93,7 @@ fn main() -> Result<()> {
 
     fs::write(&path, encode_ppm(&capture)?)
         .with_context(|| format!("Couldn't write {}.", path.display()))?;
-    println!("Saved {}x{} to {}.", WIDTH, HEIGHT, path.display());
+    println!("Saved {WIDTH}x{HEIGHT} to {}.", path.display());
 
     // The renderer must be dropped before the app.
     drop(renderer);

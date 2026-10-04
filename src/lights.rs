@@ -20,6 +20,26 @@ pub struct Light {
     pub spot: Option<Spot>,
 }
 
+impl Light {
+    /// A point light at `position` of `color` reaching `range` world units.
+    pub fn point(position: Vec3, color: [f32; 3], range: f32) -> Self {
+        Self {
+            position,
+            color,
+            range,
+            spot: None,
+        }
+    }
+
+    /// The same light shining in `spot`'s cone.
+    pub fn with_spot(self, spot: Spot) -> Self {
+        Self {
+            spot: Some(spot),
+            ..self
+        }
+    }
+}
+
 /// The cone of a spot light.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Spot {
@@ -43,6 +63,16 @@ pub(crate) struct GpuLight {
     direction_outer: [f32; 4],
     /// The cosine of the spot's inner angle, the rest unused.
     inner: [f32; 4],
+}
+
+impl GpuLight {
+    /// No light, which the shaders read in place of none.
+    pub const NONE: Self = Self {
+        position_range: [0.0, 0.0, 0.0, 1.0],
+        color_spot: [0.0; 4],
+        direction_outer: [0.0, -1.0, 0.0, -1.0],
+        inner: [-1.0, 0.0, 0.0, 0.0],
+    };
 }
 
 impl From<&Light> for GpuLight {

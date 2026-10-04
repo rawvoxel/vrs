@@ -41,7 +41,7 @@ ProbeOutput probeVert(uint vertexIndex: SV_VertexID, uint slot: SV_InstanceID) {
     if (side < 0.0) {
         at.x = -at.x;
     }
-    float3 local = (normal + u * at.x + v * at.y) * (PROBE_CUBE * 0.5 * float(1u << (slot / probesPerCascade())));
+    float3 local = (normal + u * at.x + v * at.y) * (PROBE_CUBE * 0.5 * float(1u << uint(cascadeOf(slot))));
     float3 world = (probe.position + local) * ubo.lighting.shadowGrid.x;
     output.position = mul(ubo.proj, mul(ubo.view, float4(world, 1.0)));
     output.normal = normal;
@@ -50,7 +50,7 @@ ProbeOutput probeVert(uint vertexIndex: SV_VertexID, uint slot: SV_InstanceID) {
 
 [shader("fragment")]
 float4 probeFrag(ProbeOutput input) : SV_Target {
-    // Stored to the power of 1 / 5.
+    // Stored to the power of 1 / `IRRADIANCE_GAMMA`.
     float3 stored = probeIrradiance.SampleLevel(atlasUV(input.slot, input.normal, IRRADIANCE_TEXELS), 0.0).rgb;
     return float4(pow(max(stored, 0.0), IRRADIANCE_GAMMA), 1.0);
 }

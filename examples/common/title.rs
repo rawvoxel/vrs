@@ -2,24 +2,38 @@
 //! averaged over the last second.
 
 use std::time::{Duration, Instant};
-use vrs::renderer::Renderer;
+use vrs::renderer::{GpuStage, GpuTimings, Renderer};
 use winit::window::Window;
 
 /// How often the title changes.
 const INTERVAL: Duration = Duration::from_secs(1);
-/// The GPU stages of a frame that update the light probes, and that trace shadows, see
-/// `Renderer::debug_gpu_timings`. The rest draw.
-const PROBE_STAGES: [&str; 3] = ["probe classification", "probe rays", "probe updates"];
-const SHADOW_STAGES: [&str; 2] = ["light culling", "shadows and reflections"];
+
+/// GPU milliseconds, added up over frames.
+#[derive(Clone, Copy, Default)]
+struct GpuTime {
+    total: f64,
+    /// Updating the light probes.
+    probes: f64,
+    /// Tracing shadows and reflections.
+    shadows: f64,
+}
+
+impl GpuTime {
+    fn add(&mut self, timings: &GpuTimings) {
+        self.total += timings.total();
+        self.probes += timings.sum(&GpuStage::PROBES);
+        self.shadows += timings.sum(&GpuStage::SHADOWS);
+    }
+}
 
 /// A window's title, `vrs - <name>: <details>, <fps> fps, GPU <ms> ms: ...`.
 pub struct FrameTitle {
     name: &'static str,
     since: Instant,
     frames: u32,
-    /// GPU milliseconds since the title last changed: in total, the probes' and the shadows',
-    /// and how many frames they're of.
-    gpu: [f64; 3],
+    /// Since the title last changed.
+    gpu: GpuTime,
+    /// Frames `gpu` is of.
     timed: u32,
 }
 
@@ -29,7 +43,7 @@ impl FrameTitle {
             name,
             since: Instant::now(),
             frames: 0,
-            gpu: [0.0; 3],
+            gpu: GpuTime::default(),
             timed: 0,
         }
     }
@@ -45,11 +59,7 @@ impl FrameTitle {
         self.frames += 1;
         // Without stalling, a frame from as many ago as are in flight.
         if let Some(timings) = renderer.debug_gpu_timings() {
-            let sum = |stages: &[&str]| stages.iter().map(|&stage| timings.stage(stage)).sum();
-            let times = [timings.total(), sum(&PROBE_STAGES), sum(&SHADOW_STAGES)];
-            for (total, time) in self.gpu.iter_mut().zip(times) {
-                *total += time;
-            }
+            self.gpu.add(timings);
             self.timed += 1;
         }
         let elapsed = self.since.elapsed();
@@ -63,8 +73,13 @@ impl FrameTitle {
             self.frames as f64 / elapsed.as_secs_f64()
         ));
         if self.timed > 0 {
-            let [total, probes, shadows] = self.gpu.map(|time| time / self.timed as f64);
-            // Only the stages the frames ran.
+            let frames = self.timed as f64;
+            let (total, probes, shadows) = (
+                self.gpu.total / frames,
+                self.gpu.probes / frames,
+                self.gpu.shadows / frames,
+            );
+            // Only what the frames did.
             let mut stages = Vec::new();
             for (name, time) in [("probes", probes), ("shadows", shadows)] {
                 if time > 0.0 {
@@ -78,7 +93,7 @@ impl FrameTitle {
 
         self.since = Instant::now();
         self.frames = 0;
-        self.gpu = [0.0; 3];
+        self.gpu = GpuTime::default();
         self.timed = 0;
     }
 }

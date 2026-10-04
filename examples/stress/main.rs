@@ -1,11 +1,15 @@
 //! Exercises the renderer the way a voxel game would, checking what it draws.
 //!
 //! Run with `cargo run -p vrs --example stress`, it exits with a failure code if a check fails.
+//! Debug builds take much longer, but check for validation messages, see below.
 //! `-- --headless` renders without a window, such as on a CI machine with a software
 //! Vulkan driver like lavapipe. With a window, its title shows the scenario running, frames a
 //! second and how long frames take on the GPU.
 //!
-//! A grid of chunk meshes sits behind a wall mesh. Scenarios cull it with different cameras,
+//! First, a renderer failing partway through being built must leak nothing, and the lighting
+//! is checked against scenes with known answers, see `gi`.
+//!
+//! Then a grid of chunk meshes sits behind a wall mesh. Scenarios cull it with different cameras,
 //! remesh chunks every frame against a nearly full mesh pool, and resize and
 //! minimize the window. Each one compares the draw counts read back from the device with the
 //! meshes that are actually in view, and with occlusion culling, those the wall can't hide.
@@ -17,6 +21,8 @@
 //! an indirect draw reads though, and the pixel check only sees a race the device loses,
 //! so a missing barrier before those reads can still go unnoticed.
 
+#[path = "../common/camera.rs"]
+mod camera;
 mod gi;
 #[path = "../common/greedy.rs"]
 mod greedy;
@@ -74,7 +80,8 @@ struct Stress {
 }
 
 impl Stress {
-    fn fail(&mut self, failure: String) {
+    fn fail(&mut self, failure: impl Into<String>) {
+        let failure = failure.into();
         println!("  FAIL {failure}");
         self.failures.push(failure);
     }
@@ -150,7 +157,7 @@ impl Stress {
                     vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY,
                 ) => (),
                 Err(err) => self.fail(format!("impossible capacity failed with {err}")),
-                Ok(_) => self.fail("impossible capacity was created".to_string()),
+                Ok(_) => self.fail("impossible capacity was created"),
             }
         }
         self.check_messages("failed construction");
@@ -247,7 +254,7 @@ impl Stress {
         if self.frame == SETTLE_FRAMES {
             let scene = self.scene.as_mut().unwrap();
             scene.fill(scenario.wall, scenario.wall_faces_away).unwrap();
-        } else if self.frame == SETTLE_FRAMES + POOL_TEST_DELAY && scenario.pool != PoolTest::None {
+        } else if self.frame == SETTLE_FRAMES + POOL_TEST_DELAY {
             self.test_pool();
         } else if self.frame > SETTLE_FRAMES && scenario.remesh {
             self.remesh();
@@ -397,7 +404,7 @@ impl ApplicationHandler for Stress {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.fail("the window was closed early".to_string());
+                self.fail("the window was closed early");
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
@@ -460,7 +467,7 @@ fn main() -> Result<()> {
     }
     match stress.failures.len() {
         0 => {
-            println!("All {} scenarios passed.", SCENARIOS.len());
+            println!("All checks passed.");
             Ok(())
         }
         failed => bail!("{failed} checks failed: {:#?}", stress.failures),

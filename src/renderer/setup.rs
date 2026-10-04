@@ -1,15 +1,18 @@
 //! Building a `Renderer`.
 
+use super::palette::GpuMaterial;
 use super::{Lighting, Renderer, RendererConfig, device::create_render_device};
 use crate::{
     App,
     adapter::Adapter,
+    bindings,
     buffer::DynamicBuffer,
     commands::{create_command_buffer, create_command_pool},
     cull::Culler,
     descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
     gi::ProbeVolume,
     hiz::DepthPyramid,
+    lights::GpuLight,
     mesh::MeshPool,
     pipeline::{
         PipelinePass, create_graphics_pipeline, create_pipeline_layout, create_shader_module,
@@ -19,6 +22,7 @@ use crate::{
     surface::Surface,
     swapchain::Swapchain,
     sync::{create_fence, create_semaphore},
+    timings::FrameTimestamps,
     uniforms::{create_uniform_buffer, write_uniform_descriptor_sets},
     vertex::{Index, Vertex},
 };
@@ -121,6 +125,7 @@ impl Renderer {
             frame_changed_chunks: Vec::new(),
             changed_chunks: Vec::new(),
             frame_light_buffers: Vec::new(),
+            gpu_lights: Vec::new(),
             chunk_serials: Default::default(),
             chunk_serials_next: Default::default(),
             previous_lighting: None,
@@ -151,41 +156,8 @@ impl Renderer {
         let device = self.render_device.clone();
         let adapter = self.adapter.clone();
 
-        // Frame Descriptors, matching the bindings in `common.slang`: the uniforms, the mesh
-        // pool's vertices, mesh infos and voxel types, the palette and the shadow table, then
-        // the light probes, their atlases sampled, their atlases written, their rays and the
-        // probes they're tracing, then the low resolution shadows written, the depth buffer
-        // they're traced from, and the shadows sampled, then the chunks that changed, then the
-        // lights, the lights reaching each tile, and their shadows written and read, then the
-        // reflections written and read, then the light from everywhere but the sun written and
-        // read.
-        let bindings = [
-            vk::DescriptorType::UNIFORM_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_BUFFER,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::DescriptorType::SAMPLED_IMAGE,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::DescriptorType::SAMPLED_IMAGE,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::DescriptorType::SAMPLED_IMAGE,
-        ];
+        // Frame Descriptors, see `bindings`.
+        let bindings = bindings::TYPES_BY_BINDING;
         let pool_sizes = [
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
@@ -299,6 +271,8 @@ impl Renderer {
         self.init_cmd_fence = create_fence(&device)?;
 
         // Frames in Flight
+        let timestamps = self.graphics_queue_family.properties.timestamp_valid_bits > 0
+            && adapter.properties.limits.timestamp_compute_and_graphics == vk::TRUE;
         for _ in 0..FRAMES_IN_FLIGHT {
             let pool = create_command_pool(&device, &self.graphics_queue_family)?;
             self.frame_cmd_pools.push(pool);
@@ -308,11 +282,10 @@ impl Renderer {
                 vk::CommandBufferLevel::PRIMARY,
             )?);
             self.in_flight_frames.push(create_fence(&device)?);
-            let timestamps = self.graphics_queue_family.properties.timestamp_valid_bits > 0
-                && adapter.properties.limits.timestamp_compute_and_graphics == vk::TRUE;
-            self.frame_timestamps.push(match timestamps {
-                true => crate::timings::FrameTimestamps::new(&device)?,
-                false => crate::timings::FrameTimestamps::null(),
+            self.frame_timestamps.push(if timestamps {
+                FrameTimestamps::new(&device)?
+            } else {
+                FrameTimestamps::null()
             });
             self.available_frames.push(create_semaphore(&device)?);
         }
@@ -333,7 +306,7 @@ impl Renderer {
             .write_descriptors(&device, &self.frame_desc_sets);
         self.init_probe_volume()?;
 
-        // Shadows below full resolution, with the graphics pipelines' layout too.
+        // The shadow pass, with the graphics pipelines' layout too.
         self.shadow_pass = ShadowPass::new(&adapter, &device, self.graphics_pipeline_layout)?;
         self.init_shadow_pass()?;
 
@@ -362,6 +335,15 @@ impl Renderer {
                 INITIAL_DYNAMIC_ELEMENTS * element_size as vk::DeviceSize,
             )
         };
+        // Grown to fit what each frame writes.
+        let storage_buffer = |size: usize| {
+            DynamicBuffer::new(
+                &adapter,
+                &device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                size as vk::DeviceSize,
+            )
+        };
         for _ in 0..FRAMES_IN_FLIGHT {
             // Only grown when a frame is captured.
             self.capture_buffers.push(DynamicBuffer::new(
@@ -370,33 +352,16 @@ impl Renderer {
                 vk::BufferUsageFlags::TRANSFER_DST,
                 4,
             )?);
-            self.frame_palette_buffers.push(DynamicBuffer::new(
-                &adapter,
-                &device,
+            self.frame_palette_buffers.push(dynamic_buffer(
                 vk::BufferUsageFlags::STORAGE_BUFFER,
-                INITIAL_DYNAMIC_ELEMENTS * size_of::<[[f32; 4]; 2]>() as vk::DeviceSize,
+                size_of::<GpuMaterial>(),
             )?);
             // Written by the first frame.
             self.frame_palette_versions.push(u64::MAX);
-            // Grown to fit the first frame with shadows.
-            self.frame_shadow_tables.push(DynamicBuffer::new(
-                &adapter,
-                &device,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                4,
-            )?);
-            self.frame_changed_chunks.push(DynamicBuffer::new(
-                &adapter,
-                &device,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                4,
-            )?);
-            self.frame_light_buffers.push(DynamicBuffer::new(
-                &adapter,
-                &device,
-                vk::BufferUsageFlags::STORAGE_BUFFER,
-                size_of::<crate::lights::GpuLight>() as vk::DeviceSize,
-            )?);
+            self.frame_shadow_tables.push(storage_buffer(4)?);
+            self.frame_changed_chunks.push(storage_buffer(4)?);
+            self.frame_light_buffers
+                .push(storage_buffer(size_of::<GpuLight>())?);
             self.frame_index_buffers.push(dynamic_buffer(
                 vk::BufferUsageFlags::INDEX_BUFFER,
                 size_of::<Index>(),

@@ -5,7 +5,9 @@
 //! empty. A chunk colored by its face rather than its voxels, drawn from stale or missing
 //! data, or culled while visible, shows the wrong colors.
 
-use crate::scene::{CHUNK_SIZE, CHUNK_Z, EDGE, GRID, Scene, VOXEL_SIZE, WALL_COLOR, chunk_min};
+use crate::scene::{
+    CHUNK_SIZE, CHUNK_Z, GRID, SLAB_EDGE, Scene, VOXEL_SIZE, WALL_COLOR, chunk_min,
+};
 use glam::{Mat4, Vec2};
 use vrs::renderer::Capture;
 
@@ -32,9 +34,9 @@ pub fn check(scene: &Scene, capture: &Capture, view_proj: Mat4) -> Result<usize,
         // or the middle of an empty cell.
         let samples = match scene.colors[cell as usize] {
             Some([low, high]) => vec![
-                (Vec2::new(1.0, EDGE as f32 / 2.0) * VOXEL_SIZE, low),
+                (Vec2::new(1.0, SLAB_EDGE as f32 / 2.0) * VOXEL_SIZE, low),
                 (
-                    Vec2::new(EDGE as f32 - 1.0, EDGE as f32 / 2.0) * VOXEL_SIZE,
+                    Vec2::new(SLAB_EDGE as f32 - 1.0, SLAB_EDGE as f32 / 2.0) * VOXEL_SIZE,
                     high,
                 ),
             ],

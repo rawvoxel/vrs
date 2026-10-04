@@ -42,7 +42,7 @@ impl Default for MeshCapacity {
 }
 
 /// How a mesh's vertices are stored, and so how it's colored.
-/// Matches the `KIND_` constants in `mesh.slang`.
+/// Matches the `KIND_` constants in `common.slang`.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshKind {

@@ -1,4 +1,5 @@
-//! Rolling hills of greedy meshed voxel chunks to fly around, colored per voxel.
+//! Rolling hills of greedy meshed voxel chunks to fly around, colored per voxel, ringed by
+//! coarser chunks of the next level of detail.
 //!
 //! Run with `cargo run -p vrs --example terrain --release`, debug builds take a few seconds
 //! to mesh the world. Click to look around with the mouse, Escape to let go of it. WASD
@@ -6,9 +7,11 @@
 //! camera is, Backspace takes them all away.
 //!
 //! The title shows how many chunks were drawn of those in the frame, chunks behind hills
-//! are culled, then how long frames take on the GPU: updating the light probes, tracing
-//! shadows, and drawing everything else, averaged over the last second.
+//! are culled, then frames a second and how long frames take on the GPU: updating the light
+//! probes, tracing shadows, and drawing everything else, averaged over the last second.
 
+#[path = "common/camera.rs"]
+mod camera;
 #[path = "common/greedy.rs"]
 mod greedy;
 #[path = "common/terrain.rs"]
@@ -89,7 +92,7 @@ impl Camera {
 
 struct Vulkan {
     chunks: Vec<MeshId>,
-    // NOTE: Field order matters, the renderer must be dropped before the app.
+    // Fields drop in order, so the renderer drops before the app.
     renderer: Renderer,
     _app: App,
 }
@@ -107,7 +110,7 @@ impl Vulkan {
         )?;
         let mut renderer = Renderer::with_config(&app, size.width, size.height, terrain::config())?;
         let started = Instant::now();
-        let chunks = terrain::create(&mut renderer)?;
+        let chunks = terrain::create_world(&mut renderer)?;
         println!(
             "Meshed {} chunks in {:.1?}.",
             chunks.len(),
@@ -128,7 +131,7 @@ struct Terrain {
     mouse_captured: bool,
     last_frame: Instant,
     title: title::FrameTitle,
-    // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
+    // Fields drop in order, so Vulkan drops before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
 }
@@ -175,12 +178,11 @@ impl Terrain {
         };
         let lights = &mut vulkan.renderer.lights;
         let color = LIGHT_COLORS[lights.len() % LIGHT_COLORS.len()];
-        lights.push(Light {
-            position: self.camera.position,
-            color: color.map(|channel| channel * LIGHT_BRIGHTNESS),
-            range: LIGHT_RANGE,
-            spot: None,
-        });
+        lights.push(Light::point(
+            self.camera.position,
+            color.map(|channel| channel * LIGHT_BRIGHTNESS),
+            LIGHT_RANGE,
+        ));
     }
 
     fn redraw(&mut self) {

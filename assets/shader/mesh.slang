@@ -1,16 +1,13 @@
 // Draws the mesh pool's meshes, pulling each one's vertices in whichever format it uses.
 //
 // Colored meshes carry their own colors. Chunk meshes are colored by voxel: a fragment finds
-// the voxel it belongs to in the chunk's packed types, then that type's palette color. Then
-// they're lit by the sun, whose shadows are traced through the voxels, and the light probes,
-// or the sky and the ground outside them.
+// the voxel it belongs to in the chunk's packed types, then that type's material. Then
+// they're lit by the sun and the lights, with the shadows the shadow pass traced, the light
+// probes or the sky and the ground, darkened by ambient occlusion, and when glossy, reflect
+// what's around them. Below full resolution, the shadow pass lit them with the light from
+// everywhere but the sun too, and they upscale it.
 
 #include "common.slang"
-
-// Matches `mesh::MeshKind`.
-static const uint KIND_COLORED = 0;
-static const uint KIND_GREEDY = 1;
-static const uint KIND_PACKED = 2;
 
 // Matches `voxel::POSITION_BIAS`.
 static const float POSITION_BIAS = 16.0;
@@ -23,8 +20,6 @@ static const float3 FACE_NORMALS[6] = {
     float3(0.0, 0.0, -1.0),
     float3(0.0, 0.0, 1.0),
 };
-// How far inside a face, in voxels, its fragments are moved to find their voxel: far above
-// the float error of an interpolated position, far below a voxel.
 // How far greedy quads are pushed out past their edges, in pixels, so where one quad's corner
 // meets the middle of another's edge, rounding can't open a crack between them.
 static const float QUAD_OVERLAP_PIXELS = 0.25;
@@ -32,8 +27,8 @@ static const float QUAD_OVERLAP_PIXELS = 0.25;
 // a pixel's and still shadow it.
 static const float SHADOW_DEPTH_TOLERANCE = 0.08;
 
-// The sun's visibility and the surface's distance for each block of pixels, when shadows are
-// traced at a fraction of the frame's resolution, see `shadow.slang`.
+// The sun's visibility and the surface's distance for each block of pixels, from the shadow
+// pass, see `shadow.slang`.
 [[vk::binding(15, 0)]] Sampler2D<float4> shadowTexels;
 // The lights reaching each tile of pixels, see `cullLights` in `shadow.slang`.
 [[vk::binding(18, 0)]] StructuredBuffer<uint> tileLights;
@@ -52,6 +47,7 @@ struct VSOutput {
     float3 voxelPosition;
     float3 worldPosition;
     float3 normal;
+    // A `KIND_` constant.
     nointerpolation uint kind;
     nointerpolation uint typesBase;
     nointerpolation uint occupancyBase;
@@ -147,7 +143,8 @@ uint3 cellAt(float3 p, uint edge) {
 
 // The 4 shadow texels nearest a frame pixel, weighted by how near each is, of those whose
 // surface is about as far from the camera as the pixel's, so shadows don't bleed across
-// edges. With none, the one whose surface is nearest in distance counts alone.
+// edges. With none, the one whose surface is nearest in distance counts alone. All zero
+// without the shadow pass.
 struct ShadowTaps {
     int2 texels[4];
     float weights[4];
@@ -202,7 +199,7 @@ float3 upscaledShadow(ShadowTaps taps) {
 // Face number `face`'s value from `texels`, which hold each block's and its face's number,
 // upscaled from `taps`, from those of the same face. `found` is false when none were.
 float3 upscaledByFace(Texture2D<float4> texels, ShadowTaps taps, uint face, out bool found) {
-    float3 reflection = float3(0.0);
+    float3 sum = float3(0.0);
     float totalWeight = 0.0;
     for (int i = 0; i < 4; i++) {
         if (taps.weights[i] <= 0.0) {
@@ -210,12 +207,12 @@ float3 upscaledByFace(Texture2D<float4> texels, ShadowTaps taps, uint face, out 
         }
         float4 texel = texels.Load(int3(taps.texels[i], 0));
         if (uint(texel.w + 0.5) == face) {
-            reflection += taps.weights[i] * texel.rgb;
+            sum += taps.weights[i] * texel.rgb;
             totalWeight += taps.weights[i];
         }
     }
     found = totalWeight > 0.0;
-    return found ? reflection / totalWeight : float3(0.0);
+    return found ? sum / totalWeight : float3(0.0);
 }
 
 // How much of light `lightIndex`'s light gets through, upscaled from `taps`, from those that
@@ -228,8 +225,8 @@ float upscaledLightShadow(ShadowTaps taps, uint lightIndex) {
             continue;
         }
         uint2 shadowed = lightShadowTexels.Load(int3(taps.texels[i], 0));
-        for (uint k = 0; k < 4; k++) {
-            if (((shadowed.x >> (k * 8)) & 0xff) == lightIndex) {
+        for (uint k = 0; k < MAX_SHADOWED_LIGHTS; k++) {
+            if (((shadowed.x >> (k * 8)) & NO_LIGHT) == lightIndex) {
                 visible += taps.weights[i] * float((shadowed.y >> (k * 8)) & 0xff) / 255.0;
                 totalWeight += taps.weights[i];
                 break;
@@ -241,23 +238,17 @@ float upscaledLightShadow(ShadowTaps taps, uint lightIndex) {
 
 // Whether chunk voxel `cell` blocks light from reaching a corner: solid and not see-through.
 // Past the chunk's edges, the shadow grid's voxel at `gridCell`, when the chunk is the grid's
-// size, otherwise open.
+// finest size, otherwise open.
 bool occludes(VSOutput input, int3 cell, int3 gridCell) {
     int edge = int(input.voxelsPerEdge);
-    uint id;
     if (all(cell >= 0) && all(cell < edge)) {
-        // Most voxels around a face are in the open, in blocks with none.
-        int blocksPerEdge = (edge + OCCUPANCY_BLOCK - 1) / OCCUPANCY_BLOCK;
-        if (!blockOccupied(input.occupancyBase, blocksPerEdge, cell / OCCUPANCY_BLOCK)) {
-            return false;
-        }
-        id = typeAt(input.typesBase, uint(edge), uint3(cell));
-    } else if (ubo.lighting.shadowTable.w > 0 && abs(input.scale - ubo.lighting.shadowGrid.x) < 1e-5 && int(ubo.lighting.shadowGrid.y) == edge) {
-        id = gridVoxel(gridCell);
-    } else {
-        return false;
+        return voxelOccludes(input.typesBase, input.occupancyBase, edge, cell);
     }
-    return id != 0 && !seeThrough(id);
+    float gridSize = ubo.lighting.shadowGrid.x;
+    bool inGrid = ubo.lighting.shadowTable.w > 0
+        && abs(input.scale - gridSize) <= gridSize * 1e-5
+        && int(ubo.lighting.shadowGrid.y) == edge;
+    return inGrid && gridOccludes(0, gridCell);
 }
 
 // How open a greedy face is where `input` lies on it, from 0, enclosed, to 1: each corner of
@@ -268,9 +259,10 @@ float voxelOcclusion(VSOutput input, int3 normal) {
     // The face's voxel, the empty one in front, and the same in the shadow grid.
     int3 solid = int3(floor(input.voxelPosition - float3(normal) * FACE_NUDGE));
     int3 front = solid + normal;
-    int3 gridFront = int3(floor(input.worldPosition / ubo.lighting.shadowGrid.x - float3(normal) * FACE_NUDGE)) + normal;
-    int3 u = normal.x != 0 ? int3(0, 1, 0) : int3(1, 0, 0);
-    int3 v = normal.z != 0 ? int3(0, 1, 0) : int3(0, 0, 1);
+    int3 gridFront = int3(floor(toGrid(input.worldPosition) - float3(normal) * FACE_NUDGE)) + normal;
+    int3 u;
+    int3 v;
+    faceAxes(normal, u, v);
     float2 along = float2(frac(dot(input.voxelPosition, float3(u))), frac(dot(input.voxelPosition, float3(v))));
 
     // The 8 voxels around the one in front, in its plane, each looked up once.
@@ -285,8 +277,8 @@ float voxelOcclusion(VSOutput input, int3 normal) {
 
 [shader("fragment")]
 float4 meshFrag(VSOutput input) : SV_Target {
-    // The triangle's outward normal, from screen derivatives. Taken before
-    // any branch, so every pixel of the quad takes part.
+    // The triangle's outward normal, from screen derivatives. Taken before any branch, so
+    // every pixel of the quad takes part.
     float3 faceNormal = normalize(cross(ddy(input.voxelPosition), ddx(input.voxelPosition)));
     if (input.kind == KIND_COLORED) {
         return float4(input.color, 1.0);
@@ -307,7 +299,7 @@ float4 meshFrag(VSOutput input) : SV_Target {
     float3 toViewer = -normalize(fromCamera);
     // With the shadow pass, the sun's and the lights' shadows are upscaled from it.
     bool shadowPass = ubo.shadow.frameSize.z != 0;
-    ShadowTaps taps;
+    ShadowTaps taps = {};
     float3 sunVisible = float3(-1.0);
     if (shadowPass) {
         taps = shadowTaps(input.position.xy, length(fromCamera));
@@ -334,8 +326,7 @@ float4 meshFrag(VSOutput input) : SV_Target {
     if (!upscaled && !PER_PIXEL_INDIRECT) {
         light.indirect = ambientLight(normal);
     } else if (!upscaled) {
-        float3 gridPosition = input.worldPosition / max(ubo.lighting.shadowGrid.x, 1e-6);
-        light.indirect = indirectLight(gridPosition, normal, toViewer, false);
+        light.indirect = indirectLight(toGrid(input.worldPosition), normal, toViewer, false);
         float occlusionStrength = ubo.lighting.options.x;
         if (input.kind == KIND_GREEDY && occlusionStrength > 0.0) {
             openness = lerp(1.0, voxelOcclusion(input, int3(round(normal))), occlusionStrength);
@@ -353,11 +344,10 @@ float4 meshFrag(VSOutput input) : SV_Target {
 
     // The lights reaching the pixel's tile.
     if (shadowPass && ubo.shadow.lights.x > 0) {
-        uint2 pixel = uint2(input.position.xy);
-        uint tile = (pixel.y / LIGHT_TILE) * ubo.shadow.lights.y + pixel.x / LIGHT_TILE;
-        uint count = tileLights[tile * (TILE_LIGHTS + 1)];
+        uint tile = tileOf(uint2(input.position.xy)) * TILE_WORDS;
+        uint count = tileLights[tile];
         for (uint i = 0; i < count; i++) {
-            uint lightIndex = tileLights[tile * (TILE_LIGHTS + 1) + 1 + i];
+            uint lightIndex = tileLights[tile + 1 + i];
             float3 toLight;
             float distance;
             float3 reaching = lightReaching(lights[lightIndex], input.worldPosition, normal, toLight, distance);
@@ -373,7 +363,8 @@ float4 meshFrag(VSOutput input) : SV_Target {
 
     // What the face reflects: the light reaching it from everywhere when it's rough, and when
     // it's glossy, blending into a sharp reflection, traced by the shadow pass where it could,
-    // or the probes' light from the way the viewer's reflected.
+    // or the probes' light from the way the viewer's reflected, the sky's and ground's without
+    // `PER_PIXEL_INDIRECT`.
     float3 lit = light.direct + light.indirect;
     float3 reflection = lit;
     if (glossy) {
@@ -381,11 +372,12 @@ float4 meshFrag(VSOutput input) : SV_Target {
         bool found = false;
         float3 sharp = float3(0.0);
         if (shadowPass) {
-            sharp = upscaledByFace(reflectionTexels, taps, faceNumber(round(normal)), found);
+            sharp = upscaledByFace(reflectionTexels, taps, faceNumber(normal), found);
         }
         if (!found) {
-            float3 gridPosition = input.worldPosition / max(ubo.lighting.shadowGrid.x, 1e-6);
-            sharp = indirectLight(gridPosition, reflected, toViewer, false);
+            sharp = PER_PIXEL_INDIRECT
+                ? indirectLight(toGrid(input.worldPosition), reflected, toViewer, false)
+                : ambientLight(reflected);
         }
         float sharpness = saturate(1.0 - roughness / GLOSSY_ROUGHNESS);
         reflection = lerp(lit, sharp + highlights, sharpness);
@@ -393,7 +385,7 @@ float4 meshFrag(VSOutput input) : SV_Target {
 
     switch (debugView) {
     case DEBUG_LIGHT:
-        return float4(light.direct + light.indirect, 1.0);
+        return float4(lit, 1.0);
     case DEBUG_DIRECT:
         return float4(light.direct, 1.0);
     case DEBUG_INDIRECT:

@@ -11,12 +11,13 @@ mod setup;
 
 pub use crate::gi::{GiConfig, MAX_CASCADES, ProbeTuning};
 pub use crate::lights::{Light, MAX_LIGHTS, Spot};
-pub use crate::timings::GpuTimings;
+pub use crate::timings::{GpuStage, GpuTimings};
 pub use capture::Capture;
 pub use config::RendererConfig;
 pub use debug::{FrameStats, MeshPoolStats};
+pub(crate) use lighting::LightingUniforms;
 pub use lighting::{
-    DebugView, Lighting, LightingUniforms, MAX_SHADOW_LEVELS, ShadowGrid, ShadowResolution,
+    DebugView, Lighting, MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS, ShadowGrid, ShadowResolution,
 };
 pub use palette::Material;
 
@@ -27,16 +28,19 @@ use crate::{
     cull::Culler,
     gi::ProbeVolume,
     hiz::DepthPyramid,
+    lights::GpuLight,
     mesh::{MeshId, MeshPool},
     queue::{Queue, QueueFamily},
     shadows::ShadowPass,
     surface::Surface,
     swapchain::Swapchain,
     sync::create_semaphore,
+    timings::FrameTimestamps,
     vertex::{Index, Vertex},
 };
 use ash::{khr, prelude::VkResult, vk};
-use glam::Mat4;
+use glam::{IVec4, Mat4};
+use std::collections::HashMap;
 
 /// Everything drawn by one `Renderer::submit`.
 #[derive(Clone, Copy, Default)]
@@ -74,7 +78,7 @@ pub struct Renderer {
     /// The point and spot lights lighting chunk meshes, and the light probes, the first
     /// `MAX_LIGHTS` of them. Each pixel's brightest `Lighting::shadowed_lights` are shadowed,
     /// in the `Lighting::shadow_grid`, at the `Lighting::shadow_resolution`. With any, frames
-    /// draw their depth first, as below full resolution. Changes take effect next frame.
+    /// draw their depth first, as with shadows. Changes take effect next frame.
     pub lights: Vec<Light>,
 
     mesh_pool: MeshPool,
@@ -84,15 +88,17 @@ pub struct Renderer {
     depth_pyramid: DepthPyramid,
     /// The light probes, a single unused one when there's no `RendererConfig::global_illumination`.
     probe_volume: ProbeVolume,
-    /// Sun shadows traced below full resolution, see `Lighting::shadow_resolution`.
+    /// Traces shadows and reflections, and finds the light from everywhere but the sun, from
+    /// each frame's depth, see `uses_shadow_pass`.
     shadow_pass: ShadowPass,
+    /// Whether there's a `RendererConfig::global_illumination`.
     gi_configured: bool,
     /// Frames submitted, which seeds each frame's probe rays.
     frame_number: u64,
     /// What `debug_frame_stats` reads back.
     last_frame: Option<debug::LastFrame>,
     /// Timestamps between each frame in flight's stages, null pools when the queue has none.
-    frame_timestamps: Vec<crate::timings::FrameTimestamps>,
+    frame_timestamps: Vec<FrameTimestamps>,
     /// The last finished frame's, see `debug_gpu_timings`.
     gpu_timings: Option<GpuTimings>,
     /// Whether the next frame is copied into `capture_buffers`.
@@ -145,10 +151,12 @@ pub struct Renderer {
     changed_chunks: Vec<u32>,
     /// Each frame's `lights`.
     frame_light_buffers: Vec<DynamicBuffer>,
+    /// Reused to build each frame's lights in.
+    gpu_lights: Vec<GpuLight>,
     /// The serial of each chunk in last frame's shadow table, by chunk coordinate, then level.
-    chunk_serials: std::collections::HashMap<glam::IVec4, u64>,
+    chunk_serials: HashMap<IVec4, u64>,
     /// This frame's, built while the shadow table is.
-    chunk_serials_next: std::collections::HashMap<glam::IVec4, u64>,
+    chunk_serials_next: HashMap<IVec4, u64>,
     /// Last frame's lighting, to notice changes in it.
     previous_lighting: Option<Lighting>,
     /// The faster converging probes still under way.
@@ -158,7 +166,7 @@ pub struct Renderer {
 
     /// Draws the mesh pool's meshes, pulling their vertices.
     mesh_pipeline: vk::Pipeline,
-    /// Draws the mesh pool's meshes' depth alone, for shadows traced below full resolution.
+    /// Draws the mesh pool's meshes' depth alone, for the shadow pass.
     mesh_depth_pipeline: vk::Pipeline,
     /// Draws the mesh pool's meshes' color over their depth already drawn.
     mesh_over_depth_pipeline: vk::Pipeline,
@@ -291,42 +299,30 @@ impl Renderer {
         self.init_depth_pyramid_layout()
     }
 
+    /// Readies a new depth pyramid, waiting for the device.
     fn init_depth_pyramid_layout(&self) -> VkResult<()> {
-        record_submit_commandbuffer(
-            &self.render_device,
-            self.init_cmd_buffer,
-            self.init_cmd_fence,
-            self.graphics_queue.handle,
-            &[],
-            &[],
-            &[],
-            |cmd_buffer| unsafe {
-                self.depth_pyramid
-                    .cmd_init_layout(&self.render_device, cmd_buffer)
-            },
-        )
+        self.run_init_commands(|cmd_buffer| unsafe {
+            self.depth_pyramid
+                .cmd_init_layout(&self.render_device, cmd_buffer)
+        })
     }
 
-    /// Readies a new shadow image, waiting for the device.
+    /// Readies new shadow pass images, waiting for the device.
     fn init_shadow_pass(&self) -> VkResult<()> {
-        record_submit_commandbuffer(
-            &self.render_device,
-            self.init_cmd_buffer,
-            self.init_cmd_fence,
-            self.graphics_queue.handle,
-            &[],
-            &[],
-            &[],
-            |cmd_buffer| unsafe { self.shadow_pass.cmd_init(&self.render_device, cmd_buffer) },
-        )?;
-        unsafe {
-            self.render_device
-                .wait_for_fences(&[self.init_cmd_fence], true, u64::MAX)
-        }
+        self.run_init_commands(|cmd_buffer| unsafe {
+            self.shadow_pass.cmd_init(&self.render_device, cmd_buffer)
+        })
     }
 
     /// Readies the light probes, waiting for the device.
     fn init_probe_volume(&self) -> VkResult<()> {
+        self.run_init_commands(|cmd_buffer| unsafe {
+            self.probe_volume.cmd_init(&self.render_device, cmd_buffer)
+        })
+    }
+
+    /// Records `record` into the init command buffer, submits it and waits for it to finish.
+    fn run_init_commands(&self, record: impl FnOnce(vk::CommandBuffer)) -> VkResult<()> {
         record_submit_commandbuffer(
             &self.render_device,
             self.init_cmd_buffer,
@@ -335,7 +331,7 @@ impl Renderer {
             &[],
             &[],
             &[],
-            |cmd_buffer| unsafe { self.probe_volume.cmd_init(&self.render_device, cmd_buffer) },
+            record,
         )?;
         unsafe {
             self.render_device

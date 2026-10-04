@@ -7,6 +7,8 @@
 //! Greedy meshing merges each side into one quad, yet each voxel keeps its own color:
 //! the renderer looks up the voxel under every pixel in the chunk's voxel types.
 
+#[path = "common/camera.rs"]
+mod camera;
 #[path = "common/greedy.rs"]
 mod greedy;
 #[path = "common/title.rs"]
@@ -15,13 +17,11 @@ mod title;
 use anyhow::Result;
 use ash::vk;
 use glam::{Mat4, Vec3};
-use greedy::{ChunkMask, EDGE};
 use std::time::Instant;
 use vrs::{
     App,
     mesh::MeshId,
     renderer::{DrawList, Renderer},
-    voxel::{ChunkMesh, ChunkVertices, VoxelTypes},
 };
 use winit::{
     application::ApplicationHandler,
@@ -44,29 +44,19 @@ const ORBIT_SPEED: f32 = 0.6;
 fn create_cube(renderer: &mut Renderer) -> Result<MeshId> {
     renderer.set_palette(&PALETTE);
     let inside = |x: i32, y: i32, z: i32| [x, y, z].iter().all(|&v| (0..CUBE as i32).contains(&v));
-    let mesh = greedy::mesh(&ChunkMask::from_fn(inside));
-    let types: Vec<u16> = (0..EDGE.pow(3))
-        .map(|index| {
-            let (x, y, z) = (index % EDGE, index / EDGE % EDGE, index / EDGE.pow(2));
-            match inside(x as i32, y as i32, z as i32) {
-                true => 1 + ((x + y + z) % 2) as u16,
-                false => 0,
-            }
-        })
-        .collect();
-    Ok(renderer.create_chunk_mesh(&ChunkMesh {
-        indices: &mesh.indices,
-        vertices: ChunkVertices::Greedy(&mesh.vertices),
-        // Centered on the origin.
-        origin: Vec3::splat(-0.5),
-        voxel_size: VOXEL_SIZE,
-        types: &VoxelTypes::pack(EDGE as u32, &types),
-    })?)
+    let types = greedy::chunk_types(|x, y, z| match inside(x, y, z) {
+        true => 1 + (x + y + z) as u16 % 2,
+        false => 0,
+    });
+    // Centered on the origin.
+    let origin = Vec3::splat(-0.5);
+    let cube = greedy::create_chunk(renderer, origin, VOXEL_SIZE, &types, inside)?;
+    Ok(cube.expect("The cube has voxels."))
 }
 
 struct Vulkan {
     cube: MeshId,
-    // NOTE: Field order matters, the renderer must be dropped before the app.
+    // Fields drop in order, so the renderer drops before the app.
     renderer: Renderer,
     _app: App,
 }
@@ -96,7 +86,7 @@ impl Vulkan {
 struct Cube {
     started: Instant,
     title: title::FrameTitle,
-    // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
+    // Fields drop in order, so Vulkan drops before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
 }
@@ -134,9 +124,7 @@ impl ApplicationHandler for Cube {
                 let eye = Vec3::new(2.2 * angle.sin(), 1.4, 2.2 * angle.cos());
                 let view = Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
                 let aspect = size.width as f32 / size.height as f32;
-                // glam's projection is OpenGL's, with y up, Vulkan's clip space has y down.
-                let mut proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
-                proj.y_axis.y = -proj.y_axis.y;
+                let proj = camera::perspective(60.0, aspect, 0.1, 100.0);
 
                 let draws = DrawList {
                     meshes: &[&vulkan.cube],

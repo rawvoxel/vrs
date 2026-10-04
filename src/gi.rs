@@ -1,13 +1,16 @@
-//! Dynamic diffuse global illumination: a volume of light probes around the camera, each
+//! Dynamic diffuse global illumination: cascades of light probes around the camera, each
 //! storing the light reaching it from every direction and how far away the nearest voxels
-//! are, traced through the voxels every frame and sampled when shading. See `gi.slang`.
+//! are, those near voxels traced through them in turns and sampled when shading. See
+//! `gi.slang`.
 
 use crate::{
     adapter::Adapter,
+    bindings,
     buffer::Buffer,
-    image::{Image, create_image_view},
+    image::StorageImage,
     pipeline::create_shader_module,
-    timings::{FrameTimestamps, Mark},
+    sync::cmd_memory_barrier,
+    timings::{FrameTimestamps, GpuStage},
     voxel::VoxelTypes,
 };
 use ash::{prelude::VkResult, vk};
@@ -161,12 +164,14 @@ pub struct GiUniforms {
     pub frame: [u32; 4],
     /// `ProbeTuning`'s hysteresis, depth hysteresis, depth sharpness and self-shadow bias.
     pub tuning: [f32; 4],
-    /// `ProbeTuning`'s ray distance, the rest unused.
+    /// `ProbeTuning`'s ray distance, then this frame's multipliers of the hysteresis for
+    /// light and for distances, below 1 while the probes converge faster after a change.
     pub rays: [f32; 4],
 }
 
 /// How the light probes blend what they see and are sampled, see `Lighting::probe_tuning`.
-/// The defaults are the papers' [Majercik et al. 2019 and 2021].
+/// The hysteresis, depth sharpness and self-shadow bias default to the papers' [Majercik et
+/// al. 2019 and 2021].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProbeTuning {
     /// How much of a probe's light each frame keeps, from 0 to 1. Higher is steadier but
@@ -180,8 +185,8 @@ pub struct ProbeTuning {
     /// How far off a surface probes' visibility is tested, in probe spacings. Higher leaks
     /// less shadow into lit areas, too high leaks light through thin walls.
     pub self_shadow_bias: f32,
-    /// How far probes' rays reach, in the `ShadowGrid`'s voxels. Further finds more distant
-    /// light, at more cost.
+    /// How far the finest cascade's probes' rays reach, in the `ShadowGrid`'s finest voxels,
+    /// twice as far in each coarser one. Further finds more distant light, at more cost.
     pub ray_distance: f32,
     /// Frames between each probe's updates in the finest cascade, rounded up to a power of
     /// two from 1 to 16, twice as many in each coarser one. The probes take turns, and each
@@ -217,10 +222,8 @@ pub(crate) struct ProbeVolume {
     pub probe_buffer: Buffer,
     pub ray_buffer: Buffer,
     pub active_buffer: Buffer,
-    pub irradiance: Image,
-    pub irradiance_view: vk::ImageView,
-    pub depth: Image,
-    pub depth_view: vk::ImageView,
+    pub irradiance: StorageImage,
+    pub depth: StorageImage,
     pub sampler: vk::Sampler,
     pub classify: vk::Pipeline,
     pub trace: vk::Pipeline,
@@ -241,10 +244,8 @@ impl ProbeVolume {
             probe_buffer: Buffer::null(),
             ray_buffer: Buffer::null(),
             active_buffer: Buffer::null(),
-            irradiance: Image::null(),
-            irradiance_view: vk::ImageView::null(),
-            depth: Image::null(),
-            depth_view: vk::ImageView::null(),
+            irradiance: StorageImage::null(),
+            depth: StorageImage::null(),
             sampler: vk::Sampler::null(),
             classify: vk::Pipeline::null(),
             trace: vk::Pipeline::null(),
@@ -320,46 +321,22 @@ impl ProbeVolume {
         if self.atlas_columns.max(rows) * (DEPTH_TEXELS + 2) > max_dimension {
             return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
         }
-        for (image, view, texels) in [
-            (
-                &mut self.irradiance,
-                &mut self.irradiance_view,
-                IRRADIANCE_TEXELS,
-            ),
-            (&mut self.depth, &mut self.depth_view, DEPTH_TEXELS),
+        for (atlas, texels) in [
+            (&mut self.irradiance, IRRADIANCE_TEXELS),
+            (&mut self.depth, DEPTH_TEXELS),
         ] {
             let tile = texels + 2;
-            let info = vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(ATLAS_FORMAT)
-                .extent(vk::Extent3D {
-                    width: self.atlas_columns * tile,
-                    height: rows * tile,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(
-                    vk::ImageUsageFlags::STORAGE
-                        | vk::ImageUsageFlags::SAMPLED
-                        | vk::ImageUsageFlags::TRANSFER_DST,
-                )
-                .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                .initial_layout(vk::ImageLayout::UNDEFINED);
-            *image = Image::new(
+            let extent = vk::Extent2D {
+                width: self.atlas_columns * tile,
+                height: rows * tile,
+            };
+            // Cleared by `cmd_init`.
+            *atlas = StorageImage::new(
                 adapter,
                 logical_device,
-                info,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )?;
-            *view = create_image_view(
-                logical_device,
-                image.handle,
+                extent,
                 ATLAS_FORMAT,
-                vk::ComponentMapping::default(),
-                vk::ImageAspectFlags::COLOR,
+                vk::ImageUsageFlags::TRANSFER_DST,
             )?;
         }
 
@@ -430,7 +407,8 @@ impl ProbeVolume {
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .level_count(1)
             .layer_count(1);
-        let to_general = [self.irradiance.handle, self.depth.handle].map(|image| {
+        let atlases = [self.irradiance.image.handle, self.depth.image.handle];
+        let to_general = atlases.map(|image| {
             vk::ImageMemoryBarrier2::default()
                 .dst_stage_mask(vk::PipelineStageFlags2::CLEAR)
                 .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
@@ -444,7 +422,7 @@ impl ProbeVolume {
                 cmd_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&to_general),
             );
-            for image in [self.irradiance.handle, self.depth.handle] {
+            for image in atlases {
                 logical_device.cmd_clear_color_image(
                     cmd_buffer,
                     image,
@@ -475,8 +453,8 @@ impl ProbeVolume {
         }
     }
 
-    /// Points bindings 6 to 12 of every frame's descriptor set at the volume, matching
-    /// `common.slang`. They never move.
+    /// Points the probes' bindings of every frame's descriptor set at the volume. They never
+    /// move.
     pub fn write_descriptors(&self, logical_device: &ash::Device, sets: &[vk::DescriptorSet]) {
         let buffer = |buffer: &Buffer| {
             vk::DescriptorBufferInfo::default()
@@ -492,29 +470,26 @@ impl ProbeVolume {
         let probes = buffer(&self.probe_buffer);
         let rays = buffer(&self.ray_buffer);
         let active = buffer(&self.active_buffer);
-        let irradiance_sampled = image(self.irradiance_view, self.sampler);
-        let depth_sampled = image(self.depth_view, self.sampler);
-        let irradiance_storage = image(self.irradiance_view, vk::Sampler::null());
-        let depth_storage = image(self.depth_view, vk::Sampler::null());
+        let irradiance_sampled = image(self.irradiance.view, self.sampler);
+        let depth_sampled = image(self.depth.view, self.sampler);
+        let irradiance_storage = image(self.irradiance.view, vk::Sampler::null());
+        let depth_storage = image(self.depth.view, vk::Sampler::null());
         for &set in sets {
-            let write = |binding: u32, ty: vk::DescriptorType| {
+            let write = |binding: u32| {
                 vk::WriteDescriptorSet::default()
                     .dst_set(set)
                     .dst_binding(binding)
-                    .descriptor_type(ty)
+                    .descriptor_type(bindings::TYPES_BY_BINDING[binding as usize])
             };
             let writes = [
-                write(6, vk::DescriptorType::STORAGE_BUFFER).buffer_info(slice::from_ref(&probes)),
-                write(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(slice::from_ref(&irradiance_sampled)),
-                write(8, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .image_info(slice::from_ref(&depth_sampled)),
-                write(9, vk::DescriptorType::STORAGE_IMAGE)
+                write(bindings::PROBES).buffer_info(slice::from_ref(&probes)),
+                write(bindings::PROBE_IRRADIANCE).image_info(slice::from_ref(&irradiance_sampled)),
+                write(bindings::PROBE_DEPTH).image_info(slice::from_ref(&depth_sampled)),
+                write(bindings::PROBE_IRRADIANCE_STORAGE)
                     .image_info(slice::from_ref(&irradiance_storage)),
-                write(10, vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(slice::from_ref(&depth_storage)),
-                write(11, vk::DescriptorType::STORAGE_BUFFER).buffer_info(slice::from_ref(&rays)),
-                write(12, vk::DescriptorType::STORAGE_BUFFER).buffer_info(slice::from_ref(&active)),
+                write(bindings::PROBE_DEPTH_STORAGE).image_info(slice::from_ref(&depth_storage)),
+                write(bindings::PROBE_RAYS).buffer_info(slice::from_ref(&rays)),
+                write(bindings::ACTIVE_PROBES).buffer_info(slice::from_ref(&active)),
             ];
             unsafe { logical_device.update_descriptor_sets(&writes, &[]) };
         }
@@ -535,21 +510,11 @@ impl ProbeVolume {
         layout: vk::PipelineLayout,
         timestamps: &FrameTimestamps,
     ) {
-        let barrier = |src_stage, src_access, dst_stage, dst_access| {
-            let barrier = vk::MemoryBarrier2::default()
-                .src_stage_mask(src_stage)
-                .src_access_mask(src_access)
-                .dst_stage_mask(dst_stage)
-                .dst_access_mask(dst_access);
-            unsafe {
-                logical_device.cmd_pipeline_barrier2(
-                    cmd_buffer,
-                    &vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier)),
-                )
-            };
-        };
+        let barrier =
+            |src, dst| unsafe { cmd_memory_barrier(logical_device, cmd_buffer, src, dst) };
         let compute = vk::PipelineStageFlags2::COMPUTE_SHADER;
-        let read_write = vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
+        let write = vk::AccessFlags2::SHADER_WRITE;
+        let read_write = vk::AccessFlags2::SHADER_READ | write;
         let dispatch = |pipeline: vk::Pipeline, offset: vk::DeviceSize| unsafe {
             logical_device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
             logical_device.cmd_dispatch_indirect(cmd_buffer, self.active_buffer.handle, offset);
@@ -559,15 +524,19 @@ impl ProbeVolume {
             // Last frame's shading and updates are done with the volume, and its dispatches
             // with the active count.
             barrier(
-                compute
-                    | vk::PipelineStageFlags2::FRAGMENT_SHADER
-                    | vk::PipelineStageFlags2::DRAW_INDIRECT,
-                vk::AccessFlags2::SHADER_WRITE,
-                compute | vk::PipelineStageFlags2::CLEAR,
-                read_write | vk::AccessFlags2::TRANSFER_WRITE,
+                (
+                    compute
+                        | vk::PipelineStageFlags2::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                    write,
+                ),
+                (
+                    compute | vk::PipelineStageFlags2::CLEAR,
+                    read_write | vk::AccessFlags2::TRANSFER_WRITE,
+                ),
             );
             // No active probes yet: dispatches one group high and deep, none wide.
-            let groups = [0u32, 1, 1, 0, 1, 1, 0, 0];
+            let groups: [u32; ACTIVE_LIST as usize] = [0, 1, 1, 0, 1, 1, 0, 0];
             logical_device.cmd_update_buffer(
                 cmd_buffer,
                 self.active_buffer.handle,
@@ -575,10 +544,11 @@ impl ProbeVolume {
                 crate::bytes::slice_as_bytes(&groups),
             );
             barrier(
-                vk::PipelineStageFlags2::CLEAR,
-                vk::AccessFlags2::TRANSFER_WRITE,
-                compute,
-                read_write,
+                (
+                    vk::PipelineStageFlags2::CLEAR,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                ),
+                (compute, read_write),
             );
 
             logical_device.cmd_bind_descriptor_sets(
@@ -600,37 +570,39 @@ impl ProbeVolume {
                 1,
                 1,
             );
-            barrier(compute, vk::AccessFlags2::SHADER_WRITE, compute, read_write);
+            barrier((compute, write), (compute, read_write));
             logical_device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::COMPUTE, self.plan);
             logical_device.cmd_dispatch(cmd_buffer, 1, 1, 1);
-            timestamps.mark(logical_device, cmd_buffer, Mark::GiClassify);
+            timestamps.cmd_mark(logical_device, cmd_buffer, GpuStage::ProbeClassification);
             barrier(
-                compute,
-                vk::AccessFlags2::SHADER_WRITE,
-                compute | vk::PipelineStageFlags2::DRAW_INDIRECT,
-                read_write | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                (compute, write),
+                (
+                    compute | vk::PipelineStageFlags2::DRAW_INDIRECT,
+                    read_write | vk::AccessFlags2::INDIRECT_COMMAND_READ,
+                ),
             );
 
             // One group per 32 rays, then one per active probe.
             dispatch(self.trace, 0);
-            timestamps.mark(logical_device, cmd_buffer, Mark::GiTrace);
+            timestamps.cmd_mark(logical_device, cmd_buffer, GpuStage::ProbeRays);
             // The rays are written, and tracing is done sampling the atlases.
-            barrier(compute, vk::AccessFlags2::SHADER_WRITE, compute, read_write);
+            barrier((compute, write), (compute, read_write));
             dispatch(self.update_irradiance, UPDATE_GROUPS);
             dispatch(self.update_depth, UPDATE_GROUPS);
-            timestamps.mark(logical_device, cmd_buffer, Mark::GiUpdate);
+            timestamps.cmd_mark(logical_device, cmd_buffer, GpuStage::ProbeUpdates);
             barrier(
-                compute,
-                vk::AccessFlags2::SHADER_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER | compute,
-                vk::AccessFlags2::SHADER_READ,
+                (compute, write),
+                (
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER | compute,
+                    vk::AccessFlags2::SHADER_READ,
+                ),
             );
         }
     }
 
     /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
-    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, logical_device: &ash::Device) {
         unsafe {
             for pipeline in [
                 self.classify,
@@ -642,8 +614,6 @@ impl ProbeVolume {
                 logical_device.destroy_pipeline(pipeline, None);
             }
             logical_device.destroy_sampler(self.sampler, None);
-            logical_device.destroy_image_view(self.irradiance_view, None);
-            logical_device.destroy_image_view(self.depth_view, None);
             self.irradiance.destroy(logical_device);
             self.depth.destroy(logical_device);
             for buffer in [&self.probe_buffer, &self.ray_buffer, &self.active_buffer] {

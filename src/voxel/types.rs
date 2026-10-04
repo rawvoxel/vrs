@@ -9,7 +9,7 @@
 //! a word.
 
 /// Voxels along each edge of a block of `VoxelTypes::occupancy`. Matches `OCCUPANCY_BLOCK` in
-/// `mesh.slang`.
+/// `common.slang`.
 pub const OCCUPANCY_BLOCK: u32 = 8;
 
 /// One chunk's voxel types, see the module docs. Type 0 is empty space.
@@ -147,7 +147,7 @@ impl VoxelTypes {
             .collect()
     }
 
-    /// The type id of voxel `(x, y, z)`, decoded the way `mesh.slang` decodes it.
+    /// The type id of voxel `(x, y, z)`, decoded the way `typeAt` in `common.slang` decodes it.
     pub fn type_at(&self, x: u32, y: u32, z: u32) -> u16 {
         let edge = self.voxels_per_edge;
         let index = x + edge * (y + edge * z);

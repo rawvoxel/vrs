@@ -41,7 +41,7 @@ impl Mesh {
 }
 
 /// A mesh's record in `MeshPool::info_buffer`, which culling reads to build its draw and the
-/// mesh shaders read to draw it. Matches `MeshInfo` in `cull.slang` and `mesh.slang`.
+/// mesh shaders read to draw it. Matches `MeshInfo` in `cull.slang` and `common.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MeshInfo {

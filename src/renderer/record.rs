@@ -4,10 +4,13 @@ use super::{Renderer, frame::FrameData};
 use crate::{
     cull::{DRAW_STRIDE, Phase},
     image,
-    timings::Mark,
+    timings::GpuStage,
 };
 use ash::{prelude::VkResult, vk};
 use std::slice;
+
+/// Vertices `probes.slang` draws each probe's cube with, 2 triangles a face.
+const PROBE_CUBE_VERTICES: u32 = 36;
 
 impl Renderer {
     /// Records the frame's command buffer.
@@ -15,8 +18,8 @@ impl Renderer {
     /// With occlusion culling: phase 1 culling, pass 1, the depth pyramid,
     /// phase 2 culling and pass 2. Without, frustum culling and one pass.
     ///
-    /// With shadows below full resolution, those passes draw only depth, then the shadows are
-    /// traced from it, then one more pass draws color over the depth.
+    /// With the shadow pass, see `Renderer::uses_shadow_pass`, those passes draw only depth,
+    /// then the shadow pass traces from it, then one more pass draws color over the depth.
     pub(super) fn record_frame(
         &mut self,
         frame: usize,
@@ -41,10 +44,10 @@ impl Renderer {
 
             self.frame_timestamps[frame].cmd_start(&self.render_device, cmd_buffer);
             let timestamps = &self.frame_timestamps[frame];
-            let mark = |mark| timestamps.mark(&self.render_device, cmd_buffer, mark);
+            let mark = |stage| timestamps.cmd_mark(&self.render_device, cmd_buffer, stage);
             self.mesh_pool
                 .cmd_upload(&self.render_device, frame, cmd_buffer);
-            mark(Mark::Uploads);
+            mark(GpuStage::Uploads);
             if data.gi {
                 self.probe_volume.cmd_update(
                     &self.render_device,
@@ -66,7 +69,7 @@ impl Renderer {
                     &data.candidates,
                 )?;
                 self.cmd_cull(cmd_buffer, frame, data, first_phase);
-                mark(Mark::Culling);
+                mark(GpuStage::Culling);
             }
 
             self.cmd_begin_attachments(cmd_buffer, image_index);
@@ -93,7 +96,7 @@ impl Renderer {
                 self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
             }
             self.render_device.cmd_end_rendering(cmd_buffer);
-            mark(Mark::FirstPass);
+            mark(GpuStage::FirstPass);
 
             let load = vk::AttachmentLoadOp::LOAD;
             if occlusion {
@@ -112,7 +115,7 @@ impl Renderer {
                     mesh_pipeline,
                 );
                 self.render_device.cmd_end_rendering(cmd_buffer);
-                mark(Mark::OcclusionPass);
+                mark(GpuStage::OcclusionPass);
             }
 
             if !shaded {
@@ -149,17 +152,22 @@ impl Renderer {
                     self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
                 }
                 self.render_device.cmd_end_rendering(cmd_buffer);
-                mark(Mark::ColorPass);
+                mark(GpuStage::ColorPass);
             }
 
             if data.draw_probes {
                 self.cmd_begin_rendering(cmd_buffer, Some((color_view, load)), load);
                 self.cmd_bind_graphics(cmd_buffer, frame);
                 self.cmd_bind_pipeline(cmd_buffer, self.probes_pipeline);
-                self.render_device
-                    .cmd_draw(cmd_buffer, 36, self.probe_volume.probe_count(), 0, 0);
+                self.render_device.cmd_draw(
+                    cmd_buffer,
+                    PROBE_CUBE_VERTICES,
+                    self.probe_volume.probe_count(),
+                    0,
+                    0,
+                );
                 self.render_device.cmd_end_rendering(cmd_buffer);
-                mark(Mark::ProbeOverlay);
+                mark(GpuStage::ProbeOverlay);
             }
 
             let image = self.swapchain.present_images[image_index as usize];
@@ -321,21 +329,18 @@ impl Renderer {
         color: Option<(vk::ImageView, vk::AttachmentLoadOp)>,
         depth_load_op: vk::AttachmentLoadOp,
     ) {
-        let color_attachment_infos: Vec<vk::RenderingAttachmentInfo> = color
-            .map(|(view, load_op)| {
-                vk::RenderingAttachmentInfo::default()
-                    .image_view(view)
-                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .load_op(load_op)
-                    .store_op(vk::AttachmentStoreOp::STORE)
-                    .clear_value(vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: self.clear_color,
-                        },
-                    })
-            })
-            .into_iter()
-            .collect();
+        let color_attachment = color.map(|(view, load_op)| {
+            vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(load_op)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: self.clear_color,
+                    },
+                })
+        });
         let depth_attachment_info = vk::RenderingAttachmentInfo::default()
             .image_view(self.swapchain.depth_image_view)
             .image_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
@@ -349,7 +354,7 @@ impl Renderer {
             });
         let rendering_info = vk::RenderingInfo::default()
             .render_area(self.swapchain.extent.into())
-            .color_attachments(&color_attachment_infos)
+            .color_attachments(color_attachment.as_slice())
             .depth_attachment(&depth_attachment_info)
             .layer_count(1);
         unsafe {
@@ -358,7 +363,8 @@ impl Renderer {
         };
     }
 
-    /// The pass's dynamic state and this frame's descriptors, which both graphics pipelines share.
+    /// The pass's dynamic state and this frame's descriptors, which every graphics pipeline
+    /// shares.
     fn cmd_bind_graphics(&self, cmd_buffer: vk::CommandBuffer, frame: usize) {
         let extent = self.swapchain.extent;
         let viewport = vk::Viewport::default()

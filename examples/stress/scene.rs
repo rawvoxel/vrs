@@ -20,8 +20,8 @@ pub const CHUNK_Z: f32 = 0.5;
 pub const WALL_Z: f32 = 0.2;
 pub const WALL_HALF_SIZE: f32 = 0.5;
 /// Voxels along each edge of a chunk, and of the wall.
-pub const EDGE: u32 = 4;
-pub const VOXEL_SIZE: f32 = CHUNK_SIZE / EDGE as f32;
+pub const SLAB_EDGE: u32 = 4;
+pub const VOXEL_SIZE: f32 = CHUNK_SIZE / SLAB_EDGE as f32;
 /// Shades take palette entries 1 to 10, 0 is empty space.
 const SHADES: u32 = 10;
 const WALL_TYPE: u16 = SHADES as u16 + 1;
@@ -82,28 +82,28 @@ pub fn voxel_slab(
     packed: bool,
     facing_away: bool,
 ) -> Result<MeshId, vk::Result> {
-    let voxels: Vec<u16> = (0..EDGE.pow(3))
+    let voxels: Vec<u16> = (0..SLAB_EDGE.pow(3))
         .map(|index| {
-            let (x, z) = (index % EDGE, index / (EDGE * EDGE));
-            match (z, x < EDGE / 2) {
+            let (x, z) = (index % SLAB_EDGE, index / (SLAB_EDGE * SLAB_EDGE));
+            match (z, x < SLAB_EDGE / 2) {
                 (1, true) => types[0],
                 (1, false) => types[1],
                 _ => 0,
             }
         })
         .collect();
-    let types = VoxelTypes::pack(EDGE, &voxels);
+    let types = VoxelTypes::pack(SLAB_EDGE, &voxels);
 
-    let edge = EDGE as f32;
+    let edge = SLAB_EDGE as f32;
     let corners = [
         Vec3::new(0.0, 0.0, 1.0),
         Vec3::new(edge, 0.0, 1.0),
         Vec3::new(0.0, edge, 1.0),
         Vec3::new(edge, edge, 1.0),
     ];
-    let greedy = corners.map(|corner| GreedyVertex::new(corner, Face::NegZ, EDGE).unwrap());
+    let greedy = corners.map(|corner| GreedyVertex::new(corner, Face::NegZ, SLAB_EDGE).unwrap());
     let packed_vertices =
-        corners.map(|corner| PackedVertex::new(corner, Vec3::NEG_Z, EDGE).unwrap());
+        corners.map(|corner| PackedVertex::new(corner, Vec3::NEG_Z, SLAB_EDGE).unwrap());
     // Front faces wind counter-clockwise on screen.
     let indices = match facing_away {
         false => [0, 2, 1, 1, 2, 3],
@@ -241,7 +241,7 @@ impl Scene {
             self.wall = Some(voxel_slab(
                 &mut self.renderer,
                 Vec3::new(-WALL_HALF_SIZE, -WALL_HALF_SIZE, WALL_Z),
-                size / EDGE as f32,
+                size / SLAB_EDGE as f32,
                 [WALL_TYPE; 2],
                 false,
                 wall_faces_away,

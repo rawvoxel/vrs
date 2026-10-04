@@ -36,7 +36,7 @@ const VERTICES: [Vertex; 3] = [
 
 struct Vulkan {
     triangle: MeshId,
-    // NOTE: Field order matters, the renderer must be dropped before the app.
+    // Fields drop in order, so the renderer drops before the app.
     renderer: Renderer,
     _app: App,
 }
@@ -66,7 +66,7 @@ impl Vulkan {
 
 struct Triangle {
     title: title::FrameTitle,
-    // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
+    // Fields drop in order, so Vulkan drops before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
 }

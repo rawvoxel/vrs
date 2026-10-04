@@ -1,6 +1,7 @@
 //! The stages `Renderer::submit` runs a frame in, around recording it.
 
 use super::{DrawList, Renderer};
+use crate::bindings;
 use crate::uniforms::{FrameUniforms, MvpMatrices};
 use ash::{prelude::VkResult, vk};
 use glam::Mat4;
@@ -32,104 +33,87 @@ impl FrameData {
 
 impl Renderer {
     /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces, its
-    /// palette and shadow table, which growing replaces, and the depth buffer and shadow image,
-    /// which resizing replaces. The uniforms and light probes never move.
+    /// palette, shadow table, changed chunks and lights, which growing replaces, and the depth
+    /// buffer and the shadow pass's images and tiles, which resizing replaces. The uniforms
+    /// and light probes never move.
     ///
     /// # Safety
     /// The device must not be using `frame`'s descriptor set.
     unsafe fn write_frame_descriptors(&self, frame: usize) {
-        let buffer_infos = [
-            self.mesh_pool.vertex_buffer.handle,
-            self.mesh_pool.info_buffer.handle,
-            self.mesh_pool.type_buffer.handle,
-            self.frame_palette_buffers[frame].buffer.handle,
-            self.frame_shadow_tables[frame].buffer.handle,
-        ]
-        .map(|buffer| {
-            vk::DescriptorBufferInfo::default()
-                .buffer(buffer)
-                .range(vk::WHOLE_SIZE)
-        });
-        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
-            .iter()
-            .enumerate()
-            .map(|(i, buffer_info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.frame_desc_sets[frame])
-                    .dst_binding(1 + i as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(slice::from_ref(buffer_info))
-            })
-            .collect();
-        let shadow_storage = vk::DescriptorImageInfo::default()
-            .image_view(self.shadow_pass.view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let depth_sampled = vk::DescriptorImageInfo::default()
-            .image_view(self.swapchain.depth_image_view)
-            .sampler(self.shadow_pass.sampler)
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        let shadow_sampled = shadow_storage.sampler(self.shadow_pass.sampler);
-        let late_buffers = [
-            (16, self.frame_changed_chunks[frame].buffer.handle),
-            (17, self.frame_light_buffers[frame].buffer.handle),
-            (18, self.shadow_pass.tiles.handle),
+        let buffers = [
+            (bindings::VERTICES, self.mesh_pool.vertex_buffer.handle),
+            (bindings::MESHES, self.mesh_pool.info_buffer.handle),
+            (bindings::TYPES, self.mesh_pool.type_buffer.handle),
+            (
+                bindings::PALETTE,
+                self.frame_palette_buffers[frame].buffer.handle,
+            ),
+            (
+                bindings::SHADOW_TABLE,
+                self.frame_shadow_tables[frame].buffer.handle,
+            ),
+            (
+                bindings::CHANGED_CHUNKS,
+                self.frame_changed_chunks[frame].buffer.handle,
+            ),
+            (
+                bindings::LIGHTS,
+                self.frame_light_buffers[frame].buffer.handle,
+            ),
+            (bindings::TILE_LIGHTS, self.shadow_pass.tiles.handle),
         ]
         .map(|(binding, buffer)| {
-            (
-                binding,
-                vk::DescriptorBufferInfo::default()
-                    .buffer(buffer)
-                    .range(vk::WHOLE_SIZE),
-            )
+            let info = vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .range(vk::WHOLE_SIZE);
+            (binding, info)
         });
-        let late_writes = late_buffers.each_ref().map(|(binding, info)| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(self.frame_desc_sets[frame])
-                .dst_binding(*binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(slice::from_ref(info))
-        });
-        let light_shadow = vk::DescriptorImageInfo::default()
-            .image_view(self.shadow_pass.light_view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let reflection = vk::DescriptorImageInfo::default()
-            .image_view(self.shadow_pass.reflection_view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let indirect = vk::DescriptorImageInfo::default()
-            .image_view(self.shadow_pass.indirect_view)
-            .image_layout(vk::ImageLayout::GENERAL);
-        let image_writes = [
-            (13, vk::DescriptorType::STORAGE_IMAGE, &shadow_storage),
+        let pass = &self.shadow_pass;
+        let general = |view| {
+            vk::DescriptorImageInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::GENERAL)
+        };
+        let depth = vk::DescriptorImageInfo::default()
+            .image_view(self.swapchain.depth_image_view)
+            .sampler(pass.sampler)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let images = [
+            (bindings::SHADOWS_STORAGE, general(pass.shadows.view)),
+            (bindings::DEPTH, depth),
             (
-                14,
-                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                &depth_sampled,
+                bindings::SHADOWS,
+                general(pass.shadows.view).sampler(pass.sampler),
             ),
             (
-                15,
-                vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                &shadow_sampled,
+                bindings::LIGHT_SHADOWS_STORAGE,
+                general(pass.light_shadows.view),
             ),
-            (19, vk::DescriptorType::STORAGE_IMAGE, &light_shadow),
-            (20, vk::DescriptorType::SAMPLED_IMAGE, &light_shadow),
-            (21, vk::DescriptorType::STORAGE_IMAGE, &reflection),
-            (22, vk::DescriptorType::SAMPLED_IMAGE, &reflection),
-            (23, vk::DescriptorType::STORAGE_IMAGE, &indirect),
-            (24, vk::DescriptorType::SAMPLED_IMAGE, &indirect),
-        ]
-        .map(|(binding, ty, info)| {
+            (bindings::LIGHT_SHADOWS, general(pass.light_shadows.view)),
+            (
+                bindings::REFLECTIONS_STORAGE,
+                general(pass.reflections.view),
+            ),
+            (bindings::REFLECTIONS, general(pass.reflections.view)),
+            (bindings::INDIRECT_STORAGE, general(pass.indirect.view)),
+            (bindings::INDIRECT, general(pass.indirect.view)),
+        ];
+        let write = |binding: u32| {
             vk::WriteDescriptorSet::default()
                 .dst_set(self.frame_desc_sets[frame])
                 .dst_binding(binding)
-                .descriptor_type(ty)
-                .image_info(slice::from_ref(info))
-        });
-        unsafe {
-            self.render_device.update_descriptor_sets(&writes, &[]);
-            self.render_device.update_descriptor_sets(&late_writes, &[]);
-            self.render_device
-                .update_descriptor_sets(&image_writes, &[]);
-        }
+                .descriptor_type(bindings::TYPES_BY_BINDING[binding as usize])
+        };
+        let writes: Vec<vk::WriteDescriptorSet> = buffers
+            .iter()
+            .map(|(binding, info)| write(*binding).buffer_info(slice::from_ref(info)))
+            .chain(
+                images
+                    .iter()
+                    .map(|(binding, info)| write(*binding).image_info(slice::from_ref(info))),
+            )
+            .collect();
+        unsafe { self.render_device.update_descriptor_sets(&writes, &[]) };
     }
 
     /// Waits for the device to finish `frame`'s last use, freeing up what it used.

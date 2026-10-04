@@ -1,5 +1,29 @@
 use ash::{prelude::VkResult, vk};
 
+/// Records a barrier making `src_access` in `src_stage` available to `dst_access` in
+/// `dst_stage`, for every resource.
+///
+/// # Safety
+/// `cmd_buffer` must be recording.
+pub(crate) unsafe fn cmd_memory_barrier(
+    logical_device: &ash::Device,
+    cmd_buffer: vk::CommandBuffer,
+    src: (vk::PipelineStageFlags2, vk::AccessFlags2),
+    dst: (vk::PipelineStageFlags2, vk::AccessFlags2),
+) {
+    let barrier = vk::MemoryBarrier2::default()
+        .src_stage_mask(src.0)
+        .src_access_mask(src.1)
+        .dst_stage_mask(dst.0)
+        .dst_access_mask(dst.1);
+    unsafe {
+        logical_device.cmd_pipeline_barrier2(
+            cmd_buffer,
+            &vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&barrier)),
+        )
+    };
+}
+
 /// Starts signaled, so the first wait on it returns straight away.
 #[inline]
 pub fn create_fence(logical_device: &ash::Device) -> VkResult<vk::Fence> {
