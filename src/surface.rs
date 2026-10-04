@@ -1,6 +1,5 @@
 use crate::{App, adapter::Adapter};
 use ash::{khr, prelude::VkResult, vk};
-use ash_window::create_surface;
 
 #[derive(Clone)]
 pub struct Surface {
@@ -21,21 +20,17 @@ impl Surface {
         surface_instance: &khr::surface::Instance,
     ) -> VkResult<Self> {
         unsafe {
-            let surface = create_surface(
-                &app.entry,
-                &app.instance,
-                app.display_handle,
-                app.window_handle,
-                None,
-            )?;
+            // NOTE: The `App` owns the surface.
+            let surface = app.surface;
             let depth_format = pick_depth_format(&app.instance, adapter);
             let present_mode = surface_instance
                 .get_physical_device_surface_present_modes(adapter.handle, surface)?
                 .into_iter()
                 .find(|&mode| mode == vk::PresentModeKHR::MAILBOX)
                 .unwrap_or(vk::PresentModeKHR::FIFO);
-            let format =
-                surface_instance.get_physical_device_surface_formats(adapter.handle, surface)?[0];
+            let format = pick_color_format(
+                &surface_instance.get_physical_device_surface_formats(adapter.handle, surface)?,
+            );
             let capabilities = surface_instance
                 .get_physical_device_surface_capabilities(adapter.handle, surface)?;
             let transform_flags = if capabilities
@@ -47,9 +42,12 @@ impl Surface {
                 capabilities.current_transform
             };
 
-            // FIXME: Investigate why this makes or breaks swapchain recreation.
-            // let min_image_count = capabilities.min_image_count + 1;
-            let min_image_count = 2;
+            // One more than the minimum, so acquiring never waits on the presentation engine.
+            // A maximum of zero means there's no limit.
+            let mut image_count = capabilities.min_image_count + 1;
+            if capabilities.max_image_count > 0 {
+                image_count = image_count.min(capabilities.max_image_count);
+            }
 
             Ok(Self {
                 handle: surface,
@@ -58,7 +56,7 @@ impl Surface {
                 depth_format,
                 color_space: format.color_space,
                 transform_flags,
-                image_count: min_image_count,
+                image_count,
             })
         }
     }
@@ -97,4 +95,18 @@ fn pick_depth_format(instance: &ash::Instance, adapter: &Adapter) -> vk::Format 
         true => vk::Format::D32_SFLOAT,
         false => vk::Format::D16_UNORM,
     }
+}
+
+/// An 8 bit sRGB format when there is one, so shaders can work in linear color.
+fn pick_color_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
+    formats
+        .iter()
+        .find(|format| {
+            matches!(
+                format.format,
+                vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB
+            ) && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        })
+        .unwrap_or(&formats[0])
+        .to_owned()
 }

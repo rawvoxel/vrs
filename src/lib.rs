@@ -8,12 +8,13 @@ pub mod adapter;
 pub mod alloc;
 pub mod buffer;
 pub mod commands;
-pub mod cull;
+pub(crate) mod cull;
 pub mod debug;
 pub mod descriptors;
-pub mod hiz;
+pub(crate) mod hiz;
 pub mod image;
 pub mod mesh;
+pub(crate) mod pipeline;
 pub mod queue;
 pub mod renderer;
 pub mod surface;
@@ -26,19 +27,25 @@ use debug::Debug;
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
+// Both are shared with other threads, such as Bevy resources, without any `unsafe impl`.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<App>();
+    assert_send_sync::<renderer::Renderer>();
+};
+
+/// The Vulkan instance and the window surface everything else renders to.
 pub struct App {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
-    pub display_handle: RawDisplayHandle,
-    pub window_handle: RawWindowHandle,
     pub debug_instance: ext::debug_utils::Instance,
     /// Only present in debug builds, when the validation layer is installed.
     pub debug: Option<Debug>,
+    pub surface_instance: khr::surface::Instance,
+    /// The window's surface, owned by the `App`.
+    pub surface: vk::SurfaceKHR,
     pub adapters: Vec<Adapter>,
 }
-
-unsafe impl Send for App {}
-unsafe impl Sync for App {}
 
 impl App {
     pub fn new(
@@ -49,28 +56,36 @@ impl App {
         let entry = unsafe { ash::Entry::load()? };
         let validation = cfg!(debug_assertions) && validation_available(&entry)?;
         let instance = create_instance(&entry, display_handle, app_info, validation)?;
-        let debug_instance = ext::debug_utils::Instance::new(&entry, &instance);
-        let debug = match validation {
-            true => Some(Debug::new(&debug_instance)?),
-            false => None,
-        };
-        let adapters = unsafe {
-            instance
-                .enumerate_physical_devices()?
-                .into_iter()
-                .map(|physical_device| Adapter::new(&instance, physical_device))
-                .collect()
-        };
-
-        Ok(Self {
+        // Dropping the `App` destroys whatever was created, if anything below fails.
+        let mut app = Self {
+            debug_instance: ext::debug_utils::Instance::new(&entry, &instance),
+            debug: None,
+            surface_instance: khr::surface::Instance::new(&entry, &instance),
+            surface: vk::SurfaceKHR::null(),
+            adapters: Vec::new(),
             entry,
             instance,
-            display_handle,
-            window_handle,
-            debug_instance,
-            debug,
-            adapters,
-        })
+        };
+        if validation {
+            app.debug = Some(Debug::new(&app.debug_instance)?);
+        }
+        unsafe {
+            app.surface = ash_window::create_surface(
+                &app.entry,
+                &app.instance,
+                display_handle,
+                window_handle,
+                None,
+            )?;
+            app.adapters = app
+                .instance
+                .enumerate_physical_devices()?
+                .into_iter()
+                .map(|physical_device| Adapter::new(&app.instance, physical_device))
+                .collect();
+        }
+
+        Ok(app)
     }
 
     /// The most capable adapter: discrete, then integrated, then virtual, then anything else.
@@ -106,6 +121,7 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         unsafe {
+            self.surface_instance.destroy_surface(self.surface, None);
             if let Some(debug) = &self.debug {
                 debug.destroy(&self.debug_instance);
             }

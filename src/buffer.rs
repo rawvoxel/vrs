@@ -10,7 +10,23 @@ pub struct Buffer {
     mapped: Option<NonNull<c_void>>,
 }
 
+// SAFETY: The mapping is only written through `&mut self`, so sharing a `Buffer` between
+// threads can't race on it, and host mapped memory may be accessed from any thread.
+unsafe impl Send for Buffer {}
+unsafe impl Sync for Buffer {}
+
 impl Buffer {
+    /// Owns nothing, destroying it does nothing.
+    pub fn null() -> Self {
+        Self {
+            size: 0,
+            memory_req: vk::MemoryRequirements::default(),
+            memory: vk::DeviceMemory::null(),
+            handle: vk::Buffer::null(),
+            mapped: None,
+        }
+    }
+
     pub fn new(
         adapter: &Adapter,
         logical_device: &ash::Device,
@@ -19,19 +35,20 @@ impl Buffer {
         buffer_offset: u64,
     ) -> VkResult<Self> {
         unsafe {
-            let buffer = logical_device.create_buffer(&buffer_info, None)?;
-            let memory_req = logical_device.get_buffer_memory_requirements(buffer);
-            let memory =
-                alloc::vk_alloc(adapter, logical_device, memory_req, memory_property_flags)?;
-            logical_device.bind_buffer_memory(buffer, memory, buffer_offset)?;
-
-            Ok(Self {
-                size: buffer_info.size,
-                handle: buffer,
-                memory,
-                memory_req,
-                mapped: None,
-            })
+            let mut this = Self::null();
+            this.size = buffer_info.size;
+            this.handle = logical_device.create_buffer(&buffer_info, None)?;
+            this.memory_req = logical_device.get_buffer_memory_requirements(this.handle);
+            let bound = alloc::vk_alloc(adapter, logical_device, this.memory_req, memory_property_flags)
+                .and_then(|memory| {
+                    this.memory = memory;
+                    logical_device.bind_buffer_memory(this.handle, memory, buffer_offset)
+                });
+            if let Err(err) = bound {
+                this.destroy(logical_device);
+                return Err(err);
+            }
+            Ok(this)
         }
     }
 
@@ -55,7 +72,7 @@ impl Buffer {
 
     /// Copies `data` to the start of the mapped buffer, see `mem_write_at`.
     #[inline]
-    pub fn mem_write<T: Copy>(&self, data: &[T]) {
+    pub fn mem_write<T: Copy>(&mut self, data: &[T]) {
         self.mem_write_at(0, data);
     }
 
@@ -66,7 +83,7 @@ impl Buffer {
     ///
     /// # Panics
     /// If the buffer isn't mapped or `data` doesn't fit.
-    pub fn mem_write_at<T: Copy>(&self, offset: vk::DeviceSize, data: &[T]) {
+    pub fn mem_write_at<T: Copy>(&mut self, offset: vk::DeviceSize, data: &[T]) {
         let ptr = self.mapped.expect("Buffer must be mapped before it's written.");
         let byte_count = size_of_val(data);
         assert!(
@@ -92,6 +109,7 @@ impl Buffer {
         }
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     /// Freeing the memory also unmaps it.
     #[inline]
@@ -112,6 +130,15 @@ pub struct DynamicBuffer {
 }
 
 impl DynamicBuffer {
+    /// Owns nothing, destroying it does nothing.
+    pub fn null() -> Self {
+        Self {
+            buffer: Buffer::null(),
+            usage: vk::BufferUsageFlags::empty(),
+            memory_flags: vk::MemoryPropertyFlags::empty(),
+        }
+    }
+
     pub fn new(
         adapter: &Adapter,
         logical_device: &ash::Device,
@@ -135,8 +162,11 @@ impl DynamicBuffer {
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let mut buffer = Buffer::new(adapter, logical_device, info, memory_flags, 0)?;
-        if memory_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
-            buffer.mem_map(logical_device)?;
+        if memory_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            && let Err(err) = buffer.mem_map(logical_device)
+        {
+            unsafe { buffer.destroy(logical_device) };
+            return Err(err);
         }
 
         Ok(Self {
@@ -189,6 +219,7 @@ impl DynamicBuffer {
         Ok(())
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     #[inline]
     pub unsafe fn destroy(&self, logical_device: &ash::Device) {

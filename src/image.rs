@@ -9,6 +9,14 @@ pub struct Image {
 }
 
 impl Image {
+    /// Owns nothing, destroying it does nothing.
+    pub fn null() -> Self {
+        Self {
+            memory: vk::DeviceMemory::null(),
+            handle: vk::Image::null(),
+        }
+    }
+
     pub fn new(
         adapter: &Adapter,
         logical_device: &ash::Device,
@@ -16,23 +24,23 @@ impl Image {
         memory_property_flags: vk::MemoryPropertyFlags,
     ) -> VkResult<Self> {
         unsafe {
-            let image = logical_device.create_image(&image_info, None)?;
-            let memory_requirements = logical_device.get_image_memory_requirements(image);
-            let memory = alloc::vk_alloc(
-                adapter,
-                logical_device,
-                memory_requirements,
-                memory_property_flags,
-            )?;
-            logical_device.bind_image_memory(image, memory, 0)?;
-
-            Ok(Self {
-                handle: image,
-                memory,
-            })
+            let mut this = Self::null();
+            this.handle = logical_device.create_image(&image_info, None)?;
+            let memory_requirements = logical_device.get_image_memory_requirements(this.handle);
+            let bound = alloc::vk_alloc(adapter, logical_device, memory_requirements, memory_property_flags)
+                .and_then(|memory| {
+                    this.memory = memory;
+                    logical_device.bind_image_memory(this.handle, memory, 0)
+                });
+            if let Err(err) = bound {
+                this.destroy(logical_device);
+                return Err(err);
+            }
+            Ok(this)
         }
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     #[inline]
     pub unsafe fn destroy(&self, logical_device: &ash::Device) {
@@ -67,6 +75,7 @@ pub fn create_image_view(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn transition_layout(
     render_device: &ash::Device,
     image: vk::Image,

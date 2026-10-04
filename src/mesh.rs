@@ -49,7 +49,7 @@ impl Mesh {
     }
 
     #[inline]
-    pub fn info(&self) -> MeshInfo {
+    pub(crate) fn info(&self) -> MeshInfo {
         MeshInfo {
             bounds_min: self.bounds_min.to_array(),
             index_count: self.index_count(),
@@ -66,7 +66,7 @@ impl Mesh {
 /// Matches `MeshInfo` in `cull.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-pub struct MeshInfo {
+pub(crate) struct MeshInfo {
     pub bounds_min: [f32; 3],
     pub index_count: u32,
     pub bounds_max: [f32; 3],
@@ -90,7 +90,7 @@ struct Upload {
 ///
 /// Creating a mesh only queues its data, frames copy queued data in before drawing.
 /// Destroying a mesh only frees its ranges once no frame in flight can still draw it.
-pub struct MeshPool {
+pub(crate) struct MeshPool {
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
     pub info_buffer: Buffer,
@@ -111,36 +111,50 @@ impl MeshPool {
         capacity: MeshCapacity,
         frames_in_flight: usize,
     ) -> VkResult<Self> {
-        let vertex_buffer = create_device_local_buffer(
-            adapter,
-            logical_device,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            capacity.vertices as vk::DeviceSize * size_of::<Vertex>() as vk::DeviceSize,
-        )?;
-        let index_buffer = create_device_local_buffer(
-            adapter,
-            logical_device,
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            capacity.indices as vk::DeviceSize * size_of::<Index>() as vk::DeviceSize,
-        )?;
-        let info_buffer = create_device_local_buffer(
-            adapter,
-            logical_device,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            capacity.meshes as vk::DeviceSize * size_of::<MeshInfo>() as vk::DeviceSize,
-        )?;
+        let mut pool = Self::null(capacity, frames_in_flight);
+        let sizes = [
+            (
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                capacity.vertices as vk::DeviceSize * size_of::<Vertex>() as vk::DeviceSize,
+            ),
+            (
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                capacity.indices as vk::DeviceSize * size_of::<Index>() as vk::DeviceSize,
+            ),
+            (
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                capacity.meshes as vk::DeviceSize * size_of::<MeshInfo>() as vk::DeviceSize,
+            ),
+        ];
+        for (i, (usage, size)) in sizes.into_iter().enumerate() {
+            match create_device_local_buffer(adapter, logical_device, usage, size) {
+                Ok(buffer) => match i {
+                    0 => pool.vertex_buffer = buffer,
+                    1 => pool.index_buffer = buffer,
+                    _ => pool.info_buffer = buffer,
+                },
+                Err(err) => {
+                    unsafe { pool.destroy_buffers(logical_device) };
+                    return Err(err);
+                }
+            }
+        }
+        Ok(pool)
+    }
 
-        Ok(Self {
-            vertex_buffer,
-            index_buffer,
-            info_buffer,
+    /// Owns no buffers, destroying them does nothing.
+    pub(crate) fn null(capacity: MeshCapacity, frames_in_flight: usize) -> Self {
+        Self {
+            vertex_buffer: Buffer::null(),
+            index_buffer: Buffer::null(),
+            info_buffer: Buffer::null(),
             capacity,
             vertex_ranges: RangeAllocator::new(capacity.vertices),
             index_ranges: RangeAllocator::new(capacity.indices),
             meshes: Vec::new(),
             uploads: Vec::new(),
             frame_releases: (0..frames_in_flight).map(|_| Vec::new()).collect(),
-        })
+        }
     }
 
     /// Reserves space and queues the data for the next frame to upload.
@@ -376,6 +390,7 @@ impl MeshPool {
         Ok(())
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     #[inline]
     pub unsafe fn destroy_buffers(&self, logical_device: &ash::Device) {
@@ -416,7 +431,7 @@ fn create_device_local_buffer(
 
 /// Hands out first fit ranges of `0..capacity`, merging neighbouring ranges as they're freed.
 #[derive(Debug)]
-pub struct RangeAllocator {
+pub(crate) struct RangeAllocator {
     capacity: u32,
     /// Sorted, with no two ranges touching.
     free: Vec<Range<u32>>,
@@ -426,16 +441,14 @@ impl RangeAllocator {
     pub fn new(capacity: u32) -> Self {
         Self {
             capacity,
+            // One free range covering everything.
+            #[allow(clippy::single_range_in_vec_init)]
             free: vec![0..capacity],
         }
     }
 
-    #[inline]
-    pub fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
     /// Total free space, which may be split across several ranges.
+    #[cfg(test)]
     pub fn free_len(&self) -> u32 {
         self.free.iter().map(|range| range.len() as u32).sum()
     }

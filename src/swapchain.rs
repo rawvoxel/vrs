@@ -18,6 +18,18 @@ pub struct Swapchain {
 }
 
 impl Swapchain {
+    /// Owns nothing, destroying it does nothing.
+    pub fn null() -> Self {
+        Self {
+            handle: vk::SwapchainKHR::null(),
+            extent: vk::Extent2D::default(),
+            present_images: Vec::new(),
+            present_image_views: Vec::new(),
+            depth_image: Image::null(),
+            depth_image_view: vk::ImageView::null(),
+        }
+    }
+
     pub fn new(
         adapter: &Adapter,
         surface: &Surface,
@@ -27,13 +39,40 @@ impl Swapchain {
         swapchain_device: &khr::swapchain::Device,
         old_swapchain: Option<vk::SwapchainKHR>,
     ) -> VkResult<Self> {
+        let mut this = Self::null();
+        this.extent = extent;
+        let created = this.create(
+            adapter,
+            surface,
+            queue_family,
+            logical_device,
+            swapchain_device,
+            old_swapchain,
+        );
+        if let Err(err) = created {
+            unsafe { this.destroy(logical_device, swapchain_device) };
+            return Err(err);
+        }
+        Ok(this)
+    }
+
+    /// Fills in a null swapchain, leaving whatever it created behind if it fails.
+    fn create(
+        &mut self,
+        adapter: &Adapter,
+        surface: &Surface,
+        queue_family: &QueueFamily,
+        logical_device: &ash::Device,
+        swapchain_device: &khr::swapchain::Device,
+        old_swapchain: Option<vk::SwapchainKHR>,
+    ) -> VkResult<()> {
         unsafe {
-            let mut swapchain_info = vk::SwapchainCreateInfoKHR::default()
+            let swapchain_info = vk::SwapchainCreateInfoKHR::default()
                 .surface(surface.handle)
                 .min_image_count(surface.image_count)
                 .image_format(surface.format)
                 .image_color_space(surface.color_space)
-                .image_extent(extent)
+                .image_extent(self.extent)
                 .image_array_layers(1)
                 .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -41,36 +80,26 @@ impl Swapchain {
                 .pre_transform(surface.transform_flags)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                 .present_mode(surface.present_mode)
-                .clipped(true);
+                .clipped(true)
+                .old_swapchain(old_swapchain.unwrap_or_default());
 
-            if let Some(old_swapchain) = old_swapchain {
-                swapchain_info.old_swapchain = old_swapchain;
+            self.handle = swapchain_device.create_swapchain(&swapchain_info, None)?;
+            self.present_images = swapchain_device.get_swapchain_images(self.handle)?;
+            for &image in self.present_images.iter() {
+                let view = create_image_view(
+                    logical_device,
+                    image,
+                    surface.format,
+                    vk::ComponentMapping::default(),
+                    vk::ImageAspectFlags::COLOR,
+                )?;
+                self.present_image_views.push(view);
             }
 
-            let swapchain = swapchain_device.create_swapchain(&swapchain_info, None)?;
-            let present_images = swapchain_device.get_swapchain_images(swapchain)?;
-            let present_image_views = present_images
-                .iter()
-                .map(|&image| {
-                    create_image_view(
-                        logical_device,
-                        image,
-                        surface.format,
-                        vk::ComponentMapping {
-                            r: vk::ComponentSwizzle::R,
-                            g: vk::ComponentSwizzle::G,
-                            b: vk::ComponentSwizzle::B,
-                            a: vk::ComponentSwizzle::A,
-                        },
-                        vk::ImageAspectFlags::COLOR,
-                    )
-                    .expect("Could not create vk::ImageView")
-                })
-                .collect();
             let depth_image_info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(surface.depth_format)
-                .extent(extent.into())
+                .extent(self.extent.into())
                 .mip_levels(1)
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
@@ -80,28 +109,21 @@ impl Swapchain {
                     vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 )
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
-            let depth_image = Image::new(
+            self.depth_image = Image::new(
                 adapter,
                 logical_device,
                 depth_image_info,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )?;
-            let depth_image_view = create_image_view(
+            self.depth_image_view = create_image_view(
                 logical_device,
-                depth_image.handle,
+                self.depth_image.handle,
                 depth_image_info.format,
                 vk::ComponentMapping::default(),
                 vk::ImageAspectFlags::DEPTH,
             )?;
 
-            Ok(Swapchain {
-                handle: swapchain,
-                extent,
-                present_images,
-                present_image_views,
-                depth_image,
-                depth_image_view,
-            })
+            Ok(())
         }
     }
 
@@ -134,6 +156,7 @@ impl Swapchain {
         }
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     #[inline]
     pub unsafe fn destroy(
@@ -142,8 +165,8 @@ impl Swapchain {
         swapchain_device: &khr::swapchain::Device,
     ) {
         unsafe {
-            self.depth_image.destroy(logical_device);
             logical_device.destroy_image_view(self.depth_image_view, None);
+            self.depth_image.destroy(logical_device);
             for &image_view in self.present_image_views.iter() {
                 logical_device.destroy_image_view(image_view, None);
             }

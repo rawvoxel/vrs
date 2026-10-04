@@ -14,18 +14,26 @@ pub fn create_command_pool(
     unsafe { logical_device.create_command_pool(&info, None) }
 }
 
+/// If one fails, those already created are destroyed.
 #[inline]
 pub fn create_command_pools(
     logical_device: &ash::Device,
     queue_family: &QueueFamily,
     pool_count: u32,
-) -> Vec<vk::CommandPool> {
-    (0..pool_count)
-        .map(|_| {
-            create_command_pool(logical_device, queue_family)
-                .expect("Could not create vk::CommandPool.")
-        })
-        .collect()
+) -> VkResult<Vec<vk::CommandPool>> {
+    let mut pools = Vec::with_capacity(pool_count as usize);
+    for _ in 0..pool_count {
+        match create_command_pool(logical_device, queue_family) {
+            Ok(pool) => pools.push(pool),
+            Err(err) => {
+                for pool in pools {
+                    unsafe { logical_device.destroy_command_pool(pool, None) };
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok(pools)
 }
 
 #[inline]
@@ -42,22 +50,21 @@ pub fn create_command_buffer(
     unsafe { Ok(logical_device.allocate_command_buffers(&allocate_info)?[0]) }
 }
 
+/// One from each pool, they're freed with their pools.
 #[inline]
 pub fn create_command_buffers(
     logical_device: &ash::Device,
-    command_pools: &Vec<vk::CommandPool>,
+    command_pools: &[vk::CommandPool],
     level: vk::CommandBufferLevel,
-) -> Vec<vk::CommandBuffer> {
+) -> VkResult<Vec<vk::CommandBuffer>> {
     command_pools
         .iter()
-        .map(|&command_pool| {
-            create_command_buffer(logical_device, command_pool, level)
-                .expect("Could not create vk::CommandBuffer.")
-        })
+        .map(|&command_pool| create_command_buffer(logical_device, command_pool, level))
         .collect()
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn record_submit_commandbuffer<F: FnOnce(vk::CommandBuffer)>(
     logical_device: &ash::Device,
     command_buffer: vk::CommandBuffer,

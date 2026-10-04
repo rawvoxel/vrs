@@ -1,6 +1,7 @@
 use crate::{
     adapter::Adapter,
-    cull::{allocate_desc_sets, as_bytes, create_compute_pipeline, create_desc_pool, create_desc_set_layout},
+    descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
+    pipeline::{as_bytes, create_compute_pipeline},
     image::Image,
 };
 use ash::{prelude::VkResult, vk};
@@ -49,39 +50,35 @@ impl DepthPyramid {
         depth_view: vk::ImageView,
         depth_extent: vk::Extent2D,
     ) -> VkResult<Self> {
-        let desc_set_layout = create_desc_set_layout(
-            logical_device,
-            &[vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE],
-        )?;
-        let (pipeline, pipeline_layout) = create_compute_pipeline(
-            logical_device,
-            HIZ_SPV,
-            c"reduceMain",
-            desc_set_layout,
-            size_of::<ReduceParams>() as u32,
-        )?;
+        let mut pyramid = Self::null();
+        let created = pyramid
+            .create_pipeline(logical_device)
+            .and_then(|()| pyramid.create_levels(adapter, logical_device, depth_view, depth_extent));
+        if let Err(err) = created {
+            unsafe { pyramid.destroy(logical_device) };
+            return Err(err);
+        }
+        Ok(pyramid)
+    }
 
-        let mut pyramid = Self {
-            image: Image {
-                memory: vk::DeviceMemory::null(),
-                handle: vk::Image::null(),
-            },
+    /// Owns nothing, destroying it does nothing.
+    pub fn null() -> Self {
+        Self {
+            image: Image::null(),
             view: vk::ImageView::null(),
             level_views: Vec::new(),
             levels: 0,
             extent: vk::Extent2D::default(),
-            depth_extent,
-            pipeline,
-            pipeline_layout,
-            desc_set_layout,
+            depth_extent: vk::Extent2D::default(),
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            desc_set_layout: vk::DescriptorSetLayout::null(),
             desc_pool: vk::DescriptorPool::null(),
             level_desc_sets: Vec::new(),
-        };
-        pyramid.create_levels(adapter, logical_device, depth_view, depth_extent)?;
-        Ok(pyramid)
+        }
     }
 
-    /// Rebuilds the levels for a new depth buffer.
+    /// Rebuilds the levels for a new depth buffer. If it fails, the pyramid has no levels.
     ///
     /// # Safety
     /// The device must not be using the pyramid.
@@ -93,9 +90,30 @@ impl DepthPyramid {
         depth_extent: vk::Extent2D,
     ) -> VkResult<()> {
         unsafe { self.destroy_levels(logical_device) };
-        self.create_levels(adapter, logical_device, depth_view, depth_extent)
+        let created = self.create_levels(adapter, logical_device, depth_view, depth_extent);
+        if created.is_err() {
+            unsafe { self.destroy_levels(logical_device) };
+        }
+        created
     }
 
+    fn create_pipeline(&mut self, logical_device: &ash::Device) -> VkResult<()> {
+        self.desc_set_layout = create_descriptor_set_layout(
+            logical_device,
+            &[vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE],
+            vk::ShaderStageFlags::COMPUTE,
+        )?;
+        (self.pipeline, self.pipeline_layout) = create_compute_pipeline(
+            logical_device,
+            HIZ_SPV,
+            c"reduceMain",
+            self.desc_set_layout,
+            size_of::<ReduceParams>() as u32,
+        )?;
+        Ok(())
+    }
+
+    /// Fills in levels after `destroy_levels`, leaving whatever it created behind if it fails.
     fn create_levels(
         &mut self,
         adapter: &Adapter,
@@ -105,37 +123,40 @@ impl DepthPyramid {
     ) -> VkResult<()> {
         // Powers of two, so halving never rounds and every level fits Vulkan's mip chain.
         // Texels past the depth buffer's edge repeat it.
-        let extent = vk::Extent2D {
+        self.depth_extent = depth_extent;
+        self.extent = vk::Extent2D {
             width: depth_extent.width.div_ceil(2).next_power_of_two(),
             height: depth_extent.height.div_ceil(2).next_power_of_two(),
         };
         let mut levels = 1;
-        let mut level_extent = extent;
+        let mut level_extent = self.extent;
         while level_extent.width > 1 || level_extent.height > 1 {
             level_extent = half_extent(level_extent);
             levels += 1;
         }
+        self.levels = levels;
 
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(PYRAMID_FORMAT)
-            .extent(extent.into())
+            .extent(self.extent.into())
             .mip_levels(levels)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let image = Image::new(
+        self.image = Image::new(
             adapter,
             logical_device,
             image_info,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        let view = create_view(logical_device, image.handle, 0, levels)?;
-        let level_views = (0..levels)
-            .map(|level| create_view(logical_device, image.handle, level, 1))
-            .collect::<VkResult<Vec<_>>>()?;
+        self.view = create_view(logical_device, self.image.handle, 0, levels)?;
+        for level in 0..levels {
+            let view = create_view(logical_device, self.image.handle, level, 1)?;
+            self.level_views.push(view);
+        }
 
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
@@ -145,21 +166,21 @@ impl DepthPyramid {
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(levels),
         ];
-        let desc_pool = create_desc_pool(logical_device, &pool_sizes, levels)?;
-        let level_desc_sets =
-            allocate_desc_sets(logical_device, desc_pool, self.desc_set_layout, levels)?;
+        self.desc_pool = create_descriptor_pool(logical_device, &pool_sizes, levels)?;
+        self.level_desc_sets =
+            allocate_descriptor_sets(logical_device, self.desc_pool, self.desc_set_layout, levels)?;
 
-        for (level, &desc_set) in level_desc_sets.iter().enumerate() {
+        for (level, &desc_set) in self.level_desc_sets.iter().enumerate() {
             let src_info = match level {
                 0 => vk::DescriptorImageInfo::default()
                     .image_view(depth_view)
                     .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
                 _ => vk::DescriptorImageInfo::default()
-                    .image_view(level_views[level - 1])
+                    .image_view(self.level_views[level - 1])
                     .image_layout(vk::ImageLayout::GENERAL),
             };
             let dst_info = vk::DescriptorImageInfo::default()
-                .image_view(level_views[level])
+                .image_view(self.level_views[level])
                 .image_layout(vk::ImageLayout::GENERAL);
             let writes = [
                 vk::WriteDescriptorSet::default()
@@ -176,14 +197,6 @@ impl DepthPyramid {
             unsafe { logical_device.update_descriptor_sets(&writes, &[]) };
         }
 
-        self.image = image;
-        self.view = view;
-        self.level_views = level_views;
-        self.levels = levels;
-        self.extent = extent;
-        self.depth_extent = depth_extent;
-        self.desc_pool = desc_pool;
-        self.level_desc_sets = level_desc_sets;
         Ok(())
     }
 
@@ -279,19 +292,26 @@ impl DepthPyramid {
         }
     }
 
-    unsafe fn destroy_levels(&self, logical_device: &ash::Device) {
+    /// Leaves the levels null, so destroying them again does nothing.
+    unsafe fn destroy_levels(&mut self, logical_device: &ash::Device) {
         unsafe {
             logical_device.destroy_descriptor_pool(self.desc_pool, None);
-            for &view in self.level_views.iter() {
+            for view in self.level_views.drain(..) {
                 logical_device.destroy_image_view(view, None);
             }
             logical_device.destroy_image_view(self.view, None);
             self.image.destroy(logical_device);
         }
+        self.desc_pool = vk::DescriptorPool::null();
+        self.level_desc_sets.clear();
+        self.view = vk::ImageView::null();
+        self.image = Image::null();
+        self.levels = 0;
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
-    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, logical_device: &ash::Device) {
         unsafe {
             self.destroy_levels(logical_device);
             logical_device.destroy_descriptor_set_layout(self.desc_set_layout, None);

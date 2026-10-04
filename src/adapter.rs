@@ -1,5 +1,5 @@
 use crate::{queue::QueueFamily, surface::Surface};
-use ash::{khr, vk};
+use ash::{khr, prelude::VkResult, vk};
 
 #[derive(Clone)]
 pub struct Adapter {
@@ -23,7 +23,7 @@ impl Adapter {
             let draw_indirect_count = vulkan_12_features.draw_indirect_count == vk::TRUE;
             let properties = instance.get_physical_device_properties(physical_device);
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
-            let queue_families = get_queue_families(&instance, physical_device);
+            let queue_families = get_queue_families(instance, physical_device);
 
             Self {
                 handle: physical_device,
@@ -36,6 +36,7 @@ impl Adapter {
         }
     }
 
+    /// The first queue family with `queue_flags`, which can or can't present to `surface`.
     #[inline]
     pub fn get_queue_family(
         &self,
@@ -43,27 +44,22 @@ impl Adapter {
         surface: &Surface,
         supports_surface: bool,
         queue_flags: vk::QueueFlags,
-    ) -> QueueFamily {
-        self.queue_families
-            .iter()
-            .find_map(|queue_family| unsafe {
-                let contains_flags = queue_family.properties.queue_flags.contains(queue_flags);
-                let supports_surface = supports_surface
-                    == surface_instance
-                        .get_physical_device_surface_support(
-                            self.handle,
-                            queue_family.index,
-                            surface.handle,
-                        )
-                        .expect("Could not get physical device surface support.");
-
-                if contains_flags && supports_surface {
-                    Some(queue_family.clone())
-                } else {
-                    None
-                }
-            })
-            .expect("Could not find suitable queue family.")
+    ) -> VkResult<Option<QueueFamily>> {
+        for queue_family in self.queue_families.iter() {
+            let presents = unsafe {
+                surface_instance.get_physical_device_surface_support(
+                    self.handle,
+                    queue_family.index,
+                    surface.handle,
+                )?
+            };
+            if queue_family.properties.queue_flags.contains(queue_flags)
+                && presents == supports_surface
+            {
+                return Ok(Some(*queue_family));
+            }
+        }
+        Ok(None)
     }
 }
 

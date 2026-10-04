@@ -12,11 +12,7 @@ ash = "0.38.0"
 ash-window = "0.13.0"
 glam = "0.30.5"
 raw-window-handle = "0.6.2"
-vk-mem = "0.3.0"
 
 [dev-dependencies]
 # External crates
-criterion = "0.5"
-getrandom = { version = "0.3", features = ["wasm_js"] }
-rand = "0.8"
 winit = "0.30.11"

@@ -12,6 +12,7 @@ impl Debug {
         Ok(Self { messenger })
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     #[inline]
     pub unsafe fn destroy(&self, debug_utils_instance: &debug_utils::Instance) {
@@ -38,7 +39,7 @@ pub fn create_messenger(
         )
         .pfn_user_callback(Some(vulkan_debug_callback));
 
-    unsafe { Ok(debug_utils_instance.create_debug_utils_messenger(&debug_info, None)?) }
+    unsafe { debug_utils_instance.create_debug_utils_messenger(&debug_info, None) }
 }
 
 unsafe extern "system" fn vulkan_debug_callback(

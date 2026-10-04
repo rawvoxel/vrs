@@ -1,13 +1,16 @@
 use crate::{
     adapter::Adapter,
     buffer::{Buffer, DynamicBuffer},
+    descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
     hiz::DepthPyramid,
     mesh::MeshPool,
-    renderer::create_shader_module,
+    pipeline::{as_bytes, create_compute_pipeline},
 };
 use ash::{prelude::VkResult, vk};
-use glam::{Mat4, Vec4};
-use std::{ffi::CStr, slice};
+use glam::Mat4;
+#[cfg(test)]
+use glam::Vec4;
+use std::slice;
 
 const CULL_SPV: &[u8] = include_bytes!("../assets/shader/cull.spv");
 /// Matches `numthreads` in `cull.slang`.
@@ -78,8 +81,38 @@ impl Culler {
         frames_in_flight: u32,
         can_compact: bool,
     ) -> VkResult<Self> {
+        let mut culler = Self::null(can_compact);
+        if let Err(err) = culler.create(adapter, logical_device, frames_in_flight) {
+            unsafe { culler.destroy(logical_device) };
+            return Err(err);
+        }
+        Ok(culler)
+    }
+
+    /// Owns nothing, destroying it does nothing.
+    pub fn null(can_compact: bool) -> Self {
+        Self {
+            pipeline: vk::Pipeline::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            desc_set_layout: vk::DescriptorSetLayout::null(),
+            desc_pool: vk::DescriptorPool::null(),
+            frame_desc_sets: Vec::new(),
+            frame_candidate_buffers: Vec::new(),
+            frame_draw_buffers: Vec::new(),
+            frame_count_buffers: Vec::new(),
+            can_compact,
+        }
+    }
+
+    /// Fills in a null culler, leaving whatever it created behind if it fails.
+    fn create(
+        &mut self,
+        adapter: &Adapter,
+        logical_device: &ash::Device,
+        frames_in_flight: u32,
+    ) -> VkResult<()> {
         // Mesh infos, candidates, draws, draw counts and the depth pyramid.
-        let desc_set_layout = create_desc_set_layout(
+        self.desc_set_layout = create_descriptor_set_layout(
             logical_device,
             &[
                 vk::DescriptorType::STORAGE_BUFFER,
@@ -88,6 +121,7 @@ impl Culler {
                 vk::DescriptorType::STORAGE_BUFFER,
                 vk::DescriptorType::SAMPLED_IMAGE,
             ],
+            vk::ShaderStageFlags::COMPUTE,
         )?;
         let pool_sizes = [
             vk::DescriptorPoolSize::default()
@@ -97,43 +131,22 @@ impl Culler {
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(frames_in_flight),
         ];
-        let desc_pool = create_desc_pool(logical_device, &pool_sizes, frames_in_flight)?;
-        let frame_desc_sets = allocate_desc_sets(
+        self.desc_pool = create_descriptor_pool(logical_device, &pool_sizes, frames_in_flight)?;
+        self.frame_desc_sets = allocate_descriptor_sets(
             logical_device,
-            desc_pool,
-            desc_set_layout,
+            self.desc_pool,
+            self.desc_set_layout,
             frames_in_flight,
         )?;
 
-        let (pipeline, pipeline_layout) = create_compute_pipeline(
+        (self.pipeline, self.pipeline_layout) = create_compute_pipeline(
             logical_device,
             CULL_SPV,
             c"cullMain",
-            desc_set_layout,
+            self.desc_set_layout,
             size_of::<CullParams>() as u32,
         )?;
 
-        let frame_candidate_buffers = (0..frames_in_flight)
-            .map(|_| {
-                DynamicBuffer::new(
-                    adapter,
-                    logical_device,
-                    vk::BufferUsageFlags::STORAGE_BUFFER,
-                    INITIAL_CANDIDATES * size_of::<u32>() as vk::DeviceSize,
-                )
-            })
-            .collect::<VkResult<Vec<_>>>()?;
-        let frame_draw_buffers = (0..frames_in_flight)
-            .map(|_| {
-                DynamicBuffer::with_memory(
-                    adapter,
-                    logical_device,
-                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    2 * INITIAL_CANDIDATES * DRAW_STRIDE,
-                )
-            })
-            .collect::<VkResult<Vec<_>>>()?;
         let count_info = vk::BufferCreateInfo::default()
             .size(2 * size_of::<u32>() as vk::DeviceSize)
             .usage(
@@ -144,29 +157,30 @@ impl Culler {
                     | vk::BufferUsageFlags::TRANSFER_SRC,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let frame_count_buffers = (0..frames_in_flight)
-            .map(|_| {
-                Buffer::new(
-                    adapter,
-                    logical_device,
-                    count_info,
-                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    0,
-                )
-            })
-            .collect::<VkResult<Vec<_>>>()?;
+        for _ in 0..frames_in_flight {
+            self.frame_candidate_buffers.push(DynamicBuffer::new(
+                adapter,
+                logical_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                INITIAL_CANDIDATES * size_of::<u32>() as vk::DeviceSize,
+            )?);
+            self.frame_draw_buffers.push(DynamicBuffer::with_memory(
+                adapter,
+                logical_device,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                2 * INITIAL_CANDIDATES * DRAW_STRIDE,
+            )?);
+            self.frame_count_buffers.push(Buffer::new(
+                adapter,
+                logical_device,
+                count_info,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                0,
+            )?);
+        }
 
-        Ok(Self {
-            pipeline,
-            pipeline_layout,
-            desc_set_layout,
-            desc_pool,
-            frame_desc_sets,
-            frame_candidate_buffers,
-            frame_draw_buffers,
-            frame_count_buffers,
-            can_compact,
-        })
+        Ok(())
     }
 
     /// Writes this frame's `candidates`, indices into `mesh_pool.info_buffer`, binds its
@@ -174,6 +188,7 @@ impl Culler {
     ///
     /// # Safety
     /// The device must not be using this frame's buffers or descriptor set.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn prepare(
         &mut self,
         adapter: &Adapter,
@@ -320,6 +335,7 @@ impl Culler {
         }
     }
 
+    /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     pub unsafe fn destroy(&self, logical_device: &ash::Device) {
         unsafe {
@@ -343,100 +359,11 @@ impl Culler {
 
 /// The inward facing planes of `view_proj`'s frustum, for Vulkan's `0..1` depth range.
 /// A point `p` is inside a plane when `plane.xyz.dot(p) + plane.w >= 0`.
-/// Matches `inFrustum` in `cull.slang`.
+/// Matches `inFrustum` in `cull.slang`, which tests check it against.
+#[cfg(test)]
 pub fn frustum_planes(view_proj: Mat4) -> [Vec4; 6] {
     let [x, y, z, w] = [0, 1, 2, 3].map(|row| view_proj.row(row));
     [w + x, w - x, w + y, w - y, z, w - z]
-}
-
-/// Plain data as bytes, for push constants.
-#[inline]
-pub(crate) fn as_bytes<T: Copy>(data: &T) -> &[u8] {
-    // SAFETY: Only used for plain data without implicit padding.
-    unsafe { slice::from_raw_parts((data as *const T).cast(), size_of::<T>()) }
-}
-
-/// A compute pipeline with one descriptor set and `push_constant_size` bytes of push constants.
-pub(crate) fn create_compute_pipeline(
-    logical_device: &ash::Device,
-    spv: &[u8],
-    entry: &CStr,
-    desc_set_layout: vk::DescriptorSetLayout,
-    push_constant_size: u32,
-) -> VkResult<(vk::Pipeline, vk::PipelineLayout)> {
-    let push_constant_range = vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        .size(push_constant_size);
-    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-        .set_layouts(slice::from_ref(&desc_set_layout))
-        .push_constant_ranges(slice::from_ref(&push_constant_range));
-    let pipeline_layout =
-        unsafe { logical_device.create_pipeline_layout(&pipeline_layout_info, None)? };
-
-    let shader_module = create_shader_module(logical_device, spv)?;
-    let stage_info = vk::PipelineShaderStageCreateInfo::default()
-        .module(shader_module)
-        .name(entry)
-        .stage(vk::ShaderStageFlags::COMPUTE);
-    let pipeline_info = vk::ComputePipelineCreateInfo::default()
-        .stage(stage_info)
-        .layout(pipeline_layout);
-    unsafe {
-        let pipelines = logical_device.create_compute_pipelines(
-            vk::PipelineCache::null(),
-            slice::from_ref(&pipeline_info),
-            None,
-        );
-        logical_device.destroy_shader_module(shader_module, None);
-        Ok((pipelines.map_err(|(_, err)| err)?[0], pipeline_layout))
-    }
-}
-
-/// A compute only layout with one descriptor per binding, numbered in order.
-pub(crate) fn create_desc_set_layout(
-    logical_device: &ash::Device,
-    types: &[vk::DescriptorType],
-) -> VkResult<vk::DescriptorSetLayout> {
-    let bindings: Vec<vk::DescriptorSetLayoutBinding> = types
-        .iter()
-        .enumerate()
-        .map(|(binding, &ty)| {
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(binding as u32)
-                .descriptor_type(ty)
-                .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        })
-        .collect();
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-
-    unsafe { logical_device.create_descriptor_set_layout(&info, None) }
-}
-
-pub(crate) fn create_desc_pool(
-    logical_device: &ash::Device,
-    pool_sizes: &[vk::DescriptorPoolSize],
-    max_sets: u32,
-) -> VkResult<vk::DescriptorPool> {
-    let info = vk::DescriptorPoolCreateInfo::default()
-        .max_sets(max_sets)
-        .pool_sizes(pool_sizes);
-
-    unsafe { logical_device.create_descriptor_pool(&info, None) }
-}
-
-pub(crate) fn allocate_desc_sets(
-    logical_device: &ash::Device,
-    desc_pool: vk::DescriptorPool,
-    desc_set_layout: vk::DescriptorSetLayout,
-    count: u32,
-) -> VkResult<Vec<vk::DescriptorSet>> {
-    let set_layouts = vec![desc_set_layout; count as usize];
-    let info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(desc_pool)
-        .set_layouts(&set_layouts);
-
-    unsafe { logical_device.allocate_descriptor_sets(&info) }
 }
 
 #[cfg(test)]
