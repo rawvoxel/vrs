@@ -1,42 +1,51 @@
 use crate::{
-    adapter::Adapter, buffer::Buffer, descriptors::{create_descriptor_set_layout, create_descriptor_sets}, image, queue::{Queue, QueueFamily}, surface::Surface, swapchain::Swapchain, uniforms::MvpMatrices, vertex::{Index, Vertex}, App
+    App,
+    adapter::Adapter,
+    buffer::{Buffer, StagedBuffer},
+    commands::{
+        create_command_buffer, create_command_buffers, create_command_pool, create_command_pools,
+        record_submit_commandbuffer,
+    },
+    descriptors::{create_descriptor_pool, create_descriptor_set_layout, create_descriptor_sets},
+    image,
+    queue::{Queue, QueueFamily},
+    surface::Surface,
+    swapchain::Swapchain,
+    sync::{create_fence, create_fences, create_semaphores},
+    uniforms::MvpMatrices,
+    vertex::{Index, Vertex},
 };
-use crate::sync::{create_fence, create_fences, create_semaphores};
-use crate::descriptors::create_descriptor_pool;
-use crate::commands::{create_command_buffer, create_command_buffers, create_command_pool, create_command_pools, record_submit_commandbuffer};
 use ash::{khr, prelude::VkResult, util, vk};
-use std::{default::Default, ffi::c_void, io::Cursor, slice};
+use std::{default::Default, io::Cursor, slice};
 
 const SLANG_SPV: &[u8] = include_bytes!("../assets/shader/slang.spv");
 const FRAMES_IN_FLIGHT: u32 = 2;
+/// Starting size of each frame's mesh buffers, they grow to fit.
+const INITIAL_MESH_ELEMENTS: vk::DeviceSize = 1024;
 
 pub struct Renderer {
-    pub index_src_buffer_ptr: *mut c_void,
-    pub index_src_buffer: Buffer,
-    pub index_dst_buffer: Buffer,
-    pub vertex_src_buffer_ptr: *mut c_void,
-    pub vertex_src_buffer: Buffer,
-    pub vertex_dst_buffer: Buffer,
+    pub frame_index_buffers: Vec<StagedBuffer>,
+    pub frame_vertex_buffers: Vec<StagedBuffer>,
 
     pub current_frame: usize,
     pub in_flight_frames: Vec<vk::Fence>,
     pub available_frames: Vec<vk::Semaphore>,
-    pub rendered_frames: Vec<vk::Semaphore>,
+    pub rendered_images: Vec<vk::Semaphore>,
     pub frame_cmd_buffers: Vec<vk::CommandBuffer>,
     pub frame_cmd_pools: Vec<vk::CommandPool>,
-    
+
     pub init_cmd_fence: vk::Fence,
     pub init_cmd_buffer: vk::CommandBuffer,
     pub init_cmd_pool: vk::CommandPool,
 
     pub swapchain: Swapchain,
     pub swapchain_device: khr::swapchain::Device,
+    pub swapchain_outdated: bool,
 
     pub ubo_desc_pool: vk::DescriptorPool,
     pub ubo_desc_set_layout: vk::DescriptorSetLayout,
     pub ubo_desc_sets: Vec<vk::DescriptorSet>,
     pub uniform_buffers: Vec<Buffer>,
-    pub uniform_buffer_ptrs: Vec<*mut c_void>,
 
     pub graphics_pipeline: vk::Pipeline,
     pub graphics_pipeline_layout: vk::PipelineLayout,
@@ -61,20 +70,12 @@ impl Renderer {
         // Surface
         let surface_instance = khr::surface::Instance::new(&app.entry, &app.instance);
         let surface = Surface::new(app, &adapter, &surface_instance)?;
-        let surface_extent = surface.extent(
-            window_width,
-            window_height,
-            &adapter,
-            &surface_instance,
-        )?;
+        let surface_extent =
+            surface.extent(window_width, window_height, &adapter, &surface_instance)?;
 
         // Render Device
-        let graphics_queue_family = adapter.get_queue_family(
-            &surface_instance,
-            &surface,
-            true,
-            vk::QueueFlags::GRAPHICS,
-        );
+        let graphics_queue_family =
+            adapter.get_queue_family(&surface_instance, &surface, true, vk::QueueFlags::GRAPHICS);
         let render_device = create_render_device(app, &adapter, &graphics_queue_family)?;
         let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0);
 
@@ -95,17 +96,13 @@ impl Renderer {
             ubo_desc_pool,
             &vec![ubo_desc_set_layout; FRAMES_IN_FLIGHT as usize],
         )?;
-        let uniform_buffers = create_uniform_buffers(&adapter, &render_device, FRAMES_IN_FLIGHT);
+        let uniform_buffers = create_uniform_buffers(&adapter, &render_device, FRAMES_IN_FLIGHT)?;
         write_uniform_descriptor_sets(&render_device, &ubo_desc_sets, &uniform_buffers);
-        let uniform_buffer_ptrs = uniform_buffers.iter()
-            .map(|b| {
-                b.mem_map(&render_device, 0).expect("Could not memory map buffers.")
-            })
-            .collect();
 
         // Graphics Pipeline
         let shader_module = create_shader_module(&render_device, SLANG_SPV)?;
-        let graphics_pipeline_layout = create_pipeline_layout(&render_device, slice::from_ref(&ubo_desc_set_layout))?;
+        let graphics_pipeline_layout =
+            create_pipeline_layout(&render_device, slice::from_ref(&ubo_desc_set_layout))?;
         let graphics_pipeline = create_graphics_pipeline(
             &surface,
             &render_device,
@@ -127,41 +124,47 @@ impl Renderer {
 
         // Global Commands
         let init_cmd_pool = create_command_pool(&render_device, &graphics_queue_family)?;
-        let init_cmd_buffer = create_command_buffer(&render_device, init_cmd_pool, vk::CommandBufferLevel::PRIMARY)?;
+        let init_cmd_buffer = create_command_buffer(
+            &render_device,
+            init_cmd_pool,
+            vk::CommandBufferLevel::PRIMARY,
+        )?;
         let init_cmd_fence = create_fence(&render_device)?;
 
         // Frames in Flight
-        let frame_cmd_pools = create_command_pools(
-            &render_device,
-            &graphics_queue_family,
-            FRAMES_IN_FLIGHT
-        );
+        let frame_cmd_pools =
+            create_command_pools(&render_device, &graphics_queue_family, FRAMES_IN_FLIGHT);
         let frame_cmd_buffers = create_command_buffers(
             &render_device,
             &frame_cmd_pools,
-            vk::CommandBufferLevel::PRIMARY
+            vk::CommandBufferLevel::PRIMARY,
         );
         let in_flight_frames = create_fences(&render_device, FRAMES_IN_FLIGHT);
         let available_frames = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
-        let rendered_frames = create_semaphores(&render_device, FRAMES_IN_FLIGHT);
+        let rendered_images =
+            create_semaphores(&render_device, swapchain.present_images.len() as u32);
 
         // Mesh Buffers
-        // FIXME: Figure out how to initialize an upper limit for size.
-        let index_src_buffer = create_transfer_src_buffer(
-            &adapter,
-            &render_device,
-            12 * size_of::<Index>() as vk::DeviceSize
-        )?;
-        let index_src_buffer_ptr = index_src_buffer.mem_map(&render_device, 0)?;
-        let index_dst_buffer = create_index_dst_buffer(&adapter, &render_device, 12)?;
-
-        let vertex_src_buffer = create_transfer_src_buffer(
-            &adapter,
-            &render_device,
-            12 * size_of::<Vertex>() as vk::DeviceSize
-        )?;
-        let vertex_src_buffer_ptr = vertex_src_buffer.mem_map(&render_device, 0)?;
-        let vertex_dst_buffer = create_vertex_dst_buffer(&adapter, &render_device, 12)?;
+        let frame_index_buffers = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                StagedBuffer::new(
+                    &adapter,
+                    &render_device,
+                    vk::BufferUsageFlags::INDEX_BUFFER,
+                    INITIAL_MESH_ELEMENTS * size_of::<Index>() as vk::DeviceSize,
+                )
+            })
+            .collect::<VkResult<Vec<_>>>()?;
+        let frame_vertex_buffers = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                StagedBuffer::new(
+                    &adapter,
+                    &render_device,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    INITIAL_MESH_ELEMENTS * size_of::<Vertex>() as vk::DeviceSize,
+                )
+            })
+            .collect::<VkResult<Vec<_>>>()?;
 
         // Transition Depth Image Layout
         record_submit_commandbuffer(
@@ -194,17 +197,13 @@ impl Renderer {
         }
 
         Ok(Self {
-            index_src_buffer_ptr,
-            index_src_buffer,
-            index_dst_buffer,
-            vertex_src_buffer_ptr,
-            vertex_src_buffer,
-            vertex_dst_buffer,
+            frame_index_buffers,
+            frame_vertex_buffers,
 
             current_frame: 0,
             in_flight_frames,
             available_frames,
-            rendered_frames,
+            rendered_images,
             frame_cmd_buffers,
             frame_cmd_pools,
 
@@ -212,7 +211,6 @@ impl Renderer {
             ubo_desc_set_layout,
             ubo_desc_sets,
             uniform_buffers,
-            uniform_buffer_ptrs,
 
             init_cmd_fence,
             init_cmd_buffer,
@@ -220,6 +218,7 @@ impl Renderer {
 
             swapchain,
             swapchain_device,
+            swapchain_outdated: false,
 
             graphics_pipeline,
             graphics_pipeline_layout,
@@ -237,61 +236,6 @@ impl Renderer {
     pub fn advance_current_frame(&mut self) {
         self.current_frame = (self.current_frame + 1) % self.in_flight_frames.len();
     }
-    
-    pub fn transfer_mesh_buffers(
-        &self,
-        indices: &[Index],
-        vertices: &[Vertex],
-        cmd_buffer: vk::CommandBuffer
-    ) -> VkResult<()> {
-        unsafe {
-            let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.render_device.begin_command_buffer(cmd_buffer, &command_buffer_begin_info)?;
-
-            // Indices
-            let size = (indices.len() * size_of::<Index>()) as vk::DeviceSize;
-            let regions = vk::BufferCopy2::default()
-                .src_offset(0)
-                .dst_offset(0)
-                .size(size);
-            let copy_buffer_info = vk::CopyBufferInfo2::default()
-                .src_buffer(self.index_src_buffer.handle)
-                .dst_buffer(self.index_dst_buffer.handle)
-                .regions(slice::from_ref(&regions));
-            self.render_device.cmd_copy_buffer2(cmd_buffer, &copy_buffer_info);
-
-            // Vertices
-            let size = (vertices.len() * size_of::<Vertex>()) as vk::DeviceSize;
-            let regions = vk::BufferCopy2::default()
-                .src_offset(0)
-                .dst_offset(0)
-                .size(size);
-            let copy_buffer_info = vk::CopyBufferInfo2::default()
-                .src_buffer(self.vertex_src_buffer.handle)
-                .dst_buffer(self.vertex_dst_buffer.handle)
-                .regions(slice::from_ref(&regions));
-            self.render_device.cmd_copy_buffer2(cmd_buffer, &copy_buffer_info);
-
-            self.render_device.end_command_buffer(cmd_buffer)?;
-
-            let cmd_buffer_submit_info = vk::CommandBufferSubmitInfo::default()
-                .command_buffer(cmd_buffer);
-            let submit_info = vk::SubmitInfo2::default()
-                .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info));
-            self.render_device.queue_submit2(
-                self.graphics_queue.handle,
-                slice::from_ref(&submit_info),
-                vk::Fence::null(),
-            )?;
-        
-            // NOTE: Is this wait really necessary?
-            // TODO: It may be wise to use a fence here for multiple simultaneous transfers.
-            self.render_device.queue_wait_idle(self.graphics_queue.handle)?;
-
-            Ok(())
-        }
-    }
 
     #[rustfmt::skip]
     pub fn submit(
@@ -303,10 +247,14 @@ impl Renderer {
     ) -> VkResult<()> {
         let surface_extent = self.surface
             .extent(window_width, window_height, &self.adapter, &self.surface_instance)?;
-        if self.swapchain.extent != surface_extent {
+        // A minimized window has no surface to present to.
+        if surface_extent.width == 0 || surface_extent.height == 0 {
+            return Ok(());
+        }
+        if self.swapchain_outdated || self.swapchain.extent != surface_extent {
             self.rebuild_swapchain(surface_extent)?;
         }
-        
+
         let extent = self.swapchain.extent;
         let scissors = [extent.into()];
         let viewports = [vk::Viewport::default()
@@ -320,39 +268,64 @@ impl Renderer {
             color: vk::ClearColorValue { float32: [0.1; 4] },
         };
 
-        let frame_in_flight = self.in_flight_frames[self.current_frame];
-        let frame_available = self.available_frames[self.current_frame];
-        let frame_rendered = self.rendered_frames[self.current_frame];
-        let frame_cmd_buffer = self.frame_cmd_buffers[self.current_frame];
+        let frame = self.current_frame;
+        let frame_in_flight = self.in_flight_frames[frame];
+        let frame_available = self.available_frames[frame];
+        let frame_cmd_buffer = self.frame_cmd_buffers[frame];
 
         unsafe {
             self.render_device.wait_for_fences(&[frame_in_flight], true, u64::MAX)?;
-            self.render_device.reset_fences(&[frame_in_flight])?;
 
             // Swapchain
-            let (image_index, _suboptimal) = self.swapchain_device.acquire_next_image(
+            // NOTE: A suboptimal image can still be presented, so it's rebuilt next frame.
+            let image_index = match self.swapchain_device.acquire_next_image(
                 self.swapchain.handle,
                 u64::MAX,
                 frame_available,
                 vk::Fence::null(),
-            )?;
+            ) {
+                Ok((image_index, suboptimal)) => {
+                    self.swapchain_outdated |= suboptimal;
+                    image_index
+                }
+                // Nothing was acquired so skip this frame, its fence is still signaled.
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    return self.rebuild_swapchain(surface_extent);
+                }
+                Err(err) => return Err(err),
+            };
+            let image_rendered = self.rendered_images[image_index as usize];
+
+            // Only reset once work that signals the fence is certain to be submitted.
+            self.render_device.reset_fences(&[frame_in_flight])?;
 
             // Mesh buffers
-            self.index_src_buffer.mem_write(self.index_src_buffer_ptr, indices);
-            self.vertex_src_buffer.mem_write(self.vertex_src_buffer_ptr, vertices);
-            // NOTE: It may be wise to create a dedicated command buffer for transfers.
-            self.transfer_mesh_buffers(indices, vertices, frame_cmd_buffer)?;
+            // NOTE: The fence wait above means the device is done with this frame's buffers.
+            self.frame_index_buffers[frame].write(&self.adapter, &self.render_device, indices)?;
+            self.frame_vertex_buffers[frame].write(&self.adapter, &self.render_device, vertices)?;
+            let index_buffer = &self.frame_index_buffers[frame];
+            let vertex_buffer = &self.frame_vertex_buffers[frame];
 
             // Uniform buffers
             let mvp_identity = MvpMatrices::default();
-            let uniform_buffer_ptr = self.uniform_buffer_ptrs[self.current_frame];
-            self.uniform_buffers[self.current_frame].mem_write(uniform_buffer_ptr, slice::from_ref(&mvp_identity));
+            self.uniform_buffers[frame].mem_write(slice::from_ref(&mvp_identity));
 
             // Command buffer
             let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.render_device.begin_command_buffer(frame_cmd_buffer, &command_buffer_begin_info)?;
-            
+
+            // Mesh transfer
+            index_buffer.cmd_copy(&self.render_device, frame_cmd_buffer);
+            vertex_buffer.cmd_copy(&self.render_device, frame_cmd_buffer);
+            let mesh_barrier = vk::MemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT | vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
+                .dst_access_mask(vk::AccessFlags2::INDEX_READ | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ);
+            let mesh_dependency = vk::DependencyInfo::default()
+                .memory_barriers(slice::from_ref(&mesh_barrier));
+            self.render_device.cmd_pipeline_barrier2(frame_cmd_buffer, &mesh_dependency);
 
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
@@ -366,7 +339,8 @@ impl Renderer {
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                 vk::AccessFlags2::empty(),
                 vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::NONE,
+                // Chains onto the acquire semaphore wait, which happens at this stage.
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
                 vk::ImageAspectFlags::COLOR,
             );
@@ -385,38 +359,40 @@ impl Renderer {
             self.render_device
                 .cmd_begin_rendering(frame_cmd_buffer, &rendering_info);
 
-            self.render_device.cmd_bind_pipeline(
-                frame_cmd_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.graphics_pipeline,
-            );
+            if !indices.is_empty() {
+                self.render_device.cmd_bind_pipeline(
+                    frame_cmd_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.graphics_pipeline,
+                );
 
-            self.render_device.cmd_set_viewport(frame_cmd_buffer, 0, &viewports);
-            self.render_device.cmd_set_scissor(frame_cmd_buffer, 0, &scissors);
+                self.render_device.cmd_set_viewport(frame_cmd_buffer, 0, &viewports);
+                self.render_device.cmd_set_scissor(frame_cmd_buffer, 0, &scissors);
 
-            // Buffer Bindings
-            self.render_device.cmd_bind_index_buffer(
-                frame_cmd_buffer,
-                self.index_dst_buffer.handle,
-                0,
-                vk::IndexType::UINT32,
-            );
-            self.render_device.cmd_bind_vertex_buffers(
-                frame_cmd_buffer,
-                0,
-                &[self.vertex_dst_buffer.handle],
-                &[0],
-            );
-            self.render_device.cmd_bind_descriptor_sets(
-                frame_cmd_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.graphics_pipeline_layout,
-                0,
-                slice::from_ref(&self.ubo_desc_sets[self.current_frame]),
-                &[],
-            );
+                // Buffer Bindings
+                self.render_device.cmd_bind_index_buffer(
+                    frame_cmd_buffer,
+                    index_buffer.dst.handle,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                self.render_device.cmd_bind_vertex_buffers(
+                    frame_cmd_buffer,
+                    0,
+                    &[vertex_buffer.dst.handle],
+                    &[0],
+                );
+                self.render_device.cmd_bind_descriptor_sets(
+                    frame_cmd_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.graphics_pipeline_layout,
+                    0,
+                    slice::from_ref(&self.ubo_desc_sets[frame]),
+                    &[],
+                );
 
-            self.render_device.cmd_draw_indexed(frame_cmd_buffer, indices.len() as u32, 1, 0, 0, 0);
+                self.render_device.cmd_draw_indexed(frame_cmd_buffer, indices.len() as u32, 1, 0, 0, 0);
+            }
             self.render_device.cmd_end_rendering(frame_cmd_buffer);
 
             // Present image transition
@@ -444,8 +420,9 @@ impl Renderer {
                 .semaphore(frame_available)
                 .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
             let signal_sem_submit_info = vk::SemaphoreSubmitInfo::default()
-                .semaphore(frame_rendered)
-                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT);
+                .semaphore(image_rendered)
+                // Includes the transition to `PRESENT_SRC_KHR`, which finishes after color output.
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
             let submit_info = vk::SubmitInfo2::default()
                 .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info))
                 .wait_semaphore_infos(slice::from_ref(&wait_sem_submit_info))
@@ -458,12 +435,15 @@ impl Renderer {
 
             // Queue present
             let present_info = vk::PresentInfoKHR::default()
-                .wait_semaphores(slice::from_ref(&frame_rendered))
+                .wait_semaphores(slice::from_ref(&image_rendered))
                 .swapchains(slice::from_ref(&self.swapchain.handle))
                 .image_indices(slice::from_ref(&image_index));
-            self.swapchain_device
-                .queue_present(self.graphics_queue.handle, &present_info)?;
-            
+            match self.swapchain_device.queue_present(self.graphics_queue.handle, &present_info) {
+                Ok(suboptimal) => self.swapchain_outdated |= suboptimal,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.swapchain_outdated = true,
+                Err(err) => return Err(err),
+            }
+
             Ok(self.advance_current_frame())
         }
     }
@@ -480,6 +460,16 @@ impl Renderer {
                 &self.render_device,
                 &self.swapchain_device,
             )?;
+            self.swapchain_outdated = false;
+
+            // The device is idle, so no semaphore is still waiting to be signaled or presented.
+            let image_count = self.swapchain.present_images.len();
+            if self.rendered_images.len() != image_count {
+                for s in self.rendered_images.drain(..) {
+                    self.render_device.destroy_semaphore(s, None);
+                }
+                self.rendered_images = create_semaphores(&self.render_device, image_count as u32);
+            }
 
             // Depth image layout transition
             record_submit_commandbuffer(
@@ -517,19 +507,22 @@ impl Drop for Renderer {
             // NOTE: Nothing can be done about a lost device here, so destroy regardless.
             let _ = self.render_device.device_wait_idle();
 
-            self.index_src_buffer.mem_unmap(&self.render_device);
-            self.index_src_buffer.destroy(&self.render_device);
-            self.index_dst_buffer.destroy(&self.render_device);
-            self.vertex_src_buffer.mem_unmap(&self.render_device);
-            self.vertex_src_buffer.destroy(&self.render_device);
-            self.vertex_dst_buffer.destroy(&self.render_device);
+            for mesh_buffer in self
+                .frame_index_buffers
+                .iter()
+                .chain(&self.frame_vertex_buffers)
+            {
+                mesh_buffer.destroy(&self.render_device);
+            }
 
             for ubo in self.uniform_buffers.iter() {
                 ubo.destroy(&self.render_device);
             }
-            
-            self.render_device.destroy_descriptor_set_layout(self.ubo_desc_set_layout, None);
-            self.render_device.destroy_descriptor_pool(self.ubo_desc_pool, None);
+
+            self.render_device
+                .destroy_descriptor_set_layout(self.ubo_desc_set_layout, None);
+            self.render_device
+                .destroy_descriptor_pool(self.ubo_desc_pool, None);
 
             for f in self.in_flight_frames.iter() {
                 self.render_device.destroy_fence(*f, None);
@@ -537,23 +530,28 @@ impl Drop for Renderer {
             for s in self.available_frames.iter() {
                 self.render_device.destroy_semaphore(*s, None);
             }
-            for s in self.rendered_frames.iter() {
+            for s in self.rendered_images.iter() {
                 self.render_device.destroy_semaphore(*s, None);
             }
             for p in self.frame_cmd_pools.iter() {
                 self.render_device.destroy_command_pool(*p, None);
             }
 
-            self.swapchain.destroy(&self.render_device, &self.swapchain_device);
+            self.swapchain
+                .destroy(&self.render_device, &self.swapchain_device);
 
             self.render_device.destroy_fence(self.init_cmd_fence, None);
-            self.render_device.destroy_command_pool(self.init_cmd_pool, None);
+            self.render_device
+                .destroy_command_pool(self.init_cmd_pool, None);
 
-            self.render_device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
-            self.render_device.destroy_pipeline(self.graphics_pipeline, None);
+            self.render_device
+                .destroy_pipeline_layout(self.graphics_pipeline_layout, None);
+            self.render_device
+                .destroy_pipeline(self.graphics_pipeline, None);
             self.render_device.destroy_device(None);
 
-            self.surface_instance.destroy_surface(self.surface.handle, None);
+            self.surface_instance
+                .destroy_surface(self.surface.handle, None);
         }
     }
 }
@@ -596,7 +594,10 @@ fn create_render_device(
 }
 
 #[inline]
-fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> VkResult<vk::ShaderModule> {
+fn create_shader_module(
+    render_device: &ash::Device,
+    spv_bytes: &[u8],
+) -> VkResult<vk::ShaderModule> {
     let mut spv_file = Cursor::new(&spv_bytes);
     let shader_code = util::read_spv(&mut spv_file).expect("Failed to read shader spv file.");
     let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
@@ -604,7 +605,10 @@ fn create_shader_module(render_device: &ash::Device, spv_bytes: &[u8]) -> VkResu
 }
 
 #[inline]
-fn create_pipeline_layout(render_device: &ash::Device, set_layouts: & [vk::DescriptorSetLayout]) -> VkResult<vk::PipelineLayout> {
+fn create_pipeline_layout(
+    render_device: &ash::Device,
+    set_layouts: &[vk::DescriptorSetLayout],
+) -> VkResult<vk::PipelineLayout> {
     let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(set_layouts);
     unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
 }
@@ -678,7 +682,7 @@ fn create_graphics_pipeline(
 
     let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
         .color_attachment_formats(slice::from_ref(&surface.format));
-    
+
     let graphics_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
         .push_next(&mut pipeline_rendering_info)
         .stages(&shader_stage_infos)
@@ -702,77 +706,11 @@ fn create_graphics_pipeline(
 }
 
 #[inline]
-fn create_transfer_src_buffer(
-    adapter: &Adapter,
-    render_device: &ash::Device,
-    size: vk::DeviceSize,
-) -> VkResult<Buffer> {
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-    let offset = 0;
-
-    Buffer::new(
-        adapter,
-        render_device,
-        buffer_info,
-        flags,
-        offset,
-    )
-}
-
-#[inline]
-fn create_index_dst_buffer(
-    adapter: &Adapter,
-    render_device: &ash::Device,
-    element_count: vk::DeviceSize,
-) -> VkResult<Buffer> {
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Index>() as vk::DeviceSize)
-        .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-    let offset = 0;
-
-    Buffer::new(
-        adapter,
-        render_device,
-        buffer_info,
-        flags,
-        offset,
-    )
-}
-
-#[inline]
-fn create_vertex_dst_buffer(
-    adapter: &Adapter,
-    render_device: &ash::Device,
-    element_count: vk::DeviceSize
-) -> VkResult<Buffer> {
-    let info = vk::BufferCreateInfo::default()
-        .size(element_count * size_of::<Vertex>() as vk::DeviceSize)
-        .usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
-    let offset = 0;
-
-    Buffer::new(
-        adapter,
-        render_device,
-        info,
-        flags,
-        offset,
-    )
-}
-
-#[inline]
 fn create_uniform_buffers(
     adapter: &Adapter,
     render_device: &ash::Device,
-    buffer_count: u32
-) -> Vec<Buffer> {
+    buffer_count: u32,
+) -> VkResult<Vec<Buffer>> {
     let info = vk::BufferCreateInfo::default()
         .size(size_of::<MvpMatrices>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
@@ -781,10 +719,11 @@ fn create_uniform_buffers(
 
     (0..buffer_count)
         .map(|_| {
-            Buffer::new(adapter, render_device, info, flags, 0)
-                .expect("Could not create uniform buffer.")
-    })
-    .collect()
+            let mut buffer = Buffer::new(adapter, render_device, info, flags, 0)?;
+            buffer.mem_map(render_device)?;
+            Ok(buffer)
+        })
+        .collect()
 }
 
 /// Points each frame's descriptor set at that frame's uniform buffer.
