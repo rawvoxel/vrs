@@ -1,13 +1,15 @@
 use crate::{
     App,
     adapter::Adapter,
-    buffer::{Buffer, StagedBuffer},
+    buffer::{Buffer, DynamicBuffer},
     commands::{
         create_command_buffer, create_command_buffers, create_command_pool, create_command_pools,
         record_submit_commandbuffer,
     },
     descriptors::{create_descriptor_pool, create_descriptor_set_layout, create_descriptor_sets},
+    cull::Culler,
     image,
+    mesh::{MeshCapacity, MeshId, MeshPool},
     queue::{Queue, QueueFamily},
     surface::Surface,
     swapchain::Swapchain,
@@ -16,16 +18,38 @@ use crate::{
     vertex::{Index, Vertex},
 };
 use ash::{khr, prelude::VkResult, util, vk};
+use glam::Mat4;
 use std::{default::Default, io::Cursor, slice};
 
 const SLANG_SPV: &[u8] = include_bytes!("../assets/shader/slang.spv");
 const FRAMES_IN_FLIGHT: u32 = 2;
-/// Starting size of each frame's mesh buffers, they grow to fit.
-const INITIAL_MESH_ELEMENTS: vk::DeviceSize = 1024;
+/// Starting size of each frame's dynamic geometry buffers, they grow to fit.
+const INITIAL_DYNAMIC_ELEMENTS: vk::DeviceSize = 1024;
+
+/// Everything drawn by one `Renderer::submit`.
+#[derive(Clone, Copy, Default)]
+pub struct DrawList<'a> {
+    /// Meshes added with `Renderer::create_mesh`. References, so ids can stay
+    /// wherever they're kept, such as a map of chunks.
+    pub meshes: &'a [&'a MeshId],
+    /// Geometry for this frame only, read by the device straight from host visible memory.
+    pub indices: &'a [Index],
+    pub vertices: &'a [Vertex],
+    /// Meshes outside this camera's frustum are culled on the device.
+    pub view: Mat4,
+    pub proj: Mat4,
+}
 
 pub struct Renderer {
-    pub frame_index_buffers: Vec<StagedBuffer>,
-    pub frame_vertex_buffers: Vec<StagedBuffer>,
+    pub mesh_pool: MeshPool,
+    /// Mesh uploads pass through these on their way into `mesh_pool`.
+    pub frame_staging_buffers: Vec<DynamicBuffer>,
+    /// Turns each frame's meshes into indirect draws for the visible ones.
+    pub culler: Culler,
+    /// Most draws one indirect call can make, 1 without the `multiDrawIndirect` feature.
+    pub indirect_draw_batch: u32,
+    pub frame_index_buffers: Vec<DynamicBuffer>,
+    pub frame_vertex_buffers: Vec<DynamicBuffer>,
 
     pub current_frame: usize,
     pub in_flight_frames: Vec<vk::Fence>,
@@ -63,6 +87,16 @@ unsafe impl Sync for Renderer {}
 
 impl Renderer {
     pub fn new(app: &App, window_width: u32, window_height: u32) -> VkResult<Self> {
+        Self::with_mesh_capacity(app, window_width, window_height, MeshCapacity::default())
+    }
+
+    /// Sizes the shared mesh buffers, which don't grow.
+    pub fn with_mesh_capacity(
+        app: &App,
+        window_width: u32,
+        window_height: u32,
+        mesh_capacity: MeshCapacity,
+    ) -> VkResult<Self> {
         let adapter = app
             .request_adapter()
             .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
@@ -74,9 +108,27 @@ impl Renderer {
             surface.extent(window_width, window_height, &adapter, &surface_instance)?;
 
         // Render Device
-        let graphics_queue_family =
-            adapter.get_queue_family(&surface_instance, &surface, true, vk::QueueFlags::GRAPHICS);
-        let render_device = create_render_device(app, &adapter, &graphics_queue_family)?;
+        // NOTE: Culling runs on the graphics queue, so it must also support compute.
+        let graphics_queue_family = adapter.get_queue_family(
+            &surface_instance,
+            &surface,
+            true,
+            vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+        );
+        let multi_draw_indirect = adapter.features.multi_draw_indirect == vk::TRUE;
+        // Compacting needs to draw every visible mesh in one counted call.
+        let draw_indirect_count = adapter.draw_indirect_count && multi_draw_indirect;
+        let render_device = create_render_device(
+            app,
+            &adapter,
+            &graphics_queue_family,
+            multi_draw_indirect,
+            draw_indirect_count,
+        )?;
+        let indirect_draw_batch = match multi_draw_indirect {
+            true => adapter.properties.limits.max_draw_indirect_count,
+            false => 1,
+        };
         let graphics_queue = Queue::new(&graphics_queue_family, &render_device, 0);
 
         // Uniform Buffers
@@ -144,24 +196,43 @@ impl Renderer {
         let rendered_images =
             create_semaphores(&render_device, swapchain.present_images.len() as u32);
 
-        // Mesh Buffers
+        // Meshes
+        let mesh_pool = MeshPool::new(
+            &adapter,
+            &render_device,
+            mesh_capacity,
+            FRAMES_IN_FLIGHT as usize,
+        )?;
+        let frame_staging_buffers = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                DynamicBuffer::new(
+                    &adapter,
+                    &render_device,
+                    vk::BufferUsageFlags::TRANSFER_SRC,
+                    INITIAL_DYNAMIC_ELEMENTS * size_of::<Vertex>() as vk::DeviceSize,
+                )
+            })
+            .collect::<VkResult<Vec<_>>>()?;
+        let culler = Culler::new(&adapter, &render_device, FRAMES_IN_FLIGHT, draw_indirect_count)?;
+
+        // Dynamic Geometry Buffers
         let frame_index_buffers = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
-                StagedBuffer::new(
+                DynamicBuffer::new(
                     &adapter,
                     &render_device,
                     vk::BufferUsageFlags::INDEX_BUFFER,
-                    INITIAL_MESH_ELEMENTS * size_of::<Index>() as vk::DeviceSize,
+                    INITIAL_DYNAMIC_ELEMENTS * size_of::<Index>() as vk::DeviceSize,
                 )
             })
             .collect::<VkResult<Vec<_>>>()?;
         let frame_vertex_buffers = (0..FRAMES_IN_FLIGHT)
             .map(|_| {
-                StagedBuffer::new(
+                DynamicBuffer::new(
                     &adapter,
                     &render_device,
                     vk::BufferUsageFlags::VERTEX_BUFFER,
-                    INITIAL_MESH_ELEMENTS * size_of::<Vertex>() as vk::DeviceSize,
+                    INITIAL_DYNAMIC_ELEMENTS * size_of::<Vertex>() as vk::DeviceSize,
                 )
             })
             .collect::<VkResult<Vec<_>>>()?;
@@ -197,6 +268,10 @@ impl Renderer {
         }
 
         Ok(Self {
+            mesh_pool,
+            frame_staging_buffers,
+            culler,
+            indirect_draw_batch,
             frame_index_buffers,
             frame_vertex_buffers,
 
@@ -237,13 +312,29 @@ impl Renderer {
         self.current_frame = (self.current_frame + 1) % self.in_flight_frames.len();
     }
 
+    /// Adds a mesh to the shared mesh buffers, uploaded by the next `submit`.
+    /// Indices are relative to the mesh's own first vertex, and an empty mesh draws nothing.
+    ///
+    /// Fails with `ERROR_OUT_OF_DEVICE_MEMORY` when the shared buffers have no room left.
+    #[inline]
+    pub fn create_mesh(&mut self, indices: &[Index], vertices: &[Vertex]) -> VkResult<MeshId> {
+        self.mesh_pool.create(indices, vertices)
+    }
+
+    /// Its space is reused once no frame in flight can still draw it.
+    #[inline]
+    pub fn destroy_mesh(&mut self, id: MeshId) {
+        let frame_count = self.in_flight_frames.len();
+        let last_frame = (self.current_frame + frame_count - 1) % frame_count;
+        self.mesh_pool.destroy(id, last_frame);
+    }
+
     #[rustfmt::skip]
     pub fn submit(
         &mut self,
         window_width: u32,
         window_height: u32,
-        indices: &[Index],
-        vertices: &[Vertex],
+        draws: &DrawList,
     ) -> VkResult<()> {
         let surface_extent = self.surface
             .extent(window_width, window_height, &self.adapter, &self.surface_instance)?;
@@ -275,6 +366,7 @@ impl Renderer {
 
         unsafe {
             self.render_device.wait_for_fences(&[frame_in_flight], true, u64::MAX)?;
+            self.mesh_pool.release_frame(frame);
 
             // Swapchain
             // NOTE: A suboptimal image can still be presented, so it's rebuilt next frame.
@@ -299,33 +391,52 @@ impl Renderer {
             // Only reset once work that signals the fence is certain to be submitted.
             self.render_device.reset_fences(&[frame_in_flight])?;
 
-            // Mesh buffers
+            // Dynamic geometry
             // NOTE: The fence wait above means the device is done with this frame's buffers.
-            self.frame_index_buffers[frame].write(&self.adapter, &self.render_device, indices)?;
-            self.frame_vertex_buffers[frame].write(&self.adapter, &self.render_device, vertices)?;
-            let index_buffer = &self.frame_index_buffers[frame];
-            let vertex_buffer = &self.frame_vertex_buffers[frame];
+            self.frame_index_buffers[frame].write(&self.adapter, &self.render_device, draws.indices)?;
+            self.frame_vertex_buffers[frame].write(&self.adapter, &self.render_device, draws.vertices)?;
+
+            // Meshes to cull
+            let candidates: Vec<u32> = draws.meshes
+                .iter()
+                .map(|id| self.mesh_pool.info_index(id))
+                .collect();
+            let candidate_count = candidates.len() as u32;
+            // A counted draw can't be split, so too many meshes fall back to one draw each.
+            let compact = self.culler.can_compact && candidate_count <= self.indirect_draw_batch;
 
             // Uniform buffers
-            let mvp_identity = MvpMatrices::default();
-            self.uniform_buffers[frame].mem_write(slice::from_ref(&mvp_identity));
+            let mvp = MvpMatrices {
+                model: Mat4::IDENTITY,
+                view: draws.view,
+                proj: draws.proj,
+            };
+            self.uniform_buffers[frame].mem_write(slice::from_ref(&mvp));
 
             // Command buffer
             let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
             self.render_device.begin_command_buffer(frame_cmd_buffer, &command_buffer_begin_info)?;
 
-            // Mesh transfer
-            index_buffer.cmd_copy(&self.render_device, frame_cmd_buffer);
-            vertex_buffer.cmd_copy(&self.render_device, frame_cmd_buffer);
-            let mesh_barrier = vk::MemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::COPY)
-                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT | vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
-                .dst_access_mask(vk::AccessFlags2::INDEX_READ | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ);
-            let mesh_dependency = vk::DependencyInfo::default()
-                .memory_barriers(slice::from_ref(&mesh_barrier));
-            self.render_device.cmd_pipeline_barrier2(frame_cmd_buffer, &mesh_dependency);
+            // Mesh uploads
+            self.mesh_pool.cmd_upload(
+                &self.adapter,
+                &self.render_device,
+                &mut self.frame_staging_buffers[frame],
+                frame_cmd_buffer,
+            )?;
+
+            // Mesh culling
+            self.culler.cmd_cull(
+                &self.adapter,
+                &self.render_device,
+                &self.mesh_pool,
+                frame,
+                frame_cmd_buffer,
+                &candidates,
+                draws.proj * draws.view,
+                compact,
+            )?;
 
             let present_image = self.swapchain.present_images[image_index as usize];
             let present_image_view = self.swapchain.present_image_views[image_index as usize];
@@ -359,7 +470,7 @@ impl Renderer {
             self.render_device
                 .cmd_begin_rendering(frame_cmd_buffer, &rendering_info);
 
-            if !indices.is_empty() {
+            if candidate_count > 0 || !draws.indices.is_empty() {
                 self.render_device.cmd_bind_pipeline(
                     frame_cmd_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -368,20 +479,6 @@ impl Renderer {
 
                 self.render_device.cmd_set_viewport(frame_cmd_buffer, 0, &viewports);
                 self.render_device.cmd_set_scissor(frame_cmd_buffer, 0, &scissors);
-
-                // Buffer Bindings
-                self.render_device.cmd_bind_index_buffer(
-                    frame_cmd_buffer,
-                    index_buffer.dst.handle,
-                    0,
-                    vk::IndexType::UINT32,
-                );
-                self.render_device.cmd_bind_vertex_buffers(
-                    frame_cmd_buffer,
-                    0,
-                    &[vertex_buffer.dst.handle],
-                    &[0],
-                );
                 self.render_device.cmd_bind_descriptor_sets(
                     frame_cmd_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -391,7 +488,47 @@ impl Renderer {
                     &[],
                 );
 
-                self.render_device.cmd_draw_indexed(frame_cmd_buffer, indices.len() as u32, 1, 0, 0, 0);
+                // Every mesh shares these buffers, so they're bound once and drawn indirectly.
+                if candidate_count > 0 {
+                    self.cmd_bind_geometry(
+                        frame_cmd_buffer,
+                        self.mesh_pool.index_buffer.handle,
+                        self.mesh_pool.vertex_buffer.handle,
+                    );
+                    let draw_buffer = self.culler.frame_draw_buffers[frame].buffer.handle;
+                    let stride = size_of::<vk::DrawIndexedIndirectCommand>() as u32;
+                    if compact {
+                        self.render_device.cmd_draw_indexed_indirect_count(
+                            frame_cmd_buffer,
+                            draw_buffer,
+                            0,
+                            self.culler.frame_count_buffers[frame].handle,
+                            0,
+                            candidate_count,
+                            stride,
+                        );
+                    } else {
+                        // Culled meshes still have a draw, of zero instances.
+                        for first_draw in (0..candidate_count).step_by(self.indirect_draw_batch as usize) {
+                            self.render_device.cmd_draw_indexed_indirect(
+                                frame_cmd_buffer,
+                                draw_buffer,
+                                first_draw as vk::DeviceSize * stride as vk::DeviceSize,
+                                self.indirect_draw_batch.min(candidate_count - first_draw),
+                                stride,
+                            );
+                        }
+                    }
+                }
+
+                if !draws.indices.is_empty() {
+                    self.cmd_bind_geometry(
+                        frame_cmd_buffer,
+                        self.frame_index_buffers[frame].buffer.handle,
+                        self.frame_vertex_buffers[frame].buffer.handle,
+                    );
+                    self.render_device.cmd_draw_indexed(frame_cmd_buffer, draws.indices.len() as u32, 1, 0, 0, 0);
+                }
             }
             self.render_device.cmd_end_rendering(frame_cmd_buffer);
 
@@ -445,6 +582,21 @@ impl Renderer {
             }
 
             Ok(self.advance_current_frame())
+        }
+    }
+
+    #[inline]
+    fn cmd_bind_geometry(
+        &self,
+        cmd_buffer: vk::CommandBuffer,
+        index_buffer: vk::Buffer,
+        vertex_buffer: vk::Buffer,
+    ) {
+        unsafe {
+            self.render_device
+                .cmd_bind_index_buffer(cmd_buffer, index_buffer, 0, vk::IndexType::UINT32);
+            self.render_device
+                .cmd_bind_vertex_buffers(cmd_buffer, 0, &[vertex_buffer], &[0]);
         }
     }
 
@@ -507,12 +659,15 @@ impl Drop for Renderer {
             // NOTE: Nothing can be done about a lost device here, so destroy regardless.
             let _ = self.render_device.device_wait_idle();
 
-            for mesh_buffer in self
-                .frame_index_buffers
+            self.mesh_pool.destroy_buffers(&self.render_device);
+            self.culler.destroy(&self.render_device);
+            for dynamic_buffer in self
+                .frame_staging_buffers
                 .iter()
+                .chain(&self.frame_index_buffers)
                 .chain(&self.frame_vertex_buffers)
             {
-                mesh_buffer.destroy(&self.render_device);
+                dynamic_buffer.destroy(&self.render_device);
             }
 
             for ubo in self.uniform_buffers.iter() {
@@ -561,6 +716,8 @@ fn create_render_device(
     app: &App,
     adapter: &Adapter,
     queue_family: &QueueFamily,
+    multi_draw_indirect: bool,
+    draw_indirect_count: bool,
 ) -> VkResult<ash::Device> {
     let queue_priorities = [1.0];
     let device_queue_info = vk::DeviceQueueCreateInfo::default()
@@ -574,18 +731,23 @@ fn create_render_device(
     ];
 
     // NOTE: Keep in mind proper ordering when adding features.
-    let features = vk::PhysicalDeviceFeatures::default().shader_clip_distance(true);
+    let features = vk::PhysicalDeviceFeatures::default()
+        .shader_clip_distance(true)
+        .multi_draw_indirect(multi_draw_indirect);
     let mut synchronization2 =
         vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
     let mut dynamic_rendering =
         vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+    let mut vulkan_12_features =
+        vk::PhysicalDeviceVulkan12Features::default().draw_indirect_count(draw_indirect_count);
 
     let device_info = vk::DeviceCreateInfo::default()
         .queue_create_infos(slice::from_ref(&device_queue_info))
         .enabled_extension_names(&extension_names_raw)
         .enabled_features(&features)
         .push_next(&mut synchronization2)
-        .push_next(&mut dynamic_rendering);
+        .push_next(&mut dynamic_rendering)
+        .push_next(&mut vulkan_12_features);
 
     unsafe {
         app.instance
@@ -594,7 +756,7 @@ fn create_render_device(
 }
 
 #[inline]
-fn create_shader_module(
+pub(crate) fn create_shader_module(
     render_device: &ash::Device,
     spv_bytes: &[u8],
 ) -> VkResult<vk::ShaderModule> {

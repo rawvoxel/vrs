@@ -6,7 +6,8 @@ use anyhow::Result;
 use ash::vk;
 use vrs::{
     App,
-    renderer::Renderer,
+    mesh::MeshId,
+    renderer::{DrawList, Renderer},
     vertex::{Index, Vertex},
 };
 use winit::{
@@ -28,6 +29,7 @@ const VERTICES: [Vertex; 3] = [
 ];
 
 struct Vulkan {
+    triangle: MeshId,
     // NOTE: Field order matters, the renderer must be dropped before the app.
     renderer: Renderer,
     _app: App,
@@ -44,9 +46,15 @@ impl Vulkan {
             window.window_handle()?.as_raw(),
             app_info,
         )?;
-        let renderer = Renderer::new(&app, size.width, size.height)?;
+        let mut renderer = Renderer::new(&app, size.width, size.height)?;
+        // Uploaded once, then drawn every frame.
+        let triangle = renderer.create_mesh(&INDICES, &VERTICES)?;
 
-        Ok(Self { renderer, _app: app })
+        Ok(Self {
+            triangle,
+            renderer,
+            _app: app,
+        })
     }
 }
 
@@ -86,9 +94,13 @@ impl ApplicationHandler for Triangle {
                 if size.width == 0 || size.height == 0 {
                     return;
                 }
+                let draws = DrawList {
+                    meshes: &[&vulkan.triangle],
+                    ..Default::default()
+                };
                 vulkan
                     .renderer
-                    .submit(size.width, size.height, &INDICES, &VERTICES)
+                    .submit(size.width, size.height, &draws)
                     .expect("Could not submit frame.");
             }
             _ => (),

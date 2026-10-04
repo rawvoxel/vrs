@@ -5,6 +5,8 @@ use ash::{khr, vk};
 pub struct Adapter {
     pub handle: vk::PhysicalDevice,
     pub features: vk::PhysicalDeviceFeatures,
+    /// The Vulkan 1.2 `drawIndirectCount` feature.
+    pub draw_indirect_count: bool,
     pub properties: vk::PhysicalDeviceProperties,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub queue_families: Vec<QueueFamily>,
@@ -14,6 +16,11 @@ impl Adapter {
     pub fn new(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Self {
         unsafe {
             let features = instance.get_physical_device_features(physical_device);
+            let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default();
+            let mut features2 =
+                vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_12_features);
+            instance.get_physical_device_features2(physical_device, &mut features2);
+            let draw_indirect_count = vulkan_12_features.draw_indirect_count == vk::TRUE;
             let properties = instance.get_physical_device_properties(physical_device);
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
             let queue_families = get_queue_families(&instance, physical_device);
@@ -21,6 +28,7 @@ impl Adapter {
             Self {
                 handle: physical_device,
                 features,
+                draw_indirect_count,
                 properties,
                 memory_properties,
                 queue_families,

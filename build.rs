@@ -1,21 +1,22 @@
 use std::{fs, path::Path, process::Command, time::SystemTime};
 
 fn main() {
-    compile_slang_spv();
+    compile_slang_spv("shader.slang", "slang.spv", &["vertMain", "fragMain"]);
+    compile_slang_spv("cull.slang", "cull.spv", &["cullMain"]);
 }
 
 #[rustfmt::skip]
-fn compile_slang_spv() {
+fn compile_slang_spv(slang_name: &str, spv_name: &str, entries: &[&str]) {
     let shader_dir = Path::new("assets/shader");
     fs::create_dir_all(shader_dir).unwrap();
     let shader_dir = shader_dir.canonicalize().expect("Failed to canonicalize shader directory!");
 
-    let slang_path = shader_dir.join("shader.slang");
-    let spv_path = shader_dir.join("slang.spv");
+    let slang_path = shader_dir.join(slang_name);
+    let spv_path = shader_dir.join(spv_name);
 
     // Re-run if the shader source changes
     println!("cargo:rerun-if-changed={}", slang_path.display());
-    
+
     let slang_meta = fs::metadata(&slang_path);
     let spv_meta = fs::metadata(&spv_path);
 
@@ -32,15 +33,18 @@ fn compile_slang_spv() {
         return;
     }
 
-    // Run `slangc` with both entry points
-    let status = Command::new("slangc")
-        .args([
-            slang_path.to_str().unwrap(),
-            "-target", "spirv", "-profile", "spirv_1_4",
-            "-emit-spirv-directly", "-fvk-use-entrypoint-name",
-            "-entry", "vertMain", "-entry", "fragMain", "-o",
-            spv_path.to_str().unwrap(),
-        ])
+    // Run `slangc` with every entry point
+    let mut command = Command::new("slangc");
+    command.args([
+        slang_path.to_str().unwrap(),
+        "-target", "spirv", "-profile", "spirv_1_4",
+        "-emit-spirv-directly", "-fvk-use-entrypoint-name",
+    ]);
+    for entry in entries {
+        command.args(["-entry", entry]);
+    }
+    let status = command
+        .args(["-o", spv_path.to_str().unwrap()])
         .status()
         .expect("Failed to run slangc!");
 
