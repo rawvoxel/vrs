@@ -19,6 +19,8 @@ pub(super) struct FrameData {
     pub shadow_pass: bool,
     /// Whether the light probes are drawn over the frame, see `DebugView::Probes`.
     pub draw_probes: bool,
+    /// Whether color is drawn with the light from everywhere but the sun the shadow pass lit.
+    pub upscaled_indirect: bool,
 }
 
 impl FrameData {
@@ -93,6 +95,9 @@ impl Renderer {
         let reflection = vk::DescriptorImageInfo::default()
             .image_view(self.shadow_pass.reflection_view)
             .image_layout(vk::ImageLayout::GENERAL);
+        let indirect = vk::DescriptorImageInfo::default()
+            .image_view(self.shadow_pass.indirect_view)
+            .image_layout(vk::ImageLayout::GENERAL);
         let image_writes = [
             (13, vk::DescriptorType::STORAGE_IMAGE, &shadow_storage),
             (
@@ -109,6 +114,8 @@ impl Renderer {
             (20, vk::DescriptorType::SAMPLED_IMAGE, &light_shadow),
             (21, vk::DescriptorType::STORAGE_IMAGE, &reflection),
             (22, vk::DescriptorType::SAMPLED_IMAGE, &reflection),
+            (23, vk::DescriptorType::STORAGE_IMAGE, &indirect),
+            (24, vk::DescriptorType::SAMPLED_IMAGE, &indirect),
         ]
         .map(|(binding, ty, info)| {
             vk::WriteDescriptorSet::default()
@@ -132,6 +139,14 @@ impl Renderer {
                 .wait_for_fences(&[self.in_flight_frames[frame]], true, u64::MAX)?;
         }
         self.mesh_pool.release_frame(frame);
+        let timings = self.frame_timestamps[frame].read(
+            &self.render_device,
+            self.adapter.properties.limits.timestamp_period,
+            self.graphics_queue_family.properties.timestamp_valid_bits,
+        );
+        if timings.is_some() {
+            self.gpu_timings = timings;
+        }
         Ok(())
     }
 
@@ -223,6 +238,9 @@ impl Renderer {
             gi: self.gi_enabled(),
             shadow_pass: self.uses_shadow_pass(),
             draw_probes: self.lighting.debug_view == super::DebugView::Probes && self.gi_enabled(),
+            // The ambient occlusion's own view needs each pixel's.
+            upscaled_indirect: self.lights_indirect_in_shadow_pass()
+                && self.lighting.debug_view != super::DebugView::AmbientOcclusion,
         })
     }
 

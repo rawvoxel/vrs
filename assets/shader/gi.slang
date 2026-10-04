@@ -41,6 +41,13 @@ int cascadeOf(uint slot) {
     return int(slot / probesPerCascade());
 }
 
+// Frames between the updates of the probe in slot `slot`, which converges faster for `fast`
+// more frames: `ProbeTuning::update_interval` in the finest cascade, twice as many in each
+// coarser one, further off, or every frame while it converges faster.
+uint updatePeriod(uint slot, uint fast) {
+    return fast > 0 ? 1 : ubo.gi.frame.w << uint(cascadeOf(slot));
+}
+
 // Where cascade `cascade`'s probe cell `cell` puts its probe, in the finest voxels, false when
 // it has no room for one. From the chunk of the finest level holding the cell's center, see
 // `chunkAtPoint`: one of the cascade's level has its cells baked when it was added, see
@@ -213,10 +220,9 @@ void classifyProbes(uint3 threadId: SV_DispatchThreadID) {
         probes[slot].state = state;
     }
 
-    // Coarser cascades, further off, update less often: each probe every `2^cascade` frames,
-    // in turn, unless nearby chunks just changed.
-    uint period = 1u << uint(cascade);
-    if (fast == 0 && ((ubo.gi.frame.x + slot) & (period - 1)) != 0) {
+    // Each probe updates every few frames, in turn, unless nearby chunks just changed.
+    uint period = updatePeriod(slot, fast);
+    if (((ubo.gi.frame.x + slot) & (period - 1)) != 0) {
         return;
     }
 
@@ -339,7 +345,8 @@ int2 atlasTexel(uint listed, int2 texel, int texels) {
 [numthreads(IRRADIANCE_TEXELS + 2, IRRADIANCE_TEXELS + 2, 1)]
 void updateIrradiance(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint threadIndex: SV_GroupIndex) {
     uint rays = loadRays(group.x, threadIndex, (IRRADIANCE_TEXELS + 2) * (IRRADIANCE_TEXELS + 2));
-    Probe probe = probes[active[ACTIVE_LIST + group.x]];
+    uint slot = active[ACTIVE_LIST + group.x];
+    Probe probe = probes[slot];
 
     // The average light of the rays, weighted by how far each faces the texel's direction.
     float3 direction = texelDirection(int2(thread.xy), IRRADIANCE_TEXELS);
@@ -357,10 +364,12 @@ void updateIrradiance(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, u
     float3 old = irradianceAtlas[texel].rgb;
     // A probe's first update replaces what was there, and big changes are let through
     // faster [Majercik et al. 2021].
+    // Probes updated every few frames keep as much less each time, so they follow changes as
+    // fast.
     uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
     float hysteresis = probe.updates <= 1
         ? 0.0
-        : ubo.gi.tuning.x * ubo.gi.rays.y * (fast > 0 ? 0.5 : 1.0);
+        : pow(ubo.gi.tuning.x * ubo.gi.rays.y * (fast > 0 ? 0.5 : 1.0), float(updatePeriod(slot, fast)));
     float3 change = abs(irradiance - old);
     float largestChange = max(change.x, max(change.y, change.z));
     if (largestChange > 0.25) {
@@ -408,6 +417,6 @@ void updateDepth(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint t
     uint fast = (probe.state >> PROBE_FAST_SHIFT) & 0xff;
     float hysteresis = probe.updates <= 1
         ? 0.0
-        : ubo.gi.tuning.y * ubo.gi.rays.z * (fast > FAST_FRAMES - FAST_DEPTH_FRAMES ? 0.5 : 1.0);
+        : pow(ubo.gi.tuning.y * ubo.gi.rays.z * (fast > FAST_FRAMES - FAST_DEPTH_FRAMES ? 0.5 : 1.0), float(updatePeriod(slot, fast)));
     depthAtlas[texel] = float4(lerp(moments, old, hysteresis), 0.0, 0.0);
 }

@@ -312,9 +312,22 @@ impl Renderer {
                 extent.height,
                 self.glossy_palette as u32,
             ],
-            frame_size: [frame.width, frame.height, self.uses_shadow_pass() as u32, 0],
+            frame_size: [
+                frame.width,
+                frame.height,
+                self.uses_shadow_pass() as u32,
+                self.lights_indirect_in_shadow_pass() as u32,
+            ],
             lights: [self.light_count(), tiles_x, tiles_y, shadowed],
         }
+    }
+
+    /// Whether the shadow pass lights faces with the light from everywhere but the sun,
+    /// probes and ambient occlusion, for shading to upscale, which below full resolution is
+    /// cheaper than every pixel finding it.
+    pub(super) fn lights_indirect_in_shadow_pass(&self) -> bool {
+        let indirect_work = self.gi_enabled() || self.lighting.ambient_occlusion > 0.0;
+        self.uses_shadow_pass() && self.shadow_scale() > 1 && indirect_work
     }
 
     /// How many of `lights` light the frame.
@@ -386,7 +399,7 @@ impl Renderer {
                 self.frame_number as u32,
                 self.probe_volume.rays_per_frame,
                 cascades,
-                0,
+                tuning.update_interval.clamp(1, 16).next_power_of_two(),
             ],
             ..Default::default()
         };

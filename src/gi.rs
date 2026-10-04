@@ -7,6 +7,7 @@ use crate::{
     buffer::Buffer,
     image::{Image, create_image_view},
     pipeline::create_shader_module,
+    timings::{FrameTimestamps, Mark},
     voxel::VoxelTypes,
 };
 use ash::{prelude::VkResult, vk};
@@ -155,7 +156,8 @@ pub struct GiUniforms {
     pub ray_rotation: [f32; 4],
     /// The camera's world position, w unused.
     pub camera_position: [f32; 4],
-    /// x is the frame's number, y the rays traced each frame, z how many cascades there are.
+    /// x is the frame's number, y the rays traced each frame, z how many cascades there are, w
+    /// the frames between the finest cascade's probes' updates.
     pub frame: [u32; 4],
     /// `ProbeTuning`'s hysteresis, depth hysteresis, depth sharpness and self-shadow bias.
     pub tuning: [f32; 4],
@@ -181,6 +183,11 @@ pub struct ProbeTuning {
     /// How far probes' rays reach, in the `ShadowGrid`'s voxels. Further finds more distant
     /// light, at more cost.
     pub ray_distance: f32,
+    /// Frames between each probe's updates in the finest cascade, rounded up to a power of
+    /// two from 1 to 16, twice as many in each coarser one. The probes take turns, and each
+    /// update blends in as much more, so light follows changes as fast, a little noisier, for
+    /// a fraction of the cost. Probes near chunks that just changed update every frame.
+    pub update_interval: u32,
 }
 
 impl Default for ProbeTuning {
@@ -191,6 +198,7 @@ impl Default for ProbeTuning {
             depth_sharpness: 50.0,
             self_shadow_bias: 0.3,
             ray_distance: 512.0,
+            update_interval: 4,
         }
     }
 }
@@ -525,6 +533,7 @@ impl ProbeVolume {
         cmd_buffer: vk::CommandBuffer,
         set: vk::DescriptorSet,
         layout: vk::PipelineLayout,
+        timestamps: &FrameTimestamps,
     ) {
         let barrier = |src_stage, src_access, dst_stage, dst_access| {
             let barrier = vk::MemoryBarrier2::default()
@@ -594,6 +603,7 @@ impl ProbeVolume {
             barrier(compute, vk::AccessFlags2::SHADER_WRITE, compute, read_write);
             logical_device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::COMPUTE, self.plan);
             logical_device.cmd_dispatch(cmd_buffer, 1, 1, 1);
+            timestamps.mark(logical_device, cmd_buffer, Mark::GiClassify);
             barrier(
                 compute,
                 vk::AccessFlags2::SHADER_WRITE,
@@ -603,10 +613,12 @@ impl ProbeVolume {
 
             // One group per 32 rays, then one per active probe.
             dispatch(self.trace, 0);
+            timestamps.mark(logical_device, cmd_buffer, Mark::GiTrace);
             // The rays are written, and tracing is done sampling the atlases.
             barrier(compute, vk::AccessFlags2::SHADER_WRITE, compute, read_write);
             dispatch(self.update_irradiance, UPDATE_GROUPS);
             dispatch(self.update_depth, UPDATE_GROUPS);
+            timestamps.mark(logical_device, cmd_buffer, Mark::GiUpdate);
             barrier(
                 compute,
                 vk::AccessFlags2::SHADER_WRITE,

@@ -101,6 +101,13 @@ impl Renderer {
         }))
     }
 
+    /// How long each stage of the last frame the device finished took, `None` before one has
+    /// or when its queue can't time them. Without stalling: it's the frame from as many frames
+    /// ago as are in flight.
+    pub fn debug_gpu_timings(&self) -> Option<&super::GpuTimings> {
+        self.gpu_timings.as_ref()
+    }
+
     /// For tests and tools, without stalling.
     pub fn debug_mesh_pool_stats(&self) -> MeshPoolStats {
         let repacks = self.mesh_pool.repack_counts();

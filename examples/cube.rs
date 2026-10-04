@@ -2,11 +2,15 @@
 //!
 //! Run with `cargo run -p vrs --example cube`.
 //!
+//! The title shows frames a second and how long frames take on the GPU.
+//!
 //! Greedy meshing merges each side into one quad, yet each voxel keeps its own color:
 //! the renderer looks up the voxel under every pixel in the chunk's voxel types.
 
 #[path = "common/greedy.rs"]
 mod greedy;
+#[path = "common/title.rs"]
+mod title;
 
 use anyhow::Result;
 use ash::vk;
@@ -91,6 +95,7 @@ impl Vulkan {
 
 struct Cube {
     started: Instant,
+    title: title::FrameTitle,
     // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
@@ -143,6 +148,7 @@ impl ApplicationHandler for Cube {
                     .renderer
                     .submit(size.width, size.height, &draws)
                     .expect("Could not submit frame.");
+                self.title.frame(window, &mut vulkan.renderer, |_| None);
             }
             _ => (),
         }
@@ -163,6 +169,7 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
     event_loop.run_app(&mut Cube {
         started: Instant::now(),
+        title: title::FrameTitle::new("cube"),
         vulkan: None,
         window: None,
     })?;

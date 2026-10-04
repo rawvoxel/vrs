@@ -11,6 +11,7 @@ mod setup;
 
 pub use crate::gi::{GiConfig, MAX_CASCADES, ProbeTuning};
 pub use crate::lights::{Light, MAX_LIGHTS, Spot};
+pub use crate::timings::GpuTimings;
 pub use capture::Capture;
 pub use config::RendererConfig;
 pub use debug::{FrameStats, MeshPoolStats};
@@ -90,6 +91,10 @@ pub struct Renderer {
     frame_number: u64,
     /// What `debug_frame_stats` reads back.
     last_frame: Option<debug::LastFrame>,
+    /// Timestamps between each frame in flight's stages, null pools when the queue has none.
+    frame_timestamps: Vec<crate::timings::FrameTimestamps>,
+    /// The last finished frame's, see `debug_gpu_timings`.
+    gpu_timings: Option<GpuTimings>,
     /// Whether the next frame is copied into `capture_buffers`.
     capture_requested: bool,
     capture_buffers: Vec<DynamicBuffer>,
@@ -157,6 +162,8 @@ pub struct Renderer {
     mesh_depth_pipeline: vk::Pipeline,
     /// Draws the mesh pool's meshes' color over their depth already drawn.
     mesh_over_depth_pipeline: vk::Pipeline,
+    /// The same, when the shadow pass lit the light from everywhere but the sun.
+    mesh_upscaled_indirect_pipeline: vk::Pipeline,
     /// Draws the light probes, for `DebugView::Probes`.
     probes_pipeline: vk::Pipeline,
     /// Draws each frame's own geometry from `frame_vertex_buffers`.
@@ -364,6 +371,9 @@ impl Drop for Renderer {
                 buffer.destroy(device);
             }
 
+            for timestamps in &self.frame_timestamps {
+                timestamps.destroy(device);
+            }
             for buffer in self.uniform_buffers.iter() {
                 buffer.destroy(device);
             }
@@ -388,6 +398,7 @@ impl Drop for Renderer {
             device.destroy_pipeline(self.mesh_pipeline, None);
             device.destroy_pipeline(self.mesh_depth_pipeline, None);
             device.destroy_pipeline(self.mesh_over_depth_pipeline, None);
+            device.destroy_pipeline(self.mesh_upscaled_indirect_pipeline, None);
             device.destroy_pipeline(self.probes_pipeline, None);
             device.destroy_pipeline(self.dynamic_pipeline, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);

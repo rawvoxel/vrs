@@ -57,7 +57,8 @@ struct GiUniforms {
     // This frame's random rotation of the probes' rays, a quaternion.
     float4 rayRotation;
     float4 cameraPosition;
-    // x is the frame's number, y the rays traced each frame, z how many cascades there are.
+    // x is the frame's number, y the rays traced each frame, z how many cascades there are, w
+    // the frames between the finest cascade's probes' updates.
     uint4 frame;
     // `ProbeTuning`'s hysteresis, depth hysteresis, depth sharpness and self-shadow bias.
     float4 tuning;
@@ -73,7 +74,8 @@ struct ShadowUniforms {
     // Frame pixels per shadow texel along each axis, 1 when shading traces its own, then the
     // shadow image's width and height.
     uint4 params;
-    // The frame's width and height, then 1 when the shadow pass ran this frame.
+    // The frame's width and height, then 1 when the shadow pass ran this frame, then 1 when it
+    // also lit faces with the light from everywhere but the sun.
     uint4 frameSize;
     // How many lights there are, the light tiles across and down the frame, and how many of
     // each pixel's lights are shadowed.
@@ -304,6 +306,8 @@ struct VoxelHit {
     // How much light passes along the ray to it, or to its end without a hit, through the
     // see-through voxels on the way, tinted by them.
     float3 transmittance;
+    // The level of the chunk it's in.
+    int level;
 };
 
 // Whether a ray from `origin` along unit `direction`, both in the shadow grid's finest voxels,
@@ -320,6 +324,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
     hit.normal = float3(0.0);
     hit.id = 0;
     hit.transmittance = float3(1.0);
+    hit.level = 0;
     // Whether the last voxel was see-through, so each pane tints the light once.
     bool inGlass = false;
     int edge = int(ubo.lighting.shadowGrid.y);
@@ -399,6 +404,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
                 if (leftSurface) {
                     hit.distance = t;
                     hit.id = id;
+                    hit.level = level;
                     if (axis >= 0) {
                         hit.normal[axis] = -float(stepDirection[axis]);
                     }
@@ -414,6 +420,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
                     // As good as opaque.
                     hit.distance = t;
                     hit.id = id;
+                    hit.level = level;
                     return true;
                 }
             }
@@ -633,23 +640,82 @@ float3 indirectLight(float3 gridPosition, float3 normal, float3 toViewer, bool p
 // The sky's would leak into closed rooms, and with every bounce adding to the next, take
 // many frames to fade.
 SurfaceLight lightParts(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay, float3 sunVisible) {
-    LightingUniforms lighting = ubo.lighting;
-    float3 gridPosition = worldPosition / max(lighting.shadowGrid.x, 1e-6);
     SurfaceLight light;
-    light.direct = float3(0.0);
+    float3 gridPosition = worldPosition / max(ubo.lighting.shadowGrid.x, 1e-6);
     light.indirect = indirectLight(gridPosition, normal, toViewer, probeRay);
+    light.direct = sunLight(worldPosition, normal, faceNormal, sunVisible);
+    return light;
+}
+
+// The sun's light reaching a surface, see `lightParts`.
+float3 sunLight(float3 worldPosition, float3 normal, float3 faceNormal, float3 sunVisible) {
+    LightingUniforms lighting = ubo.lighting;
     float facing = dot(normal, lighting.sunDirection.xyz);
     if (facing <= 0.0) {
-        return light;
+        return float3(0.0);
     }
     float3 visible = sunVisible;
     if (visible.x < 0.0) {
+        float3 gridPosition = worldPosition / max(lighting.shadowGrid.x, 1e-6);
         visible = lighting.shadowTable.w > 0
             ? sunVisibility(gridPosition + faceNormal * SHADOW_RAY_OFFSET, lighting.sunDirection.xyz)
             : float3(1.0);
     }
-    light.direct = lighting.sunColor.rgb * facing * visible;
-    return light;
+    return lighting.sunColor.rgb * facing * visible;
+}
+
+// Moves a point on a face into the voxel behind it, in voxels.
+static const float FACE_NUDGE = 1.0 / 256.0;
+
+// Whether level `level`'s voxel `voxel`, in that level's voxels, blocks light from reaching a
+// corner: solid and not see-through.
+bool gridOccludes(int level, int3 voxel) {
+    int edge = int(ubo.lighting.shadowGrid.y);
+    int3 chunk = floorDiv(voxel, edge);
+    bool outside;
+    uint meshIndex = levelChunk(level, chunk, outside);
+    if (meshIndex == NO_CHUNK) {
+        return false;
+    }
+    MeshInfo mesh = meshes[meshIndex];
+    int3 local = voxel - chunk * edge;
+    int blocksPerEdge = (edge + OCCUPANCY_BLOCK - 1) / OCCUPANCY_BLOCK;
+    if (!blockOccupied(mesh.occupancyBase, blocksPerEdge, local / OCCUPANCY_BLOCK)) {
+        return false;
+    }
+    uint id = typeAt(mesh.typesBase, uint(edge), uint3(local));
+    return id != 0 && !seeThrough(id);
+}
+
+// How open the face of a level `level` chunk facing unit axis `normal` is at `position` on
+// it, in that level's voxels, as `voxelOcclusion` in `mesh.slang` finds it.
+float gridOpenness(int level, float3 position, int3 normal) {
+    int3 front = int3(floor(position - float3(normal) * FACE_NUDGE)) + normal;
+    int3 u = normal.x != 0 ? int3(0, 1, 0) : int3(1, 0, 0);
+    int3 v = normal.z != 0 ? int3(0, 1, 0) : int3(0, 0, 1);
+    float2 along = float2(frac(dot(position, float3(u))), frac(dot(position, float3(v))));
+    bool around[9];
+    for (int i = 0; i < 9; i++) {
+        int2 at = int2(i % 3, i / 3) - 1;
+        around[i] = i != 4 && gridOccludes(level, front + u * at.x + v * at.y);
+    }
+    return cornerOpenness(around, along);
+}
+
+// How open a face is at `along` across its voxel, from 0 to 1 on each axis, with `around`
+// the 8 voxels around the one in front of it, 3 to a row, whether each blocks light: each
+// corner darkens with those around it, two solid sides closing it entirely, and the point
+// blends the four corners [classic voxel ambient occlusion].
+float cornerOpenness(bool around[9], float2 along) {
+    float corners[4];
+    for (int i = 0; i < 4; i++) {
+        int2 side = int2(i & 1, i >> 1) * 2 - 1;
+        bool sideU = around[4 + side.x];
+        bool sideV = around[4 + 3 * side.y];
+        bool corner = around[4 + side.x + 3 * side.y];
+        corners[i] = sideU && sideV ? 0.0 : (3.0 - float(sideU) - float(sideV) - float(corner)) / 3.0;
+    }
+    return lerp(lerp(corners[0], corners[1], along.x), lerp(corners[2], corners[3], along.x), along.y);
 }
 
 // Pixels along each edge of a tile lights are culled for. Matches `shadows::LIGHT_TILE`.

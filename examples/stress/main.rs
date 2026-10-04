@@ -2,7 +2,8 @@
 //!
 //! Run with `cargo run -p vrs --example stress`, it exits with a failure code if a check fails.
 //! `-- --headless` renders without a window, such as on a CI machine with a software
-//! Vulkan driver like lavapipe.
+//! Vulkan driver like lavapipe. With a window, its title shows the scenario running, frames a
+//! second and how long frames take on the GPU.
 //!
 //! A grid of chunk meshes sits behind a wall mesh. Scenarios cull it with different cameras,
 //! remesh chunks every frame against a nearly full mesh pool, and resize and
@@ -23,6 +24,8 @@ mod pixels;
 mod scenarios;
 mod scene;
 mod target;
+#[path = "../common/title.rs"]
+mod title;
 
 use anyhow::{Result, bail};
 use ash::vk;
@@ -58,6 +61,8 @@ const POOL_TEST_DELAY: u32 = 2;
 struct Stress {
     target: Option<Target>,
     scene: Option<Scene>,
+    /// With a window.
+    title: Option<title::FrameTitle>,
     scenario: usize,
     frame: u32,
     /// Chunks that couldn't be meshed, which never happens while every chunk fits the pool.
@@ -266,6 +271,10 @@ impl Stress {
             .renderer
             .submit(size.width, size.height, &draws)
             .unwrap();
+        if let (Some(Target::Window(window)), Some(title)) = (&self.target, &mut self.title) {
+            let name = scenario.name;
+            title.frame(window, &mut scene.renderer, |_| Some(name.to_string()));
+        }
 
         if last_frame {
             self.finish_scenario(proj * view, captured);
@@ -381,6 +390,7 @@ impl ApplicationHandler for Stress {
             app_info(),
         )
         .unwrap();
+        self.title = Some(title::FrameTitle::new("stress"));
         self.start(app, Target::Window(window));
     }
 

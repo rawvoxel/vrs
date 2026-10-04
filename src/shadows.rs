@@ -7,6 +7,7 @@ use crate::{
     buffer::Buffer,
     image::{Image, create_image_view},
     pipeline::create_shader_module,
+    timings::{FrameTimestamps, Mark},
 };
 use ash::{prelude::VkResult, vk};
 use glam::Mat4;
@@ -18,7 +19,7 @@ const SHADOW_SPV: &[u8] = include_bytes!("../assets/shader/shadow.spv");
 const SHADOW_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
 /// Each texel's shadowed lights and how much of each gets through, 8 bits each.
 const LIGHT_SHADOW_FORMAT: vk::Format = vk::Format::R32G32_UINT;
-/// Each texel's reflection, and which face it's of.
+/// Each texel's reflection, or light from everywhere but the sun, and which face it's of.
 const REFLECTION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Matches `numthreads` of `traceShadows` in `shadow.slang`.
 const WORKGROUP_SIZE: u32 = 8;
@@ -37,7 +38,8 @@ pub struct ShadowUniforms {
     /// Frame pixels per shadow texel along each axis, then the shadow image's width and
     /// height, then 1 when any material is glossy, for reflections to be traced.
     pub params: [u32; 4],
-    /// The frame's width and height, then 1 when the shadow pass runs this frame, then unused.
+    /// The frame's width and height, then 1 when the shadow pass runs this frame, then 1 when
+    /// it also lights faces with the light from everywhere but the sun.
     pub frame_size: [u32; 4],
     /// How many lights there are, the light tiles across and down the frame, and how many of
     /// each pixel's lights are shadowed.
@@ -53,6 +55,9 @@ pub(crate) struct ShadowPass {
     pub light_view: vk::ImageView,
     pub reflection_image: Image,
     pub reflection_view: vk::ImageView,
+    /// Each texel's light from everywhere but the sun, with its ambient occlusion.
+    pub indirect_image: Image,
+    pub indirect_view: vk::ImageView,
     /// Each tile's lights, `TILE_WORDS` words a tile.
     pub tiles: Buffer,
     pub extent: vk::Extent2D,
@@ -76,6 +81,8 @@ impl ShadowPass {
             light_view: vk::ImageView::null(),
             reflection_image: Image::null(),
             reflection_view: vk::ImageView::null(),
+            indirect_image: Image::null(),
+            indirect_view: vk::ImageView::null(),
             tiles: Buffer::null(),
             extent: vk::Extent2D::default(),
             tile_counts: [0; 2],
@@ -191,6 +198,11 @@ impl ShadowPass {
                 &mut self.reflection_view,
                 REFLECTION_FORMAT,
             ),
+            (
+                &mut self.indirect_image,
+                &mut self.indirect_view,
+                REFLECTION_FORMAT,
+            ),
         ] {
             let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -250,6 +262,7 @@ impl ShadowPass {
             self.image.handle,
             self.light_image.handle,
             self.reflection_image.handle,
+            self.indirect_image.handle,
         ] {
             crate::image::transition_layout(
                 logical_device,
@@ -279,6 +292,7 @@ impl ShadowPass {
         cmd_buffer: vk::CommandBuffer,
         set: vk::DescriptorSet,
         layout: vk::PipelineLayout,
+        timestamps: &FrameTimestamps,
     ) {
         let barrier = |src_stage, src_access, dst_stage, dst_access| {
             let barrier = vk::MemoryBarrier2::default()
@@ -315,6 +329,7 @@ impl ShadowPass {
                 &[],
             );
             dispatch(self.cull_pipeline, self.tile_counts);
+            timestamps.mark(logical_device, cmd_buffer, Mark::LightCulling);
             barrier(
                 compute,
                 vk::AccessFlags2::SHADER_STORAGE_WRITE,
@@ -328,6 +343,7 @@ impl ShadowPass {
                     self.extent.height.div_ceil(WORKGROUP_SIZE),
                 ],
             );
+            timestamps.mark(logical_device, cmd_buffer, Mark::Shadows);
             barrier(
                 compute,
                 vk::AccessFlags2::SHADER_STORAGE_WRITE,
@@ -341,20 +357,28 @@ impl ShadowPass {
     /// Nothing may be using the images or tiles.
     unsafe fn destroy_images(&mut self, logical_device: &ash::Device) {
         unsafe {
-            for view in [self.view, self.light_view, self.reflection_view] {
+            for view in [
+                self.view,
+                self.light_view,
+                self.reflection_view,
+                self.indirect_view,
+            ] {
                 logical_device.destroy_image_view(view, None);
             }
             self.image.destroy(logical_device);
             self.light_image.destroy(logical_device);
             self.reflection_image.destroy(logical_device);
+            self.indirect_image.destroy(logical_device);
             self.tiles.destroy(logical_device);
         }
         self.view = vk::ImageView::null();
         self.light_view = vk::ImageView::null();
         self.reflection_view = vk::ImageView::null();
+        self.indirect_view = vk::ImageView::null();
         self.image = Image::null();
         self.light_image = Image::null();
         self.reflection_image = Image::null();
+        self.indirect_image = Image::null();
         self.tiles = Buffer::null();
     }
 

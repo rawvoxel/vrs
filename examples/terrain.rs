@@ -5,21 +5,21 @@
 //! moves, Space and Ctrl go up and down, and Shift moves faster. L drops a light where the
 //! camera is, Backspace takes them all away.
 //!
-//! The title shows how many chunks were drawn of those in the frame: chunks behind hills
-//! are culled.
+//! The title shows how many chunks were drawn of those in the frame, chunks behind hills
+//! are culled, then how long frames take on the GPU: updating the light probes, tracing
+//! shadows, and drawing everything else, averaged over the last second.
 
 #[path = "common/greedy.rs"]
 mod greedy;
 #[path = "common/terrain.rs"]
 mod terrain;
+#[path = "common/title.rs"]
+mod title;
 
 use anyhow::Result;
 use ash::vk;
 use glam::Vec3;
-use std::{
-    collections::HashSet,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, time::Instant};
 use vrs::{
     App,
     mesh::MeshId,
@@ -50,8 +50,6 @@ const LIGHT_COLORS: [[f32; 3]; 4] = [
 /// Dropped lights' brightness at their center, and how far their light reaches, in voxels.
 const LIGHT_BRIGHTNESS: f32 = 300.0;
 const LIGHT_RANGE: f32 = 48.0;
-/// How often the title's draw counts are read back, which stalls the device.
-const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 struct Camera {
     position: Vec3,
@@ -129,8 +127,7 @@ struct Terrain {
     keys: HashSet<KeyCode>,
     mouse_captured: bool,
     last_frame: Instant,
-    last_stats: Instant,
-    frames_since_stats: u32,
+    title: title::FrameTitle,
     // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
@@ -147,8 +144,7 @@ impl Terrain {
             keys: HashSet::new(),
             mouse_captured: false,
             last_frame: Instant::now(),
-            last_stats: Instant::now(),
-            frames_since_stats: 0,
+            title: title::FrameTitle::new("terrain"),
             vulkan: None,
             window: None,
         }
@@ -218,20 +214,15 @@ impl Terrain {
             .submit(size.width, size.height, &draws)
             .expect("Could not submit frame.");
 
-        self.frames_since_stats += 1;
-        let since_stats = now - self.last_stats;
-        if since_stats >= STATS_INTERVAL {
-            if let Ok(Some(stats)) = vulkan.renderer.debug_frame_stats() {
-                let fps = self.frames_since_stats as f32 / since_stats.as_secs_f32();
-                window.set_title(&format!(
-                    "vrs - terrain: {} of {} chunks drawn, {fps:.0} fps",
-                    stats.total_drawn(),
-                    stats.meshes,
-                ));
-            }
-            self.last_stats = now;
-            self.frames_since_stats = 0;
-        }
+        // The draw counts are read back, stalling the device, only when the title changes.
+        self.title.frame(window, &mut vulkan.renderer, |renderer| {
+            let stats = renderer.debug_frame_stats().ok().flatten()?;
+            Some(format!(
+                "{} of {} chunks drawn",
+                stats.total_drawn(),
+                stats.meshes
+            ))
+        });
     }
 }
 

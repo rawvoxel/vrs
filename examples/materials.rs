@@ -3,7 +3,8 @@
 //! them, on a glossy checkered floor at dusk.
 //!
 //! Run with `cargo run -p vrs --example materials --release`. Space pauses the camera, and L
-//! turns on and off a point light inside each glowing block.
+//! turns on and off a point light inside each glowing block. The title shows frames a second
+//! and how long frames take on the GPU.
 //!
 //! Along +x, roughness goes 0, 0.1, 0.2, 0.3, 0.4 and 1. The smoothest blocks show sharp
 //! reflections of the floor's checks, the glowing blocks and each other, blurring as they get rougher,
@@ -14,6 +15,8 @@
 
 #[path = "common/greedy.rs"]
 mod greedy;
+#[path = "common/title.rs"]
+mod title;
 
 use anyhow::Result;
 use ash::vk;
@@ -248,6 +251,7 @@ struct Materials {
     angle: f32,
     paused: bool,
     last_frame: Instant,
+    title: title::FrameTitle,
     // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
@@ -320,6 +324,7 @@ impl ApplicationHandler for Materials {
                     .renderer
                     .submit(size.width, size.height, &draws)
                     .expect("Could not submit frame.");
+                self.title.frame(window, &mut vulkan.renderer, |_| None);
             }
             _ => (),
         }
@@ -342,6 +347,7 @@ fn main() -> Result<()> {
         angle: 0.6,
         paused: false,
         last_frame: Instant::now(),
+        title: title::FrameTitle::new("materials"),
         vulkan: None,
         window: None,
     })?;

@@ -86,7 +86,11 @@ drop(renderer);
   With shadows or lights, frames draw their depth first, trace the shadows from it, then draw
   their color over it, which saves tracing for pixels drawn over. `Lighting::shadow_resolution`
   traces one shadow ray per 2x2 or 4x4 pixels instead of every pixel, upscaling the shadows by
-  distance so they don't bleed across edges.
+  distance so they don't bleed across edges. Below full resolution, the shadow pass also
+  finds the light from everywhere but the sun, the probes' and the ambient occlusion, for
+  each block of pixels, which shading upscales by face. That leaves sampling probes out of
+  shading, which is most of its cost, so chunks the shadow grid doesn't hold are lit by the
+  sky and ground colors alone then.
   Greedy faces' corners and crevices are darkened by voxel ambient occlusion, from the voxels
   around each face, `Lighting::ambient_occlusion`.
 - **Lights**: `Renderer::lights` holds up to 255 point and spot lights. Each frame lists the
@@ -107,9 +111,11 @@ drop(renderer);
   illumination (Majercik et al. 2019 and 2021):
   - When a chunk is added, each 16³ cell of it bakes where its probe goes: the largest empty
     part of the cell nearest its center, found breadth first, or none when it's solid.
-  - Every frame, the probes with voxels in or next to their cell share a fixed budget of
-    rays, `GiConfig::rays_per_frame`, so the cost stays steady, those of coarser cascades
-    every few frames. Each traces its share through the voxels with the same DDA, shades
+  - The probes with voxels in or next to their cell share a fixed budget of rays,
+    `GiConfig::rays_per_frame`, so the cost stays steady. Each updates every
+    `ProbeTuning::update_interval` frames, 4 by default, taking turns, and twice as rarely
+    in each coarser cascade, but blends in as much more each time, so the light follows
+    changes as fast. Each traces its share through the voxels with the same DDA, shades
     what they hit with the sun, the lights and last frame's probes, which adds a bounce every
     frame, and blends the result into small octahedral maps of the light reaching it and how
     far away voxels are.
@@ -220,11 +226,13 @@ since a fresh checkout's file times can make them look out of date.
 
 ## Debug hooks
 
-For tests and tools, these stall the GPU:
+For tests and tools, these stall the GPU unless they say otherwise:
 
 - `Renderer::debug_frame_stats` reads back how many meshes the last frame drew.
 - `Renderer::debug_capture_next_frame` and `debug_read_capture` copy a frame back.
 - `Renderer::debug_mesh_pool_stats` reports the mesh pool's size and how often it repacked.
+- `Renderer::debug_gpu_timings` reports how long each stage of a recent frame took on the GPU,
+  from timestamps, without stalling.
 - `debug::message_counts` counts validation errors and warnings.
 
 ## Layout

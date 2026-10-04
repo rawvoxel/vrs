@@ -4,6 +4,7 @@ use super::{Renderer, frame::FrameData};
 use crate::{
     cull::{DRAW_STRIDE, Phase},
     image,
+    timings::Mark,
 };
 use ash::{prelude::VkResult, vk};
 use std::slice;
@@ -38,14 +39,19 @@ impl Renderer {
             self.render_device
                 .begin_command_buffer(cmd_buffer, &begin_info)?;
 
+            self.frame_timestamps[frame].cmd_start(&self.render_device, cmd_buffer);
+            let timestamps = &self.frame_timestamps[frame];
+            let mark = |mark| timestamps.mark(&self.render_device, cmd_buffer, mark);
             self.mesh_pool
                 .cmd_upload(&self.render_device, frame, cmd_buffer);
+            mark(Mark::Uploads);
             if data.gi {
                 self.probe_volume.cmd_update(
                     &self.render_device,
                     cmd_buffer,
                     self.frame_desc_sets[frame],
                     self.graphics_pipeline_layout,
+                    timestamps,
                 );
             }
 
@@ -60,6 +66,7 @@ impl Renderer {
                     &data.candidates,
                 )?;
                 self.cmd_cull(cmd_buffer, frame, data, first_phase);
+                mark(Mark::Culling);
             }
 
             self.cmd_begin_attachments(cmd_buffer, image_index);
@@ -86,6 +93,7 @@ impl Renderer {
                 self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
             }
             self.render_device.cmd_end_rendering(cmd_buffer);
+            mark(Mark::FirstPass);
 
             let load = vk::AttachmentLoadOp::LOAD;
             if occlusion {
@@ -104,6 +112,7 @@ impl Renderer {
                     mesh_pipeline,
                 );
                 self.render_device.cmd_end_rendering(cmd_buffer);
+                mark(Mark::OcclusionPass);
             }
 
             if !shaded {
@@ -114,13 +123,17 @@ impl Renderer {
                     cmd_buffer,
                     self.frame_desc_sets[frame],
                     self.graphics_pipeline_layout,
+                    timestamps,
                 );
                 self.cmd_resume_attachments(cmd_buffer);
 
                 self.cmd_begin_rendering(cmd_buffer, Some((color_view, clear)), load);
                 self.cmd_bind_graphics(cmd_buffer, frame);
                 if culling {
-                    let pipeline = self.mesh_over_depth_pipeline;
+                    let pipeline = match data.upscaled_indirect {
+                        true => self.mesh_upscaled_indirect_pipeline,
+                        false => self.mesh_over_depth_pipeline,
+                    };
                     self.cmd_draw_meshes(cmd_buffer, frame, first_phase, candidate_count, pipeline);
                     if occlusion {
                         self.cmd_draw_meshes(
@@ -136,6 +149,7 @@ impl Renderer {
                     self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
                 }
                 self.render_device.cmd_end_rendering(cmd_buffer);
+                mark(Mark::ColorPass);
             }
 
             if data.draw_probes {
@@ -145,6 +159,7 @@ impl Renderer {
                 self.render_device
                     .cmd_draw(cmd_buffer, 36, self.probe_volume.probe_count(), 0, 0);
                 self.render_device.cmd_end_rendering(cmd_buffer);
+                mark(Mark::ProbeOverlay);
             }
 
             let image = self.swapchain.present_images[image_index as usize];

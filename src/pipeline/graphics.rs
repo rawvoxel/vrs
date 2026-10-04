@@ -21,6 +21,10 @@ pub enum PipelinePass {
     DepthOnly,
     /// Color over depth already drawn, testing against it without writing it.
     ShadedOverDepth,
+    /// As `ShadedOverDepth`, for when the shadow pass lit the light from everywhere but the sun
+    /// for `mesh.slang` to upscale: without its code for each pixel to find its own, see
+    /// `PER_PIXEL_INDIRECT` there.
+    ShadedOverUpscaledIndirect,
 }
 
 /// The renderer's pipeline drawing into `surface`, with the vertex and fragment shaders of
@@ -35,19 +39,33 @@ pub fn create_graphics_pipeline(
     pass: PipelinePass,
     pipeline_layout: vk::PipelineLayout,
 ) -> VkResult<vk::Pipeline> {
+    // `PER_PIXEL_INDIRECT` off.
+    let per_pixel_indirect = vk::FALSE;
+    let entry = vk::SpecializationMapEntry::default()
+        .constant_id(0)
+        .size(size_of::<vk::Bool32>());
+    let upscaled_indirect = vk::SpecializationInfo::default()
+        .map_entries(slice::from_ref(&entry))
+        .data(crate::bytes::slice_as_bytes(slice::from_ref(
+            &per_pixel_indirect,
+        )));
+    let mut fragment = vk::PipelineShaderStageCreateInfo::default()
+        .module(shader_module)
+        .name(entries.1)
+        .stage(vk::ShaderStageFlags::FRAGMENT);
+    if pass == PipelinePass::ShadedOverUpscaledIndirect {
+        fragment = fragment.specialization_info(&upscaled_indirect);
+    }
     let all_stages = [
         vk::PipelineShaderStageCreateInfo::default()
             .module(shader_module)
             .name(entries.0)
             .stage(vk::ShaderStageFlags::VERTEX),
-        vk::PipelineShaderStageCreateInfo::default()
-            .module(shader_module)
-            .name(entries.1)
-            .stage(vk::ShaderStageFlags::FRAGMENT),
+        fragment,
     ];
     let shader_stage_infos = match pass {
         PipelinePass::DepthOnly => &all_stages[..1],
-        PipelinePass::Shaded | PipelinePass::ShadedOverDepth => &all_stages[..],
+        _ => &all_stages[..],
     };
 
     let vertex_input_state_info = match vertex_input {
@@ -85,7 +103,7 @@ pub fn create_graphics_pipeline(
 
     let color_attachments = match pass {
         PipelinePass::DepthOnly => 0,
-        PipelinePass::Shaded | PipelinePass::ShadedOverDepth => 1,
+        _ => 1,
     };
     let color_blend_state_info = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op(vk::LogicOp::CLEAR)
@@ -99,7 +117,10 @@ pub fn create_graphics_pipeline(
 
     let depth_state_info = vk::PipelineDepthStencilStateCreateInfo::default()
         .depth_test_enable(true)
-        .depth_write_enable(pass != PipelinePass::ShadedOverDepth)
+        .depth_write_enable(matches!(
+            pass,
+            PipelinePass::Shaded | PipelinePass::DepthOnly
+        ))
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
         .front(noop_stencil_state)
         .back(noop_stencil_state)

@@ -1,6 +1,11 @@
 //! The classic Vulkan "hello triangle": one red, green and blue vertex.
 //!
 //! Run with `cargo run -p vrs --example triangle`.
+//!
+//! The title shows frames a second and how long frames take on the GPU.
+
+#[path = "common/title.rs"]
+mod title;
 
 use anyhow::Result;
 use ash::vk;
@@ -59,8 +64,8 @@ impl Vulkan {
     }
 }
 
-#[derive(Default)]
 struct Triangle {
+    title: title::FrameTitle,
     // NOTE: Field order matters, Vulkan must be dropped before the window it renders to.
     vulkan: Option<Vulkan>,
     window: Option<Window>,
@@ -103,6 +108,7 @@ impl ApplicationHandler for Triangle {
                     .renderer
                     .submit(size.width, size.height, &draws)
                     .expect("Could not submit frame.");
+                self.title.frame(window, &mut vulkan.renderer, |_| None);
             }
             _ => (),
         }
@@ -121,6 +127,10 @@ impl ApplicationHandler for Triangle {
 
 fn main() -> Result<()> {
     let event_loop = EventLoop::new()?;
-    event_loop.run_app(&mut Triangle::default())?;
+    event_loop.run_app(&mut Triangle {
+        title: title::FrameTitle::new("triangle"),
+        vulkan: None,
+        window: None,
+    })?;
     Ok(())
 }

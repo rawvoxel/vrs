@@ -2,6 +2,8 @@
 //!
 //! - A floor under a uniform white sky, without a sun, lit by its probes as by the sky alone.
 //! - A sealed hollow box under a bright sun and sky, seen from inside: no light may leak in.
+//! - Both again at half shadow resolution, where the shadow pass lights faces with the
+//!   probes' light for shading to upscale.
 //! - The same box with a hole in its roof: sunlight bouncing in lights all of it.
 //! - The sealed box with a glowing block inside, in the dark: its light reaches the walls.
 //! - The box with glass over its hole: sunlight comes through, dimmed by the glass.
@@ -301,12 +303,22 @@ pub fn check(app: &App) -> Result<Option<Vec<String>>, vk::Result> {
     let Some(floor_lit) = render(app, floor, sky, eye, target)? else {
         return Ok(None);
     };
-    let floor_mean = mean(&floor_lit);
-    println!("  a floor under a white sky is {floor_mean:.3}, {ALBEDO} is exact");
-    if (floor_mean - ALBEDO).abs() > ALBEDO * 0.06 {
-        failures.push(format!(
-            "a floor under a white sky is {floor_mean:.3}, not {ALBEDO}"
-        ));
+    let half = |lighting: Lighting| Lighting {
+        shadow_resolution: ShadowResolution::Half,
+        ..lighting
+    };
+    let half_floor = render(app, floor, half(sky), eye, target)?;
+    for (resolution, lit) in [("", Some(floor_lit)), (" at half resolution", half_floor)] {
+        let Some(lit) = lit else {
+            continue;
+        };
+        let floor_mean = mean(&lit);
+        println!("  a floor under a white sky{resolution} is {floor_mean:.3}, {ALBEDO} is exact");
+        if (floor_mean - ALBEDO).abs() > ALBEDO * 0.06 {
+            failures.push(format!(
+                "a floor under a white sky{resolution} is {floor_mean:.3}, not {ALBEDO}"
+            ));
+        }
     }
 
     // A box 32 voxels wide inside, its walls 2 thick, under a bright sun and sky.
@@ -324,14 +336,19 @@ pub fn check(app: &App) -> Result<Option<Vec<String>>, vk::Result> {
         (outer && !hollow) as u16
     };
     let (eye, target) = (Vec3::new(0.5, 20.0, -10.0), Vec3::new(0.5, 18.0, 10.0));
-    if let Some(sealed) = render(app, shell, bright, eye, target)? {
-        let lit = fraction_over(&sealed, UNLIT);
-        println!("  {:.2}% of a sealed box's inside is lit", lit * 100.0);
-        if lit > CRACKS {
-            failures.push(format!(
-                "{:.2}% of a sealed box's inside is lit, light leaks in",
+    for (resolution, lighting) in [("", bright), (" at half resolution", half(bright))] {
+        if let Some(sealed) = render(app, shell, lighting, eye, target)? {
+            let lit = fraction_over(&sealed, UNLIT);
+            println!(
+                "  {:.2}% of a sealed box's inside is lit{resolution}",
                 lit * 100.0
-            ));
+            );
+            if lit > CRACKS {
+                failures.push(format!(
+                    "{:.2}% of a sealed box's inside is lit{resolution}, light leaks in",
+                    lit * 100.0
+                ));
+            }
         }
     }
 

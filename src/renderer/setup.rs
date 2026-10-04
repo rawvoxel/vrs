@@ -84,6 +84,8 @@ impl Renderer {
             gi_configured: config.global_illumination.is_some(),
             frame_number: 0,
             last_frame: None,
+            frame_timestamps: Vec::new(),
+            gpu_timings: None,
             capture_requested: false,
             capture_buffers: Vec::new(),
             recorded_capture: None,
@@ -128,6 +130,7 @@ impl Renderer {
             mesh_pipeline: vk::Pipeline::null(),
             mesh_depth_pipeline: vk::Pipeline::null(),
             mesh_over_depth_pipeline: vk::Pipeline::null(),
+            mesh_upscaled_indirect_pipeline: vk::Pipeline::null(),
             probes_pipeline: vk::Pipeline::null(),
             dynamic_pipeline: vk::Pipeline::null(),
             graphics_pipeline_layout: vk::PipelineLayout::null(),
@@ -154,7 +157,8 @@ impl Renderer {
         // probes they're tracing, then the low resolution shadows written, the depth buffer
         // they're traced from, and the shadows sampled, then the chunks that changed, then the
         // lights, the lights reaching each tile, and their shadows written and read, then the
-        // reflections written and read.
+        // reflections written and read, then the light from everywhere but the sun written and
+        // read.
         let bindings = [
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
@@ -175,6 +179,8 @@ impl Renderer {
             vk::DescriptorType::STORAGE_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
             vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::SAMPLED_IMAGE,
             vk::DescriptorType::STORAGE_IMAGE,
             vk::DescriptorType::SAMPLED_IMAGE,
             vk::DescriptorType::STORAGE_IMAGE,
@@ -240,6 +246,13 @@ impl Renderer {
                 PipelinePass::ShadedOverDepth,
             ),
             (
+                &mut self.mesh_upscaled_indirect_pipeline,
+                MESH_SPV,
+                mesh_entries,
+                false,
+                PipelinePass::ShadedOverUpscaledIndirect,
+            ),
+            (
                 &mut self.dynamic_pipeline,
                 DYNAMIC_SPV,
                 (c"vertMain", c"fragMain"),
@@ -295,6 +308,12 @@ impl Renderer {
                 vk::CommandBufferLevel::PRIMARY,
             )?);
             self.in_flight_frames.push(create_fence(&device)?);
+            let timestamps = self.graphics_queue_family.properties.timestamp_valid_bits > 0
+                && adapter.properties.limits.timestamp_compute_and_graphics == vk::TRUE;
+            self.frame_timestamps.push(match timestamps {
+                true => crate::timings::FrameTimestamps::new(&device)?,
+                false => crate::timings::FrameTimestamps::null(),
+            });
             self.available_frames.push(create_semaphore(&device)?);
         }
         if !self.surface.is_offscreen() {

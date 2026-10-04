@@ -18,6 +18,9 @@
 [[vk::binding(19, 0)]] [[vk::image_format("rg32ui")]] RWTexture2D<uint2> lightShadowImage;
 // Each texel's sharp reflection when its voxel is glossy, and its face's number, 0 for none.
 [[vk::binding(21, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> reflectionImage;
+// Each texel's light from everywhere but the sun, with its ambient occlusion, and its face's
+// number, 0 for none.
+[[vk::binding(23, 0)]] [[vk::image_format("rgba16f")]] RWTexture2D<float4> indirectImage;
 
 groupshared uint tileNearest;
 groupshared uint tileFarthest;
@@ -119,6 +122,7 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
         shadowImage[threadId.xy] = float4(1.0, 1.0, 1.0, 1e9);
         lightShadowImage[threadId.xy] = uint2(0xffffffff, 0);
         reflectionImage[threadId.xy] = float4(0.0);
+        indirectImage[threadId.xy] = float4(0.0);
         return;
     }
     float4 world = mul(ubo.shadow.inverseViewProj, float4(uv * 2.0 - 1.0, depth, 1.0));
@@ -136,22 +140,37 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
     shadowImage[threadId.xy] = float4(visible, distance);
 
     // The voxel the pixel shows and the face it's seen through, found by a short ray from
-    // just in front of it, then what that face reflects when it's glossy.
+    // just in front of it, then the light reaching that face from everywhere but the sun, and
+    // what it reflects when it's glossy.
     float4 reflection = float4(0.0);
-    if (ubo.shadow.params.w != 0 && ubo.lighting.shadowTable.w > 0) {
+    float4 indirect = float4(0.0);
+    bool lightsIndirect = ubo.shadow.frameSize.w != 0;
+    if ((ubo.shadow.params.w != 0 || lightsIndirect) && ubo.lighting.shadowTable.w > 0) {
         float3 view = -toCamera;
         float3 start = position / ubo.lighting.shadowGrid.x - view;
         VoxelHit surface;
         if (traceVoxels(start, view, 2.0, false, surface) && surface.distance > 0.0) {
+            float3 onFace = start + view * surface.distance;
+            float face = float(faceNumber(surface.normal));
+            if (lightsIndirect) {
+                float3 light = indirectLight(onFace, surface.normal, toCamera, false);
+                float occlusionStrength = ubo.lighting.options.x;
+                if (occlusionStrength > 0.0) {
+                    float3 inLevel = onFace / float(1 << surface.level);
+                    light *= lerp(1.0, gridOpenness(surface.level, inLevel, int3(surface.normal)), occlusionStrength);
+                }
+                indirect = float4(light, face);
+            }
             Material material = materialOf(surface.id);
-            if (material.colorRoughness.w < GLOSSY_ROUGHNESS) {
-                float3 onSurface = start + view * surface.distance + surface.normal * SHADOW_RAY_OFFSET;
+            if (ubo.shadow.params.w != 0 && material.colorRoughness.w < GLOSSY_ROUGHNESS) {
+                float3 onSurface = onFace + surface.normal * SHADOW_RAY_OFFSET;
                 float3 reflected = radianceAlong(onSurface, reflect(view, surface.normal), ubo.lighting.shadowGrid.z);
-                reflection = float4(reflected, float(faceNumber(surface.normal)));
+                reflection = float4(reflected, face);
             }
         }
     }
     reflectionImage[threadId.xy] = reflection;
+    indirectImage[threadId.xy] = indirect;
 
     // The block's tile's brightest lights here, as many as are shadowed, brightest first.
     uint shadowed = ubo.shadow.lights.w;
