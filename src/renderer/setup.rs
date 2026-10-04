@@ -1,6 +1,6 @@
 //! Building a `Renderer`.
 
-use super::{Renderer, RendererConfig, device::create_render_device};
+use super::{Lighting, Renderer, RendererConfig, device::create_render_device};
 use crate::{
     App,
     adapter::Adapter,
@@ -8,8 +8,9 @@ use crate::{
     commands::{create_command_buffer, create_command_pool},
     cull::Culler,
     descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
+    gi::ProbeVolume,
     hiz::DepthPyramid,
-    mesh::{MeshCapacity, MeshPool},
+    mesh::MeshPool,
     pipeline::{create_graphics_pipeline, create_pipeline_layout, create_shader_module},
     queue::{Queue, QueueFamily},
     surface::Surface,
@@ -68,10 +69,14 @@ impl Renderer {
             backface_culling: config.backface_culling,
             grow_mesh_pool: config.grow_mesh_pool,
             clear_color: DEFAULT_CLEAR_COLOR,
+            lighting: Lighting::default(),
 
             mesh_pool: MeshPool::null(config.mesh_capacity, FRAMES_IN_FLIGHT as usize),
             culler: Culler::null(),
             depth_pyramid: DepthPyramid::null(),
+            probe_volume: ProbeVolume::null(),
+            gi_configured: config.global_illumination.is_some(),
+            frame_number: 0,
             last_frame: None,
             capture_requested: false,
             capture_buffers: Vec::new(),
@@ -102,6 +107,8 @@ impl Renderer {
             palette_version: 0,
             frame_palette_buffers: Vec::new(),
             frame_palette_versions: Vec::new(),
+            frame_shadow_tables: Vec::new(),
+            shadow_table: Vec::new(),
 
             mesh_pipeline: vk::Pipeline::null(),
             dynamic_pipeline: vk::Pipeline::null(),
@@ -114,40 +121,53 @@ impl Renderer {
             surface_instance,
             adapter,
         };
-        renderer.create(surface_extent, config.mesh_capacity)?;
+        renderer.create(surface_extent, config)?;
         Ok(renderer)
     }
 
     /// Fills in everything the device makes, leaving it for `Drop` if it fails.
-    fn create(
-        &mut self,
-        surface_extent: vk::Extent2D,
-        mesh_capacity: MeshCapacity,
-    ) -> VkResult<()> {
+    fn create(&mut self, surface_extent: vk::Extent2D, config: RendererConfig) -> VkResult<()> {
         let device = self.render_device.clone();
         let adapter = self.adapter.clone();
 
-        // Frame Descriptors: the uniforms, then the mesh pool's vertices, mesh infos and voxel
-        // types, and the palette, matching the bindings in `mesh.slang`.
-        let pool_sizes = [
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(FRAMES_IN_FLIGHT),
-            vk::DescriptorPoolSize::default()
-                .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(4 * FRAMES_IN_FLIGHT),
+        // Frame Descriptors, matching the bindings in `common.slang`: the uniforms, the mesh
+        // pool's vertices, mesh infos and voxel types, the palette and the shadow table, then
+        // the light probes, their atlases sampled, their atlases written, their rays and the
+        // probes they're tracing.
+        let bindings = [
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
         ];
+        let pool_sizes = [
+            vk::DescriptorType::UNIFORM_BUFFER,
+            vk::DescriptorType::STORAGE_BUFFER,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            vk::DescriptorType::STORAGE_IMAGE,
+        ]
+        .map(|ty| {
+            let count = bindings.iter().filter(|&&binding| binding == ty).count() as u32;
+            vk::DescriptorPoolSize::default()
+                .ty(ty)
+                .descriptor_count(count * FRAMES_IN_FLIGHT)
+        });
         self.frame_desc_pool = create_descriptor_pool(&device, &pool_sizes, FRAMES_IN_FLIGHT)?;
         self.frame_desc_set_layout = create_descriptor_set_layout(
             &device,
-            &[
-                vk::DescriptorType::UNIFORM_BUFFER,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::DescriptorType::STORAGE_BUFFER,
-            ],
-            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            &bindings,
+            vk::ShaderStageFlags::VERTEX
+                | vk::ShaderStageFlags::FRAGMENT
+                | vk::ShaderStageFlags::COMPUTE,
         )?;
         self.frame_desc_sets = allocate_descriptor_sets(
             &device,
@@ -226,9 +246,24 @@ impl Renderer {
             }
         }
 
+        // Light Probes, updated with the graphics pipelines' layout, it's only the frame's set.
+        self.probe_volume = ProbeVolume::new(
+            &adapter,
+            &device,
+            config.global_illumination,
+            self.graphics_pipeline_layout,
+        )?;
+        self.probe_volume
+            .write_descriptors(&device, &self.frame_desc_sets);
+        self.init_probe_volume()?;
+
         // Meshes
-        self.mesh_pool =
-            MeshPool::new(&adapter, &device, mesh_capacity, FRAMES_IN_FLIGHT as usize)?;
+        self.mesh_pool = MeshPool::new(
+            &adapter,
+            &device,
+            config.mesh_capacity,
+            FRAMES_IN_FLIGHT as usize,
+        )?;
         self.culler = Culler::new(&adapter, &device, FRAMES_IN_FLIGHT)?;
         self.depth_pyramid = DepthPyramid::new(
             &adapter,
@@ -263,6 +298,13 @@ impl Renderer {
             )?);
             // Written by the first frame.
             self.frame_palette_versions.push(u64::MAX);
+            // Grown to fit the first frame with shadows.
+            self.frame_shadow_tables.push(DynamicBuffer::new(
+                &adapter,
+                &device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                4,
+            )?);
             self.frame_index_buffers.push(dynamic_buffer(
                 vk::BufferUsageFlags::INDEX_BUFFER,
                 size_of::<Index>(),

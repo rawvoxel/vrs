@@ -1,4 +1,4 @@
-use crate::mesh::MeshCapacity;
+use crate::{gi::GiConfig, mesh::MeshCapacity};
 
 /// How a `Renderer` is built, see `Renderer::with_config`.
 ///
@@ -15,10 +15,14 @@ pub struct RendererConfig {
     pub occlusion_culling: bool,
     /// Whether triangles facing away are skipped, see `Renderer::backface_culling`.
     pub backface_culling: bool,
+    /// The light probes chunks are lit by, `None` for none. They follow the camera, so they
+    /// can't be resized later. See `Lighting::global_illumination`.
+    pub global_illumination: Option<GiConfig>,
 }
 
 impl Default for RendererConfig {
-    /// The default mesh capacity, which grows, without vsync, with occlusion and backface culling.
+    /// The default mesh capacity, which grows, without vsync, with occlusion and backface
+    /// culling, and without light probes.
     fn default() -> Self {
         Self {
             mesh_capacity: MeshCapacity::default(),
@@ -26,6 +30,7 @@ impl Default for RendererConfig {
             vsync: false,
             occlusion_culling: true,
             backface_culling: true,
+            global_illumination: None,
         }
     }
 }

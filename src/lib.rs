@@ -9,6 +9,7 @@ pub mod commands;
 pub(crate) mod cull;
 pub mod debug;
 pub mod descriptors;
+pub mod gi;
 pub(crate) mod hiz;
 pub mod image;
 pub mod mesh;

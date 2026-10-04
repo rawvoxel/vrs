@@ -1,10 +1,23 @@
 use std::{path::Path, process::Command};
 
 fn main() {
+    // Included by `mesh.slang` and `gi.slang`.
+    println!("cargo:rerun-if-changed=assets/shader/common.slang");
     compile_slang_spv("shader.slang", "slang.spv", &["vertMain", "fragMain"]);
     compile_slang_spv("cull.slang", "cull.spv", &["cullMain"]);
     compile_slang_spv("hiz.slang", "hiz.spv", &["reduceMain"]);
     compile_slang_spv("mesh.slang", "mesh.spv", &["meshVert", "meshFrag"]);
+    compile_slang_spv(
+        "gi.slang",
+        "gi.spv",
+        &[
+            "classifyProbes",
+            "planRays",
+            "traceProbeRays",
+            "updateIrradiance",
+            "updateDepth",
+        ],
+    );
 }
 
 /// Cargo only reruns this when a shader source changes, or on a fresh build.

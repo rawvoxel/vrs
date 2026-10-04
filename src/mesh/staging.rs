@@ -55,8 +55,8 @@ impl UploadStaging {
         }
     }
 
-    /// Appends `bytes` to `frame`'s buffer, growing it while keeping what's already there.
-    /// Returns where they start.
+    /// Appends `pieces` to `frame`'s buffer one after another, growing it while keeping
+    /// what's already there. Returns where they start.
     ///
     /// # Safety
     /// `begin_writes` must have been called for `frame` since it was last recorded.
@@ -65,19 +65,24 @@ impl UploadStaging {
         adapter: &Adapter,
         logical_device: &ash::Device,
         frame: usize,
-        bytes: &[u8],
+        pieces: &[&[u8]],
     ) -> VkResult<vk::DeviceSize> {
         debug_assert!(
             !self.frame_in_flight[frame],
             "Staging written while in flight."
         );
-        let offset = self.frame_lens[frame];
-        let end = offset + bytes.len() as vk::DeviceSize;
+        let start = self.frame_lens[frame];
+        let len: usize = pieces.iter().map(|piece| piece.len()).sum();
+        let end = start + len as vk::DeviceSize;
         let buffer = &mut self.frame_buffers[frame];
-        unsafe { buffer.reserve_preserving(adapter, logical_device, end, offset)? };
-        buffer.buffer.mem_write_at(offset, bytes);
+        unsafe { buffer.reserve_preserving(adapter, logical_device, end, start)? };
+        let mut offset = start;
+        for piece in pieces {
+            buffer.buffer.mem_write_at(offset, piece);
+            offset += piece.len() as vk::DeviceSize;
+        }
         self.frame_lens[frame] = end;
-        Ok(offset)
+        Ok(start)
     }
 
     /// The buffer copies read `frame`'s data from.

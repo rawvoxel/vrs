@@ -3,6 +3,7 @@
 use super::Renderer;
 use crate::{
     bytes::slice_as_words,
+    gi::bake_probe_cells,
     mesh::{Mesh, MeshId, MeshKind, NewMesh},
     vertex::{Index, Vertex},
     voxel::{ChunkMesh, ChunkVertices, unpack_position},
@@ -22,6 +23,8 @@ impl Renderer {
             vertex_words: &vertex_words,
             indices,
             type_words: &[],
+            occupancy: &[],
+            probes: &[],
             origin: Vec3::ZERO,
             scale: 1.0,
             voxels_per_edge: 0,
@@ -49,6 +52,8 @@ impl Renderer {
             vertex_words,
             indices: chunk.indices,
             type_words: chunk.types.words(),
+            occupancy: &chunk.types.occupancy(),
+            probes: &bake_probe_cells(chunk.types),
             origin: chunk.origin,
             scale: chunk.voxel_size,
             voxels_per_edge: edge,

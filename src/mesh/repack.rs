@@ -43,7 +43,7 @@ impl MeshPool {
             (
                 &mut capacity.type_words,
                 &self.type_ranges,
-                new.type_words.len() as u32,
+                new.type_word_count(),
             ),
         ] {
             if ranges.can_alloc(len) {

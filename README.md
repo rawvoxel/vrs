@@ -60,11 +60,36 @@ drop(renderer);
   for axis aligned faces, which keep a face index instead of a normal, or `voxel::PackedVertex`es
   for any surface. Positions are chunk local, placed by the chunk's `origin` and `voxel_size`,
   which includes its LOD. Its `voxel::VoxelTypes` are palette compressed, and already packed
-  words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the palette from `set_palette`, 0 is empty space. Cells past a chunk's
-  edge take the chunk's own edge voxel, there's no lookup into neighbors, and see-through
-  faces are drawn like any other.
+  words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the
+  palette from `set_palette`, 0 is empty space. Cells past a chunk's edge take the chunk's own
+  edge voxel, there's no lookup into neighbors, and see-through faces are drawn like any other.
 - **Colored meshes** come from `create_mesh`, `vertex::Vertex`es in world space with colors of
-  their own, for anything that isn't a chunk.
+  their own, for anything that isn't a chunk. They aren't lit.
+- **Lighting**: `Renderer::lighting` lights chunks with sky and ground colors, blended by
+  which way a face points, and a sun. With a `ShadowGrid`, each pixel facing the sun traces a
+  ray toward it through the voxels with a DDA, across chunks, so hills shadow their
+  neighbors. Each chunk also keeps one bit per 8³ block of voxels saying whether any is
+  solid, and rays cross empty blocks in one step. The grid is the chunks of one voxel size and
+  width, placed on a grid from the world's origin. Chunks of other sizes are lit but cast no
+  shadows, and chunks with no faces, such as under the ground, should still be created for
+  their voxels to cast shadows.
+- **Global illumination**: with `RendererConfig::global_illumination`, a volume of light
+  probes 16 voxels apart follows the camera, and lights chunks inside it with light bounced
+  off the voxels around them, in place of the sky and ground colors. It's dynamic diffuse
+  global illumination (Majercik et al. 2019 and 2021):
+  - When a chunk is added, each 16³ cell of it bakes where its probe goes: the largest empty
+    part of the cell nearest its center, found breadth first, or none when it's solid.
+  - Every frame, the probes with voxels in or next to their cell share a fixed budget of
+    rays, `GiConfig::rays_per_frame`, so the cost stays steady. Each traces its share
+    through the voxels with the same DDA, shades what they hit with the sun and last frame's
+    probes, which adds a bounce every frame, and blends the result into small octahedral
+    maps of the light reaching it and how far away voxels are.
+  - Shading blends the 8 probes around each point, weighted by distance, which way they face
+    and whether their distances say they can see it, which keeps light from leaking
+    through walls.
+
+  It needs a `ShadowGrid` whose chunks are a multiple of 16 voxels wide, and
+  `Lighting::global_illumination` turns it off and on.
 - **Winding**: front faces wind counter-clockwise on screen, backface culling skips the rest.
 - **Cameras**: `DrawList::proj` maps into Vulkan's clip space, where y points down and depth
   runs from 0 to 1. Flip y in an OpenGL style projection, such as glam's `perspective_rh`,
@@ -107,9 +132,10 @@ cargo run -p vrs --example stress -- --headless
 - `triangle` is the classic Vulkan triangle, drawn as a colored mesh.
 - `cube` circles a cube of 8³ voxels checkered in two types. Greedy meshing makes each side
   one quad, and the colors still come from the voxels.
-- `terrain` is rolling hills of greedy meshed chunks to fly around: click to look with the
-  mouse, WASD to move, Space and Shift for up and down, Ctrl to go faster. The title shows
-  how many chunks were drawn, the rest culled behind hills.
+- `terrain` is rolling hills of greedy meshed chunks, under a low sun casting shadows and lit
+  by light probes near the camera, to fly around: click to look with the mouse, WASD to
+  move, Space and Ctrl for up and down, Shift to go faster. The title shows how many chunks
+  were drawn, the rest culled behind hills.
 - `screenshot` renders the terrain without a window and saves the frame as a PPM image.
 
 `cube`, `terrain` and `screenshot` share a greedy mesher for 64³ chunks in
@@ -160,6 +186,7 @@ For tests and tools, these stall the GPU:
 | `renderer` | `Renderer`, building it, each frame's stages and command recording |
 | `mesh` | Mesh ids and the shared mesh pool, its staging, range allocator and repacking |
 | `voxel` | Chunk meshes: compact vertex formats and packed voxel types |
+| `gi` | The light probe volume and its configuration |
 | `cull`, `hiz` | GPU culling, and the depth pyramid occlusion culling tests against |
 | `app`, `adapter`, `surface`, `swapchain` | The instance, GPUs, and what frames are drawn into |
 | `buffer`, `image`, `pipeline`, `descriptors`, `commands`, `sync` | Vulkan building blocks |

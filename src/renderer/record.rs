@@ -37,6 +37,14 @@ impl Renderer {
 
             self.mesh_pool
                 .cmd_upload(&self.render_device, frame, cmd_buffer);
+            if data.gi {
+                self.probe_volume.cmd_update(
+                    &self.render_device,
+                    cmd_buffer,
+                    self.frame_desc_sets[frame],
+                    self.graphics_pipeline_layout,
+                );
+            }
 
             if culling {
                 self.culler.prepare(

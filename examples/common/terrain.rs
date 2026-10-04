@@ -5,7 +5,7 @@ use ash::prelude::VkResult;
 use glam::{Mat4, Vec3};
 use vrs::{
     mesh::{MeshCapacity, MeshId},
-    renderer::{Renderer, RendererConfig},
+    renderer::{GiConfig, Renderer, RendererConfig, ShadowGrid},
     voxel::{ChunkMesh, ChunkVertices, VoxelTypes},
 };
 
@@ -20,14 +20,16 @@ const SNOW: u16 = 5;
 const BEACH_LINE: i32 = 30;
 const SNOW_LINE: i32 = 80;
 
-/// Every chunk has up to six voxel types, 4 bits each, so it's room for them all without growing.
+/// Every chunk has up to six voxel types, 4 bits each, a few words of header and palette, 16 of
+/// occupancy and 64 of light probe cells, so it's room for them all without growing.
 pub fn config() -> RendererConfig {
     let chunks = (CHUNKS[0] * CHUNKS[1] * CHUNKS[2]) as u32;
     RendererConfig {
         mesh_capacity: MeshCapacity {
-            type_words: chunks * (EDGE.pow(3) as u32 / 8 + 8),
+            type_words: chunks * (EDGE.pow(3) as u32 / 8 + 96),
             ..MeshCapacity::default()
         },
+        global_illumination: Some(GiConfig::default()),
         ..RendererConfig::default()
     }
 }
@@ -64,9 +66,15 @@ fn voxel_type(height: i32, depth: i32) -> u16 {
     }
 }
 
-/// Meshes every chunk with a surface and adds it to `renderer`, setting its palette.
+/// Meshes every chunk with ground in it and adds it to `renderer`, setting its palette, and
+/// lights it with a low sun whose shadows are traced through the chunks.
 pub fn create(renderer: &mut Renderer) -> VkResult<Vec<MeshId>> {
     renderer.set_palette(&palette());
+    renderer.lighting.sun_direction = Vec3::new(-0.6, 0.5, 0.25);
+    renderer.lighting.shadow_grid = Some(ShadowGrid {
+        voxel_size: 1.0,
+        voxels_per_edge: EDGE as u32,
+    });
     let edge = EDGE as i32;
     let world = CHUNKS.map(|chunks| chunks as i32 * edge);
     let mut ids = Vec::new();
@@ -92,10 +100,6 @@ pub fn create(renderer: &mut Renderer) -> VkResult<Vec<MeshId>> {
                     wy < 0 || (inside && wy < height_at(x, z))
                 };
 
-                let mesh = greedy::mesh(&ChunkMask::from_fn(solid));
-                if mesh.indices.is_empty() {
-                    continue;
-                }
                 let types: Vec<u16> = (0..EDGE.pow(3))
                     .map(|index| {
                         let (x, y, z) = (index % EDGE, index / EDGE % EDGE, index / EDGE.pow(2));
@@ -108,6 +112,11 @@ pub fn create(renderer: &mut Renderer) -> VkResult<Vec<MeshId>> {
                         }
                     })
                     .collect();
+                // Chunks under the ground have no faces, but still cast shadows.
+                if types.iter().all(|&id| id == 0) {
+                    continue;
+                }
+                let mesh = greedy::mesh(&ChunkMask::from_fn(solid));
                 ids.push(renderer.create_chunk_mesh(&ChunkMesh {
                     indices: &mesh.indices,
                     vertices: ChunkVertices::Greedy(&mesh.vertices),

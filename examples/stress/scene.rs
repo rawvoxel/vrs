@@ -9,7 +9,7 @@ use glam::{Mat4, Vec2, Vec3};
 use vrs::{
     App,
     mesh::{MeshCapacity, MeshId},
-    renderer::Renderer,
+    renderer::{Lighting, Renderer},
     vertex::Vertex,
     voxel::{ChunkMesh, ChunkVertices, Face, GreedyVertex, PackedVertex, VoxelTypes},
 };
@@ -31,8 +31,8 @@ pub const CAPACITY: MeshCapacity = MeshCapacity {
     // Packed vertices are 3 words, greedy 2.
     vertex_words: GRID * GRID * 4 * 3 * 3 / 2 + 16,
     indices: GRID * GRID * 6 * 3 / 2 + 6,
-    // A header, two palette words and four index words a chunk.
-    type_words: GRID * GRID * 7 * 3 / 2 + 8,
+    // A header, two palette words, four index words and an occupancy word a chunk.
+    type_words: GRID * GRID * 8 * 3 / 2 + 8,
     meshes: GRID * GRID * 3 / 2,
 };
 
@@ -169,6 +169,13 @@ pub fn live<'a>(
 impl Scene {
     pub fn new(mut renderer: Renderer, app: App) -> Self {
         renderer.set_palette(&palette());
+        // Full light from every side and no sun, so every face shows its palette color.
+        renderer.lighting = Lighting {
+            sun_color: [0.0; 3],
+            sky_color: [1.0; 3],
+            ground_color: [1.0; 3],
+            ..Lighting::default()
+        };
         let cells = (GRID * GRID) as usize;
         Self {
             chunks: (0..cells).map(|_| None).collect(),

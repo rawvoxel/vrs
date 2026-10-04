@@ -1,7 +1,7 @@
 //! The stages `Renderer::submit` runs a frame in, around recording it.
 
 use super::{DrawList, Renderer};
-use crate::uniforms::MvpMatrices;
+use crate::uniforms::{FrameUniforms, MvpMatrices};
 use ash::{prelude::VkResult, vk};
 use glam::Mat4;
 use std::slice;
@@ -12,6 +12,8 @@ pub(super) struct FrameData {
     pub candidates: Vec<u32>,
     pub dynamic_index_count: u32,
     pub view_proj: Mat4,
+    /// Whether the light probes are updated and sampled.
+    pub gi: bool,
 }
 
 impl FrameData {
@@ -22,8 +24,8 @@ impl FrameData {
 }
 
 impl Renderer {
-    /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces,
-    /// and its palette, which growing replaces. The uniforms never move.
+    /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces, and
+    /// its palette and shadow table, which growing replaces. The uniforms never move.
     ///
     /// # Safety
     /// The device must not be using `frame`'s descriptor set.
@@ -33,6 +35,7 @@ impl Renderer {
             self.mesh_pool.info_buffer.handle,
             self.mesh_pool.type_buffer.handle,
             self.frame_palette_buffers[frame].buffer.handle,
+            self.frame_shadow_tables[frame].buffer.handle,
         ]
         .map(|buffer| {
             vk::DescriptorBufferInfo::default()
@@ -110,8 +113,9 @@ impl Renderer {
         frame: usize,
         draws: &DrawList,
     ) -> VkResult<FrameData> {
-        unsafe {
+        let lighting = unsafe {
             self.write_palette(frame)?;
+            let lighting = self.write_lighting(frame, draws.view)?;
             self.write_frame_descriptors(frame);
             self.frame_index_buffers[frame].write(
                 &self.adapter,
@@ -123,14 +127,19 @@ impl Renderer {
                 &self.render_device,
                 draws.vertices,
             )?;
-        }
-
-        let mvp = MvpMatrices {
-            model: Mat4::IDENTITY,
-            view: draws.view,
-            proj: draws.proj,
+            lighting
         };
-        self.uniform_buffers[frame].mem_write(slice::from_ref(&mvp));
+
+        let uniforms = FrameUniforms {
+            matrices: MvpMatrices {
+                model: Mat4::IDENTITY,
+                view: draws.view,
+                proj: draws.proj,
+            },
+            lighting,
+            gi: self.gi_uniforms(draws.view),
+        };
+        self.uniform_buffers[frame].mem_write(slice::from_ref(&uniforms));
 
         Ok(FrameData {
             candidates: draws
@@ -140,6 +149,7 @@ impl Renderer {
                 .collect(),
             dynamic_index_count: draws.indices.len() as u32,
             view_proj: draws.proj * draws.view,
+            gi: self.gi_enabled(),
         })
     }
 

@@ -3,7 +3,7 @@
 mod types;
 mod vertex;
 
-pub use types::VoxelTypes;
+pub use types::{OCCUPANCY_BLOCK, VoxelTypes};
 pub use vertex::{
     Face, GreedyVertex, POSITION_BIAS, PackedVertex, SEE_THROUGH_FLAG, octahedral_decode,
     octahedral_encode, position_steps, unpack_position,

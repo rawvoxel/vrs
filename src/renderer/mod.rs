@@ -3,20 +3,24 @@ mod config;
 mod debug;
 mod device;
 mod frame;
+mod lighting;
 mod meshes;
 mod palette;
 mod record;
 mod setup;
 
+pub use crate::gi::GiConfig;
 pub use capture::Capture;
 pub use config::RendererConfig;
 pub use debug::{FrameStats, MeshPoolStats};
+pub use lighting::{Lighting, LightingUniforms, ShadowGrid};
 
 use crate::{
     adapter::Adapter,
     buffer::{Buffer, DynamicBuffer},
     commands::record_submit_commandbuffer,
     cull::Culler,
+    gi::ProbeVolume,
     hiz::DepthPyramid,
     mesh::{MeshId, MeshPool},
     queue::{Queue, QueueFamily},
@@ -59,12 +63,19 @@ pub struct Renderer {
     pub grow_mesh_pool: bool,
     /// What each frame starts as, in linear color.
     pub clear_color: [f32; 4],
+    /// How chunk meshes are lit. Changes take effect next frame.
+    pub lighting: Lighting,
 
     mesh_pool: MeshPool,
     /// Turns each frame's meshes into indirect draws for the visible ones.
     culler: Culler,
     /// Built from each frame's depth between its two culling phases.
     depth_pyramid: DepthPyramid,
+    /// The light probes, a single unused one when there's no `RendererConfig::global_illumination`.
+    probe_volume: ProbeVolume,
+    gi_configured: bool,
+    /// Frames submitted, which seeds each frame's probe rays.
+    frame_number: u64,
     /// What `debug_frame_stats` reads back.
     last_frame: Option<debug::LastFrame>,
     /// Whether the next frame is copied into `capture_buffers`.
@@ -104,6 +115,10 @@ pub struct Renderer {
     frame_palette_buffers: Vec<DynamicBuffer>,
     /// The palette version each frame's buffer holds.
     frame_palette_versions: Vec<u64>,
+    /// Which chunk is where around the camera, for shadow rays, see `write_lighting`.
+    frame_shadow_tables: Vec<DynamicBuffer>,
+    /// Reused to build each frame's shadow table in.
+    shadow_table: Vec<u32>,
 
     /// Draws the mesh pool's meshes, pulling their vertices.
     mesh_pipeline: vk::Pipeline,
@@ -187,6 +202,7 @@ impl Renderer {
         });
 
         self.current_frame = (self.current_frame + 1) % self.in_flight_frames.len();
+        self.frame_number += 1;
         Ok(())
     }
 
@@ -244,6 +260,24 @@ impl Renderer {
             },
         )
     }
+
+    /// Readies the light probes, waiting for the device.
+    fn init_probe_volume(&self) -> VkResult<()> {
+        record_submit_commandbuffer(
+            &self.render_device,
+            self.init_cmd_buffer,
+            self.init_cmd_fence,
+            self.graphics_queue.handle,
+            &[],
+            &[],
+            &[],
+            |cmd_buffer| unsafe { self.probe_volume.cmd_init(&self.render_device, cmd_buffer) },
+        )?;
+        unsafe {
+            self.render_device
+                .wait_for_fences(&[self.init_cmd_fence], true, u64::MAX)
+        }
+    }
 }
 
 /// Must be dropped before the `App` it was created from.
@@ -258,10 +292,12 @@ impl Drop for Renderer {
             self.mesh_pool.destroy_buffers(device);
             self.culler.destroy(device);
             self.depth_pyramid.destroy(device);
+            self.probe_volume.destroy(device);
             for buffer in self
                 .capture_buffers
                 .iter()
                 .chain(&self.frame_palette_buffers)
+                .chain(&self.frame_shadow_tables)
                 .chain(&self.frame_index_buffers)
                 .chain(&self.frame_vertex_buffers)
             {

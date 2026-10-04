@@ -2,7 +2,7 @@
 //!
 //! Run with `cargo run -p vrs --example terrain --release`, debug builds take a few seconds
 //! to mesh the world. Click to look around with the mouse, Escape to let go of it. WASD
-//! moves, Space and Shift go up and down, and Ctrl moves faster.
+//! moves, Space and Ctrl go up and down, and Shift moves faster.
 //!
 //! The title shows how many chunks were drawn of those in the frame: chunks behind hills
 //! are culled.
@@ -64,13 +64,13 @@ impl Camera {
             (KeyCode::KeyD, right),
             (KeyCode::KeyA, -right),
             (KeyCode::Space, Vec3::Y),
-            (KeyCode::ShiftLeft, -Vec3::Y),
+            (KeyCode::ControlLeft, -Vec3::Y),
         ] {
             if keys.contains(&key) {
                 direction += step;
             }
         }
-        let speed = match keys.contains(&KeyCode::ControlLeft) {
+        let speed = match keys.contains(&KeyCode::ShiftLeft) {
             true => FAST_SPEED,
             false => SPEED,
         };

@@ -19,8 +19,8 @@ struct MeshInfo {
     uint visible;
     uint voxelsPerEdge;
     float positionSteps;
-    uint _pad0;
-    uint _pad1;
+    uint occupancyBase;
+    uint probesBase;
 };
 
 // Matches `vk::DrawIndexedIndirectCommand`.

@@ -21,7 +21,10 @@ pub struct MeshCapacity {
     /// Every kind of vertex shares the buffer, see `MeshKind::words_per_vertex`.
     pub vertex_words: u32,
     pub indices: u32,
-    /// Chunks' packed voxel types, see `voxel::VoxelTypes`.
+    /// Chunks' packed voxel types, see `voxel::VoxelTypes`, each chunk's occupancy, one bit
+    /// per block of `voxel::OCCUPANCY_BLOCK`³ voxels, and for chunks a multiple of 16 voxels
+    /// wide, a word per 16³ voxels of where its light probe goes and a bit of whether it has
+    /// voxels.
     pub type_words: u32,
     pub meshes: u32,
 }
@@ -70,8 +73,12 @@ pub struct Mesh {
     pub kind: MeshKind,
     pub vertex_words: Range<u32>,
     pub indices: Range<u32>,
-    /// Empty for colored meshes.
+    /// A chunk's voxel types, its occupancy, then its probe cells, empty for colored meshes.
     pub type_words: Range<u32>,
+    /// Where the occupancy starts in `type_words`, see `voxel::VoxelTypes::occupancy`.
+    pub occupancy_offset: u32,
+    /// Where the probe cells start in `type_words`, see `gi::bake_probe_cells`.
+    pub probes_offset: u32,
     /// World position of the mesh's local origin, a chunk's voxel `(0, 0, 0)` corner.
     pub origin: Vec3,
     /// World units per local unit, a chunk's voxel size.

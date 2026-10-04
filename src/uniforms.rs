@@ -1,8 +1,19 @@
-use crate::{adapter::Adapter, buffer::Buffer};
+use crate::{adapter::Adapter, buffer::Buffer, gi::GiUniforms, renderer::LightingUniforms};
 use ash::{prelude::VkResult, vk};
 use glam::{Mat4, Vec4};
 use std::slice;
 
+/// Everything in a frame's uniform buffer. Starts with `MvpMatrices`, all the dynamic
+/// geometry's shader reads, and matches `Uniforms` in `mesh.slang`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FrameUniforms {
+    pub matrices: MvpMatrices,
+    pub lighting: LightingUniforms,
+    pub gi: GiUniforms,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MvpMatrices {
     pub model: Mat4,
@@ -36,10 +47,10 @@ pub fn identity_matrix() -> Mat4 {
     }
 }
 
-/// A mapped `HOST_VISIBLE` buffer the size of `MvpMatrices`.
+/// A mapped `HOST_VISIBLE` buffer the size of `FrameUniforms`.
 pub fn create_uniform_buffer(adapter: &Adapter, render_device: &ash::Device) -> VkResult<Buffer> {
     let info = vk::BufferCreateInfo::default()
-        .size(size_of::<MvpMatrices>() as vk::DeviceSize)
+        .size(size_of::<FrameUniforms>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
@@ -63,7 +74,7 @@ pub fn write_uniform_descriptor_sets(
         .map(|buffer| {
             vk::DescriptorBufferInfo::default()
                 .buffer(buffer.handle)
-                .range(size_of::<MvpMatrices>() as vk::DeviceSize)
+                .range(size_of::<FrameUniforms>() as vk::DeviceSize)
         })
         .collect();
     let writes: Vec<vk::WriteDescriptorSet> = descriptor_sets

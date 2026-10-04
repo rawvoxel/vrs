@@ -27,6 +27,8 @@ impl Mesh {
             scale: self.scale,
             vertex_base: self.vertex_words.start,
             types_base: self.type_words.start,
+            occupancy_base: self.type_words.start + self.occupancy_offset,
+            probes_base: self.type_words.start + self.probes_offset,
             kind: self.kind as u32,
             visible: 0,
             voxels_per_edge: self.voxels_per_edge,
@@ -34,7 +36,6 @@ impl Mesh {
                 0 => 0.0,
                 edge => crate::voxel::position_steps(edge) as f32,
             },
-            _pad: [0; 2],
         }
     }
 }
@@ -60,7 +61,9 @@ pub(crate) struct MeshInfo {
     /// Zero for colored meshes.
     pub voxels_per_edge: u32,
     pub position_steps: f32,
-    pub _pad: [u32; 2],
+    /// Where the chunk's occupancy and probe cells start in the type buffer, in words.
+    pub occupancy_base: u32,
+    pub probes_base: u32,
 }
 
 impl MeshInfo {
@@ -78,7 +81,8 @@ impl MeshInfo {
         visible: 0,
         voxels_per_edge: 0,
         position_steps: 0.0,
-        _pad: [0; 2],
+        occupancy_base: 0,
+        probes_base: 0,
     };
 }
 
@@ -90,12 +94,24 @@ pub(crate) struct NewMesh<'a> {
     pub indices: &'a [Index],
     /// Packed voxel types, empty for colored meshes.
     pub type_words: &'a [u32],
+    /// The types' occupancy, stored right after them. Empty for colored meshes.
+    pub occupancy: &'a [u32],
+    /// Where the chunk's light probes go, stored after the occupancy. Empty for colored meshes.
+    pub probes: &'a [u32],
     pub origin: Vec3,
     pub scale: f32,
     /// Zero for colored meshes.
     pub voxels_per_edge: u32,
     /// In the world.
     pub bounds: (Vec3, Vec3),
+}
+
+impl NewMesh<'_> {
+    /// Words the mesh takes in the type buffer, its types, occupancy and probe cells.
+    #[inline]
+    pub fn type_word_count(&self) -> u32 {
+        (self.type_words.len() + self.occupancy.len() + self.probes.len()) as u32
+    }
 }
 
 /// Which of the pool's buffers an upload copies into.
@@ -227,7 +243,7 @@ impl MeshPool {
             self.vertex_ranges.free(vertex_words);
             return Err(out_of_memory);
         };
-        let Some(type_words) = self.type_ranges.alloc(new.type_words.len() as u32) else {
+        let Some(type_words) = self.type_ranges.alloc(new.type_word_count()) else {
             self.vertex_ranges.free(vertex_words);
             self.index_ranges.free(indices);
             return Err(out_of_memory);
@@ -238,6 +254,8 @@ impl MeshPool {
             vertex_words,
             indices,
             type_words,
+            occupancy_offset: new.type_words.len() as u32,
+            probes_offset: (new.type_words.len() + new.occupancy.len()) as u32,
             origin: new.origin,
             scale: new.scale,
             voxels_per_edge: new.voxels_per_edge,
@@ -248,35 +266,40 @@ impl MeshPool {
 
         // NOTE: Even empty meshes upload their `MeshInfo`, the slot's last one may still be there.
         let info = mesh.info();
-        let mut pieces = [(&[][..], 0); 4];
-        pieces[VERTICES] = (
-            slice_as_bytes(new.vertex_words),
+        let mut uploads: [(Vec<&[u8]>, vk::DeviceSize); 4] = Default::default();
+        uploads[VERTICES] = (
+            vec![slice_as_bytes(new.vertex_words)],
             mesh.vertex_words.start as vk::DeviceSize * WORD_SIZE,
         );
-        pieces[INDICES] = (
-            slice_as_bytes(new.indices),
+        uploads[INDICES] = (
+            vec![slice_as_bytes(new.indices)],
             mesh.indices.start as vk::DeviceSize * INDEX_SIZE,
         );
-        pieces[INFOS] = (
-            slice_as_bytes(slice::from_ref(&info)),
+        uploads[INFOS] = (
+            vec![slice_as_bytes(slice::from_ref(&info))],
             (slot * size_of::<MeshInfo>()) as vk::DeviceSize,
         );
-        pieces[TYPES] = (
-            slice_as_bytes(new.type_words),
+        uploads[TYPES] = (
+            vec![
+                slice_as_bytes(new.type_words),
+                slice_as_bytes(new.occupancy),
+                slice_as_bytes(new.probes),
+            ],
             mesh.type_words.start as vk::DeviceSize * WORD_SIZE,
         );
         let mut copies = [None; 4];
-        for (copy, (bytes, dst_offset)) in copies.iter_mut().zip(pieces) {
-            if bytes.is_empty() {
+        for (copy, (pieces, dst_offset)) in copies.iter_mut().zip(uploads) {
+            let size: usize = pieces.iter().map(|piece| piece.len()).sum();
+            if size == 0 {
                 continue;
             }
-            match unsafe { self.staging.push(adapter, logical_device, frame, bytes) } {
+            match unsafe { self.staging.push(adapter, logical_device, frame, &pieces) } {
                 Ok(src_offset) => {
                     *copy = Some(
                         vk::BufferCopy2::default()
                             .src_offset(src_offset)
                             .dst_offset(dst_offset)
-                            .size(bytes.len() as vk::DeviceSize),
+                            .size(size as vk::DeviceSize),
                     );
                 }
                 Err(err) => {
@@ -317,6 +340,14 @@ impl MeshPool {
         self.meshes[id.0]
             .as_ref()
             .expect("MeshId must come from this MeshPool.")
+    }
+
+    /// Every mesh with an id, uploaded or not, by its index into `info_buffer`.
+    pub fn meshes(&self) -> impl Iterator<Item = (u32, &Mesh)> {
+        self.meshes
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, mesh)| Some((slot as u32, mesh.as_ref()?)))
     }
 
     /// The mesh's index into `info_buffer`.

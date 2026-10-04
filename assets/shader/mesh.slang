@@ -1,32 +1,11 @@
 // Draws the mesh pool's meshes, pulling each one's vertices in whichever format it uses.
 //
 // Colored meshes carry their own colors. Chunk meshes are colored by voxel: a fragment finds
-// the voxel it belongs to in the chunk's packed types, then that type's palette color.
+// the voxel it belongs to in the chunk's packed types, then that type's palette color. Then
+// they're lit by the sun, whose shadows are traced through the voxels, and the light probes,
+// or the sky and the ground outside them.
 
-// Matches `mesh::MeshInfo`, and `MeshInfo` in `cull.slang`.
-struct MeshInfo {
-    float3 boundsMin;
-    uint indexCount;
-    float3 boundsMax;
-    uint firstIndex;
-    float3 origin;
-    float scale;
-    uint vertexBase;
-    uint typesBase;
-    uint kind;
-    uint visible;
-    uint voxelsPerEdge;
-    float positionSteps;
-    uint _pad0;
-    uint _pad1;
-};
-
-// Matches `uniforms::MvpMatrices`.
-struct Uniforms {
-    float4x4 model;
-    float4x4 view;
-    float4x4 proj;
-};
+#include "common.slang"
 
 // Matches `mesh::MeshKind`.
 static const uint KIND_COLORED = 0;
@@ -48,20 +27,12 @@ static const float3 FACE_NORMALS[6] = {
 // the float error of an interpolated position, far below a voxel.
 static const float FACE_NUDGE = 1.0 / 256.0;
 
-[[vk::binding(0, 0)]] ConstantBuffer<Uniforms> ubo;
-[[vk::binding(1, 0)]] StructuredBuffer<uint> vertexWords;
-[[vk::binding(2, 0)]] StructuredBuffer<MeshInfo> meshes;
-// Every chunk's voxel types, laid out as `voxel::VoxelTypes` packs them.
-[[vk::binding(3, 0)]] StructuredBuffer<uint> typeWords;
-// Linear colors indexed by voxel type.
-[[vk::binding(4, 0)]] StructuredBuffer<float4> palette;
-
 struct VSOutput {
     float4 position : SV_Position;
     float3 color;
     // Chunk local, in the chunk's voxels.
     float3 voxelPosition;
-    // Carried for lighting, which the renderer doesn't do yet.
+    float3 worldPosition;
     float3 normal;
     nointerpolation uint kind;
     nointerpolation uint typesBase;
@@ -114,21 +85,9 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
     output.voxelPosition = local;
 
     float4 world = float4(mesh.origin + local * mesh.scale, 1.0);
+    output.worldPosition = world.xyz;
     output.position = mul(ubo.proj, mul(ubo.view, world));
     return output;
-}
-
-// The type id of voxel `cell` of the chunk whose types start at word `base`.
-// Matches `voxel::VoxelTypes::type_at`.
-uint typeAt(uint base, uint edge, uint3 cell) {
-    uint header = typeWords[base];
-    uint bits = header & 0xff;
-    uint perWord = 32 / bits;
-    uint index = cell.x + edge * (cell.y + edge * cell.z);
-    uint word = typeWords[base + 1 + (header >> 8) + index / perWord];
-    uint entry = (word >> ((index % perWord) * bits)) & ((1u << bits) - 1);
-    uint paletteWord = typeWords[base + 1 + (entry >> 1)];
-    return (paletteWord >> ((entry & 1) * 16)) & 0xffff;
 }
 
 // The chunk voxel containing voxel position `p`. Past the chunk's edges, its edge voxel.
@@ -154,10 +113,9 @@ float4 meshFrag(VSOutput input) : SV_Target {
         id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * (1.0 + FACE_NUDGE), edge));
     }
 
-    uint paletteSize;
-    uint stride;
-    palette.GetDimensions(paletteSize, stride);
-    // Types the palette doesn't cover show magenta.
-    float3 color = id < paletteSize ? palette[id].rgb : float3(1.0, 0.0, 1.0);
-    return float4(color, 1.0);
+    // Greedy normals are exact already, packed ones are interpolated between vertices.
+    float3 normal = input.kind == KIND_GREEDY ? input.normal : normalize(input.normal);
+    float3 toViewer = normalize(ubo.gi.cameraPosition.xyz - input.worldPosition);
+    float3 light = lightAt(input.worldPosition, normal, faceNormal, toViewer, false);
+    return float4(paletteColor(id) * light, 1.0);
 }
