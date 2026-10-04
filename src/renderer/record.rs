@@ -61,19 +61,7 @@ impl Renderer {
                 self.cmd_draw_meshes(cmd_buffer, frame, first_phase, candidate_count, compact);
             }
             if data.dynamic_index_count > 0 {
-                self.cmd_bind_geometry(
-                    cmd_buffer,
-                    self.frame_index_buffers[frame].buffer.handle,
-                    self.frame_vertex_buffers[frame].buffer.handle,
-                );
-                self.render_device.cmd_draw_indexed(
-                    cmd_buffer,
-                    data.dynamic_index_count,
-                    1,
-                    0,
-                    0,
-                    0,
-                );
+                self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
             }
             self.render_device.cmd_end_rendering(cmd_buffer);
 
@@ -282,7 +270,7 @@ impl Renderer {
         };
     }
 
-    /// The graphics pipeline, its dynamic state and this frame's uniforms.
+    /// The pass's dynamic state and this frame's descriptors, which both graphics pipelines share.
     fn cmd_bind_graphics(&self, cmd_buffer: vk::CommandBuffer, frame: usize) {
         let extent = self.swapchain.extent;
         let viewport = vk::Viewport::default()
@@ -290,11 +278,6 @@ impl Renderer {
             .height(extent.height as f32)
             .max_depth(1.0);
         unsafe {
-            self.render_device.cmd_bind_pipeline(
-                cmd_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.graphics_pipeline,
-            );
             self.render_device
                 .cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
             self.render_device
@@ -309,28 +292,41 @@ impl Renderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline_layout,
                 0,
-                slice::from_ref(&self.ubo_desc_sets[frame]),
+                slice::from_ref(&self.frame_desc_sets[frame]),
                 &[],
             );
         }
     }
 
     #[inline]
-    fn cmd_bind_geometry(
-        &self,
-        cmd_buffer: vk::CommandBuffer,
-        index_buffer: vk::Buffer,
-        vertex_buffer: vk::Buffer,
-    ) {
+    fn cmd_bind_pipeline(&self, cmd_buffer: vk::CommandBuffer, pipeline: vk::Pipeline) {
+        unsafe {
+            self.render_device.cmd_bind_pipeline(
+                cmd_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline,
+            )
+        };
+    }
+
+    /// Draws the frame's own geometry, from its host visible buffers.
+    fn cmd_draw_dynamic(&self, cmd_buffer: vk::CommandBuffer, frame: usize, index_count: u32) {
+        self.cmd_bind_pipeline(cmd_buffer, self.dynamic_pipeline);
         unsafe {
             self.render_device.cmd_bind_index_buffer(
                 cmd_buffer,
-                index_buffer,
+                self.frame_index_buffers[frame].buffer.handle,
                 0,
                 vk::IndexType::UINT32,
             );
+            self.render_device.cmd_bind_vertex_buffers(
+                cmd_buffer,
+                0,
+                &[self.frame_vertex_buffers[frame].buffer.handle],
+                &[0],
+            );
             self.render_device
-                .cmd_bind_vertex_buffers(cmd_buffer, 0, &[vertex_buffer], &[0]);
+                .cmd_draw_indexed(cmd_buffer, index_count, 1, 0, 0, 0);
         }
     }
 
@@ -343,11 +339,16 @@ impl Renderer {
         candidate_count: u32,
         compact: bool,
     ) {
-        self.cmd_bind_geometry(
-            cmd_buffer,
-            self.mesh_pool.index_buffer.handle,
-            self.mesh_pool.vertex_buffer.handle,
-        );
+        // The mesh shaders pull vertices themselves, there's no vertex buffer.
+        self.cmd_bind_pipeline(cmd_buffer, self.mesh_pipeline);
+        unsafe {
+            self.render_device.cmd_bind_index_buffer(
+                cmd_buffer,
+                self.mesh_pool.index_buffer.handle,
+                0,
+                vk::IndexType::UINT32,
+            );
+        }
         let draw_buffer = self.culler.frame_draw_buffers[frame].buffer.handle;
         let region = phase.draw_region();
         let first_draw_offset =

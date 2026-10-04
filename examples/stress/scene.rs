@@ -1,4 +1,8 @@
 //! The chunks and the wall the stress test draws, and which of them should be drawn.
+//!
+//! Chunks are voxel chunks, colored per voxel through the palette. Each is the face of a slab
+//! one voxel thick, half one type and half another, so its color has to come from the voxel
+//! under each pixel, not the face. Every third chunk uses packed vertices, the rest greedy.
 
 use ash::vk;
 use glam::{Mat4, Vec2, Vec3};
@@ -7,6 +11,7 @@ use vrs::{
     mesh::{MeshCapacity, MeshId},
     renderer::Renderer,
     vertex::Vertex,
+    voxel::{ChunkMesh, ChunkVertices, Face, GreedyVertex, PackedVertex, VoxelTypes},
 };
 
 pub const GRID: u32 = 16;
@@ -14,41 +19,34 @@ pub const CHUNK_SIZE: f32 = 2.0 / GRID as f32 * 0.9;
 pub const CHUNK_Z: f32 = 0.5;
 pub const WALL_Z: f32 = 0.2;
 pub const WALL_HALF_SIZE: f32 = 0.5;
+/// Voxels along each edge of a chunk, and of the wall.
+pub const EDGE: u32 = 4;
+pub const VOXEL_SIZE: f32 = CHUNK_SIZE / EDGE as f32;
+/// Shades take palette entries 1 to 10, 0 is empty space.
+const SHADES: u32 = 10;
+const WALL_TYPE: u16 = SHADES as u16 + 1;
 pub const WALL_COLOR: [f32; 3] = [0.9, 0.8, 0.1];
 /// Room for half again the grid's geometry, so remeshing has to reuse freed space.
 pub const CAPACITY: MeshCapacity = MeshCapacity {
-    vertices: GRID * GRID * 4 * 3 / 2 + 4,
+    // Packed vertices are 3 words, greedy 2.
+    vertex_words: GRID * GRID * 4 * 3 * 3 / 2 + 16,
     indices: GRID * GRID * 6 * 3 / 2 + 6,
+    // A header, two palette words and four index words a chunk.
+    type_words: GRID * GRID * 7 * 3 / 2 + 8,
     meshes: GRID * GRID * 3 / 2,
 };
 
-/// Faces the camera unless `facing_away`, which backface culling skips.
-pub fn quad(
-    renderer: &mut Renderer,
-    min: Vec2,
-    size: f32,
-    z: f32,
-    col: [f32; 3],
-    facing_away: bool,
-) -> Result<MeshId, vk::Result> {
-    let corner = |x: f32, y: f32| Vertex {
-        pos: [min.x + x * size, min.y + y * size, z],
-        col,
-    };
-    // Front faces wind counter-clockwise on screen.
-    let indices = match facing_away {
-        false => [0, 2, 1, 1, 2, 3],
-        true => [0, 1, 2, 2, 1, 3],
-    };
-    renderer.create_mesh(
-        &indices,
-        &[
-            corner(0.0, 0.0),
-            corner(1.0, 0.0),
-            corner(0.0, 1.0),
-            corner(1.0, 1.0),
-        ],
-    )
+/// The colors voxel types draw with.
+pub fn palette() -> Vec<[f32; 3]> {
+    let shades = (0..SHADES).map(|shade| {
+        let shade = shade as f32 / SHADES as f32;
+        [shade, 1.0 - shade, 0.5]
+    });
+    [[0.0; 3]]
+        .into_iter()
+        .chain(shades)
+        .chain([WALL_COLOR])
+        .collect()
 }
 
 /// The corner of a cell's chunk nearest the origin.
@@ -56,13 +54,71 @@ pub fn chunk_min(cell: u32) -> Vec2 {
     Vec2::new((cell % GRID) as f32, (cell / GRID) as f32) / GRID as f32 * 2.0 - 1.0
 }
 
-/// A chunk's color when it's meshed on `frame`, `None` when it's empty, like air in a voxel world.
-pub fn chunk_color(cell: u32, frame: u32) -> Option<[f32; 3]> {
+/// A chunk's two voxel types when it's meshed on `frame`, `None` when it's empty, like air.
+fn chunk_types(cell: u32, frame: u32) -> Option<[u16; 2]> {
     if (cell + frame).is_multiple_of(13) {
         return None;
     }
-    let shade = ((frame / 7 + cell) % 10) as f32 / 10.0;
-    Some([shade, 1.0 - shade, 0.5])
+    let shade = (frame / 7 + cell) % SHADES;
+    Some([1 + shade as u16, 1 + ((shade + SHADES / 2) % SHADES) as u16])
+}
+
+/// A chunk's two colors, its low x half and its high x half, when it's meshed on `frame`.
+pub fn chunk_colors(cell: u32, frame: u32) -> Option<[[f32; 3]; 2]> {
+    let palette = palette();
+    chunk_types(cell, frame).map(|types| types.map(|id| palette[id as usize]))
+}
+
+/// A slab one voxel thick with its `-Z` face drawn at `face_corner`, facing the camera unless
+/// `facing_away`, which backface culling skips. Its low x half is `types[0]`, the rest `types[1]`.
+///
+/// The slab is the chunk's second layer, so the cells in front of the face are empty and inside
+/// the chunk: finding a face's voxel by going the wrong way lands there, not on the slab.
+pub fn voxel_slab(
+    renderer: &mut Renderer,
+    face_corner: Vec3,
+    voxel_size: f32,
+    types: [u16; 2],
+    packed: bool,
+    facing_away: bool,
+) -> Result<MeshId, vk::Result> {
+    let voxels: Vec<u16> = (0..EDGE.pow(3))
+        .map(|index| {
+            let (x, z) = (index % EDGE, index / (EDGE * EDGE));
+            match (z, x < EDGE / 2) {
+                (1, true) => types[0],
+                (1, false) => types[1],
+                _ => 0,
+            }
+        })
+        .collect();
+    let types = VoxelTypes::pack(EDGE, &voxels);
+
+    let edge = EDGE as f32;
+    let corners = [
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(edge, 0.0, 1.0),
+        Vec3::new(0.0, edge, 1.0),
+        Vec3::new(edge, edge, 1.0),
+    ];
+    let greedy = corners.map(|corner| GreedyVertex::new(corner, Face::NegZ, EDGE).unwrap());
+    let packed_vertices =
+        corners.map(|corner| PackedVertex::new(corner, Vec3::NEG_Z, EDGE).unwrap());
+    // Front faces wind counter-clockwise on screen.
+    let indices = match facing_away {
+        false => [0, 2, 1, 1, 2, 3],
+        true => [0, 1, 2, 2, 1, 3],
+    };
+    renderer.create_chunk_mesh(&ChunkMesh {
+        indices: &indices,
+        vertices: match packed {
+            true => ChunkVertices::Packed(&packed_vertices),
+            false => ChunkVertices::Greedy(&greedy),
+        },
+        origin: face_corner - Vec3::Z * voxel_size,
+        voxel_size,
+        types: &types,
+    })
 }
 
 /// A box's screen rectangle in NDC, `None` when it's outside the frustum.
@@ -85,8 +141,8 @@ pub fn screen_rect(view_proj: Mat4, min: Vec3, max: Vec3) -> Option<(Vec2, Vec2)
 
 pub struct Scene {
     pub chunks: Vec<Option<MeshId>>,
-    /// Each chunk's color, `None` when it's empty or wasn't meshed.
-    pub colors: Vec<Option<[f32; 3]>>,
+    /// Each chunk's two colors, `None` when it's empty or wasn't meshed.
+    pub colors: Vec<Option<[[f32; 3]; 2]>>,
     pub wall: Option<MeshId>,
     /// Backface culling skips the wall, so it hides nothing.
     pub wall_faces_away: bool,
@@ -111,7 +167,8 @@ pub fn live<'a>(
 }
 
 impl Scene {
-    pub fn new(renderer: Renderer, app: App) -> Self {
+    pub fn new(mut renderer: Renderer, app: App) -> Self {
+        renderer.set_palette(&palette());
         let cells = (GRID * GRID) as usize;
         Self {
             chunks: (0..cells).map(|_| None).collect(),
@@ -148,22 +205,24 @@ impl Scene {
         }
     }
 
-    /// Where the last mesh's vertices end in the pool.
-    pub fn vertices_end(&self) -> u32 {
+    /// Where the last mesh's vertices end in the pool, in words.
+    pub fn vertex_words_end(&self) -> u32 {
         live(&self.chunks, &self.wall, &self.ballast)
             .into_iter()
-            .map(|id| self.renderer.mesh(id).vertices.end)
+            .map(|id| self.renderer.mesh(id).vertex_words.end)
             .max()
             .unwrap_or(0)
     }
 
-    /// A mesh of `vertices` far outside every camera's view, frustum culled every frame.
-    pub fn add_ballast(&mut self, vertices: u32) -> Result<(), vk::Result> {
+    /// A colored mesh of at least `words` vertex words, far outside every camera's view,
+    /// frustum culled every frame.
+    pub fn add_ballast(&mut self, words: u32) -> Result<(), vk::Result> {
         let far = Vertex {
             pos: [1000.0, 1000.0, CHUNK_Z],
             col: [1.0; 3],
         };
-        let vertices = vec![far; vertices as usize];
+        // Colored vertices are 4 words.
+        let vertices = vec![far; words.div_ceil(4) as usize];
         self.ballast = Some(self.renderer.create_mesh(&[0, 1, 2], &vertices)?);
         Ok(())
     }
@@ -171,14 +230,13 @@ impl Scene {
     /// Every chunk, and the wall in front of them when `wall`, facing away when `wall_faces_away`.
     pub fn fill(&mut self, wall: bool, wall_faces_away: bool) -> Result<(), vk::Result> {
         if wall {
-            let min = Vec2::splat(-WALL_HALF_SIZE);
             let size = 2.0 * WALL_HALF_SIZE;
-            self.wall = Some(quad(
+            self.wall = Some(voxel_slab(
                 &mut self.renderer,
-                min,
-                size,
-                WALL_Z,
-                WALL_COLOR,
+                Vec3::new(-WALL_HALF_SIZE, -WALL_HALF_SIZE, WALL_Z),
+                size / EDGE as f32,
+                [WALL_TYPE; 2],
+                false,
                 wall_faces_away,
             )?);
             self.wall_faces_away = wall_faces_away;
@@ -198,20 +256,19 @@ impl Scene {
         }
         self.colors[index] = None;
 
-        let color = chunk_color(cell, frame);
-        let id = match color {
-            Some(color) => quad(
+        let id = match chunk_types(cell, frame) {
+            Some(types) => voxel_slab(
                 &mut self.renderer,
-                chunk_min(cell),
-                CHUNK_SIZE,
-                CHUNK_Z,
-                color,
+                chunk_min(cell).extend(CHUNK_Z),
+                VOXEL_SIZE,
+                types,
+                cell.is_multiple_of(3),
                 false,
             )?,
             None => self.renderer.create_mesh(&[], &[])?,
         };
         self.chunks[index] = Some(id);
-        self.colors[index] = color;
+        self.colors[index] = chunk_colors(cell, frame);
         Ok(())
     }
 

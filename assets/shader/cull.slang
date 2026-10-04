@@ -4,15 +4,21 @@
 // phase 1 draws what was visible last frame, phase 2 tests everything against the
 // pyramid, draws what's newly visible and remembers what's visible for next frame.
 
-// Matches `mesh::MeshInfo`.
+// Matches `mesh::MeshInfo`, and `MeshInfo` in `mesh.slang`.
 struct MeshInfo {
     float3 boundsMin;
     uint indexCount;
     float3 boundsMax;
     uint firstIndex;
-    int vertexOffset;
+    float3 origin;
+    float scale;
+    uint vertexBase;
+    uint typesBase;
+    uint kind;
     // Non-zero when phase 2 last found the mesh visible.
     uint visible;
+    uint voxelsPerEdge;
+    float positionSteps;
     uint _pad0;
     uint _pad1;
 };
@@ -153,8 +159,9 @@ void cullMain(uint3 threadId: SV_DispatchThreadID) {
     draw.indexCount = mesh.indexCount;
     draw.instanceCount = visible ? 1 : 0;
     draw.firstIndex = mesh.firstIndex;
-    draw.vertexOffset = mesh.vertexOffset;
-    draw.firstInstance = 0;
+    // The mesh shaders pull vertices themselves, finding the mesh by its instance.
+    draw.vertexOffset = 0;
+    draw.firstInstance = meshIndex;
 
     uint firstDraw = params.phase == PHASE_OCCLUSION ? params.candidateCount : 0;
     if (params.compact == 0) {

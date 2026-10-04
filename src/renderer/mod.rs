@@ -3,6 +3,8 @@ mod config;
 mod debug;
 mod device;
 mod frame;
+mod meshes;
+mod palette;
 mod record;
 mod setup;
 
@@ -16,7 +18,7 @@ use crate::{
     commands::record_submit_commandbuffer,
     cull::Culler,
     hiz::DepthPyramid,
-    mesh::{Mesh, MeshId, MeshPool},
+    mesh::{MeshId, MeshPool},
     queue::{Queue, QueueFamily},
     surface::Surface,
     swapchain::Swapchain,
@@ -96,12 +98,21 @@ pub struct Renderer {
     /// Set when the swapchain no longer matches the surface and must be rebuilt.
     swapchain_outdated: bool,
 
-    ubo_desc_pool: vk::DescriptorPool,
-    ubo_desc_set_layout: vk::DescriptorSetLayout,
-    ubo_desc_sets: Vec<vk::DescriptorSet>,
+    frame_desc_pool: vk::DescriptorPool,
+    frame_desc_set_layout: vk::DescriptorSetLayout,
+    frame_desc_sets: Vec<vk::DescriptorSet>,
     uniform_buffers: Vec<Buffer>,
+    /// Linear colors by voxel type, see `set_palette`.
+    palette: Vec<[f32; 4]>,
+    palette_version: u64,
+    frame_palette_buffers: Vec<DynamicBuffer>,
+    /// The palette version each frame's buffer holds.
+    frame_palette_versions: Vec<u64>,
 
-    graphics_pipeline: vk::Pipeline,
+    /// Draws the mesh pool's meshes, pulling their vertices.
+    mesh_pipeline: vk::Pipeline,
+    /// Draws each frame's own geometry from `frame_vertex_buffers`.
+    dynamic_pipeline: vk::Pipeline,
     graphics_pipeline_layout: vk::PipelineLayout,
     graphics_queue: Queue,
     graphics_queue_family: QueueFamily,
@@ -136,90 +147,6 @@ impl Renderer {
         let present_mode = self.surface.present_mode;
         self.surface.set_vsync(vsync);
         self.swapchain_outdated |= self.surface.present_mode != present_mode;
-    }
-
-    /// Adds a mesh to the shared mesh buffers, uploaded by the next `submit`.
-    /// Indices are relative to the mesh's own first vertex, and an empty mesh draws nothing.
-    ///
-    /// Its data is staged right away, which first waits for the device to finish the frame
-    /// that last used the next frame's staging buffer. That's normally long done.
-    ///
-    /// When the pool's out of room it waits for the device to go idle, freeing destroyed
-    /// meshes' space, then defragments, or grows when `grow_mesh_pool` allows. Those stall,
-    /// but are rare. Fails with `ERROR_OUT_OF_DEVICE_MEMORY` when none of it makes room.
-    pub fn create_mesh(&mut self, indices: &[Index], vertices: &[Vertex]) -> VkResult<MeshId> {
-        let frame = self.current_frame;
-        self.wait_for_frame(frame)?;
-        let out_of_room = |result: &VkResult<MeshId>| {
-            matches!(result, Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY))
-        };
-
-        let created = self.stage_mesh(frame, indices, vertices);
-        if !out_of_room(&created) {
-            return created;
-        }
-        // Frames in flight may still hold destroyed meshes' space.
-        let mut created = created;
-        if self.mesh_pool.has_pending_releases() {
-            unsafe { self.render_device.device_wait_idle()? };
-            self.mesh_pool.release_all();
-            created = self.stage_mesh(frame, indices, vertices);
-            if !out_of_room(&created) {
-                return created;
-            }
-        }
-
-        let plan = self.mesh_pool.plan_repack(
-            vertices.len() as u32,
-            indices.len() as u32,
-            self.grow_mesh_pool,
-        );
-        let Some(capacity) = plan else {
-            return created;
-        };
-        unsafe {
-            self.render_device.device_wait_idle()?;
-            self.mesh_pool.repack(
-                &self.adapter,
-                &self.render_device,
-                self.graphics_queue.handle,
-                self.init_cmd_buffer,
-                self.init_cmd_fence,
-                capacity,
-            )?;
-        }
-        self.stage_mesh(frame, indices, vertices)
-    }
-
-    #[inline]
-    fn stage_mesh(
-        &mut self,
-        frame: usize,
-        indices: &[Index],
-        vertices: &[Vertex],
-    ) -> VkResult<MeshId> {
-        // SAFETY: `create_mesh` waited for `frame`, which readies its staging buffer.
-        unsafe {
-            self.mesh_pool
-                .create(&self.adapter, &self.render_device, frame, indices, vertices)
-        }
-    }
-
-    /// Its space is reused once no frame in flight can still draw it.
-    #[inline]
-    pub fn destroy_mesh(&mut self, id: MeshId) {
-        let frame_count = self.in_flight_frames.len();
-        let last_frame = (self.current_frame + frame_count - 1) % frame_count;
-        self.mesh_pool.destroy(id, last_frame);
-    }
-
-    /// Where the mesh lives in the shared buffers, and its bounds.
-    ///
-    /// # Panics
-    /// If `id` came from another renderer.
-    #[inline]
-    pub fn mesh(&self, id: &MeshId) -> &Mesh {
-        self.mesh_pool.get(id)
     }
 
     /// Renders and presents a frame, skipping it while the window is minimized.
@@ -338,6 +265,7 @@ impl Drop for Renderer {
             for buffer in self
                 .capture_buffers
                 .iter()
+                .chain(&self.frame_palette_buffers)
                 .chain(&self.frame_index_buffers)
                 .chain(&self.frame_vertex_buffers)
             {
@@ -347,8 +275,8 @@ impl Drop for Renderer {
             for buffer in self.uniform_buffers.iter() {
                 buffer.destroy(device);
             }
-            device.destroy_descriptor_set_layout(self.ubo_desc_set_layout, None);
-            device.destroy_descriptor_pool(self.ubo_desc_pool, None);
+            device.destroy_descriptor_set_layout(self.frame_desc_set_layout, None);
+            device.destroy_descriptor_pool(self.frame_desc_pool, None);
 
             for &fence in self.in_flight_frames.iter() {
                 device.destroy_fence(fence, None);
@@ -365,7 +293,8 @@ impl Drop for Renderer {
             device.destroy_fence(self.init_cmd_fence, None);
             device.destroy_command_pool(self.init_cmd_pool, None);
 
-            device.destroy_pipeline(self.graphics_pipeline, None);
+            device.destroy_pipeline(self.mesh_pipeline, None);
+            device.destroy_pipeline(self.dynamic_pipeline, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             device.destroy_device(None);
         }

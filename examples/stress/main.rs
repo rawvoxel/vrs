@@ -25,7 +25,7 @@ use anyhow::{Result, bail};
 use ash::vk;
 use glam::Mat4;
 use scenarios::{Expect, PoolTest, SCENARIOS};
-use scene::{CAPACITY, CHUNK_SIZE, CHUNK_Z, GRID, Scene, chunk_min, live, quad};
+use scene::{CAPACITY, CHUNK_Z, GRID, Scene, VOXEL_SIZE, chunk_min, live, voxel_slab};
 use std::time::Instant;
 use target::{START_SIZE, Target};
 use vrs::{
@@ -124,7 +124,7 @@ impl Stress {
             // Far past any device's memory, even one that overcommits, such as lavapipe's.
             // The first fails on the pool's first buffer, the second on its last.
             MeshCapacity {
-                vertices: u32::MAX,
+                vertex_words: u32::MAX,
                 ..CAPACITY
             },
             MeshCapacity {
@@ -175,12 +175,12 @@ impl Stress {
             }
         }
         // A chunk destroyed before it's ever uploaded.
-        if let Ok(id) = quad(
+        if let Ok(id) = voxel_slab(
             &mut scene.renderer,
-            chunk_min(1),
-            CHUNK_SIZE,
-            CHUNK_Z,
-            [1.0; 3],
+            chunk_min(1).extend(CHUNK_Z),
+            VOXEL_SIZE,
+            [1, 2],
+            false,
             false,
         ) {
             scene.renderer.destroy_mesh(id);
@@ -200,13 +200,13 @@ impl Stress {
     fn test_pool(&mut self) {
         let scenario = &SCENARIOS[self.scenario];
         let scene = self.scene.as_mut().unwrap();
-        let capacity = scene.renderer.debug_mesh_pool_stats().capacity.vertices;
+        let capacity = scene.renderer.debug_mesh_pool_stats().capacity.vertex_words;
         let ballast = match scenario.pool {
             PoolTest::None => return,
             PoolTest::Defragment => {
                 scene.punch_holes();
                 // Past the free space at the end, but not past all of it.
-                capacity - scene.vertices_end() + 8
+                capacity - scene.vertex_words_end() + 8
             }
             PoolTest::Grow => capacity,
         };
@@ -319,15 +319,16 @@ impl Stress {
         let growths = after.growths - before.growths;
         if defrags > 0 || growths > 0 {
             println!(
-                "  the pool defragmented {defrags} and grew {growths} times, to {} vertices",
-                after.capacity.vertices
+                "  the pool defragmented {defrags} and grew {growths} times, to {} vertex words",
+                after.capacity.vertex_words
             );
         }
         let pool_failure = match scenario.pool {
             PoolTest::None => (growths > 0).then_some("the pool grew with growth off"),
             PoolTest::Defragment if defrags == 0 => Some("the pool never defragmented"),
             PoolTest::Defragment => (growths > 0).then_some("the pool grew with growth off"),
-            PoolTest::Grow => (growths == 0 || after.capacity.vertices <= before.capacity.vertices)
+            PoolTest::Grow => (growths == 0
+                || after.capacity.vertex_words <= before.capacity.vertex_words)
                 .then_some("the pool never grew"),
         };
         if let Some(failure) = pool_failure {

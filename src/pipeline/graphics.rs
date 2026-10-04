@@ -2,7 +2,7 @@
 
 use crate::{surface::Surface, vertex::Vertex};
 use ash::{prelude::VkResult, vk};
-use std::slice;
+use std::{ffi::CStr, slice};
 
 pub fn create_pipeline_layout(
     render_device: &ash::Device,
@@ -12,26 +12,34 @@ pub fn create_pipeline_layout(
     unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
 }
 
+/// The renderer's pipeline drawing into `surface`, with the vertex and fragment shaders of
+/// `entries`. With `vertex_input` it reads `Vertex`es from a vertex buffer, without, the
+/// vertex shader pulls its own.
 pub fn create_graphics_pipeline(
     surface: &Surface,
     render_device: &ash::Device,
     shader_module: vk::ShaderModule,
+    entries: (&CStr, &CStr),
+    vertex_input: bool,
     pipeline_layout: vk::PipelineLayout,
 ) -> VkResult<vk::Pipeline> {
     let shader_stage_infos = [
         vk::PipelineShaderStageCreateInfo::default()
             .module(shader_module)
-            .name(c"vertMain")
+            .name(entries.0)
             .stage(vk::ShaderStageFlags::VERTEX),
         vk::PipelineShaderStageCreateInfo::default()
             .module(shader_module)
-            .name(c"fragMain")
+            .name(entries.1)
             .stage(vk::ShaderStageFlags::FRAGMENT),
     ];
 
-    let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::default()
-        .vertex_attribute_descriptions(&Vertex::VERTEX_ATTRIBUTE_DESCRIPTIONS)
-        .vertex_binding_descriptions(&Vertex::VERTEX_BINDING_DESCRIPTIONS);
+    let vertex_input_state_info = match vertex_input {
+        true => vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_attribute_descriptions(&Vertex::VERTEX_ATTRIBUTE_DESCRIPTIONS)
+            .vertex_binding_descriptions(&Vertex::VERTEX_BINDING_DESCRIPTIONS),
+        false => vk::PipelineVertexInputStateCreateInfo::default(),
+    };
 
     let vertex_input_assembly_state_info =
         vk::PipelineInputAssemblyStateCreateInfo::default().topology(Vertex::VERTEX_TOPOLOGY);

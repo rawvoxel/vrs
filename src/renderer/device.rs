@@ -24,7 +24,12 @@ pub(super) fn create_render_device(
     extension_names_raw.push(khr::portability_subset::NAME.as_ptr());
 
     // NOTE: Keep in mind proper ordering when adding features.
-    let features = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(multi_draw_indirect);
+    // Indirect draws name their mesh by their first instance, which the mesh shaders read.
+    let features = vk::PhysicalDeviceFeatures::default()
+        .multi_draw_indirect(multi_draw_indirect)
+        .draw_indirect_first_instance(true);
+    let mut vulkan_11_features =
+        vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
     let mut synchronization2 =
         vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
     let mut dynamic_rendering =
@@ -38,6 +43,7 @@ pub(super) fn create_render_device(
         .enabled_features(&features)
         .push_next(&mut synchronization2)
         .push_next(&mut dynamic_rendering)
+        .push_next(&mut vulkan_11_features)
         .push_next(&mut vulkan_12_features);
 
     unsafe {

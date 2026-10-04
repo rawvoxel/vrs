@@ -7,6 +7,8 @@ pub struct Adapter {
     pub(crate) features: vk::PhysicalDeviceFeatures,
     /// The Vulkan 1.2 `drawIndirectCount` feature.
     pub(crate) draw_indirect_count: bool,
+    /// The Vulkan 1.1 `shaderDrawParameters` feature.
+    pub(crate) shader_draw_parameters: bool,
     pub(crate) properties: vk::PhysicalDeviceProperties,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub(crate) queue_families: Vec<QueueFamily>,
@@ -48,11 +50,14 @@ impl Adapter {
     pub fn new(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Self {
         unsafe {
             let features = instance.get_physical_device_features(physical_device);
+            let mut vulkan_11_features = vk::PhysicalDeviceVulkan11Features::default();
             let mut vulkan_12_features = vk::PhysicalDeviceVulkan12Features::default();
-            let mut features2 =
-                vk::PhysicalDeviceFeatures2::default().push_next(&mut vulkan_12_features);
+            let mut features2 = vk::PhysicalDeviceFeatures2::default()
+                .push_next(&mut vulkan_11_features)
+                .push_next(&mut vulkan_12_features);
             instance.get_physical_device_features2(physical_device, &mut features2);
             let draw_indirect_count = vulkan_12_features.draw_indirect_count == vk::TRUE;
+            let shader_draw_parameters = vulkan_11_features.shader_draw_parameters == vk::TRUE;
             let properties = instance.get_physical_device_properties(physical_device);
             let memory_properties = instance.get_physical_device_memory_properties(physical_device);
             let queue_families = get_queue_families(instance, physical_device);
@@ -61,6 +66,7 @@ impl Adapter {
                 handle: physical_device,
                 features,
                 draw_indirect_count,
+                shader_draw_parameters,
                 properties,
                 memory_properties,
                 queue_families,
@@ -95,6 +101,15 @@ impl Adapter {
             }
         }
         Ok(None)
+    }
+
+    /// Whether it has every feature the renderer needs: Vulkan 1.3, for dynamic rendering and
+    /// synchronization2, and indirect draws that name their mesh by their first instance.
+    #[inline]
+    pub fn supports_renderer(&self) -> bool {
+        self.supports_vulkan_1_3()
+            && self.features.draw_indirect_first_instance == vk::TRUE
+            && self.shader_draw_parameters
     }
 
     /// Dynamic rendering and synchronization2 are core in Vulkan 1.3.

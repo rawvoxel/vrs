@@ -20,6 +20,7 @@ pub mod swapchain;
 pub mod sync;
 pub mod uniforms;
 pub mod vertex;
+pub mod voxel;
 
 pub use app::App;
 

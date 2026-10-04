@@ -22,6 +22,37 @@ impl FrameData {
 }
 
 impl Renderer {
+    /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces,
+    /// and its palette, which growing replaces. The uniforms never move.
+    ///
+    /// # Safety
+    /// The device must not be using `frame`'s descriptor set.
+    unsafe fn write_frame_descriptors(&self, frame: usize) {
+        let buffer_infos = [
+            self.mesh_pool.vertex_buffer.handle,
+            self.mesh_pool.info_buffer.handle,
+            self.mesh_pool.type_buffer.handle,
+            self.frame_palette_buffers[frame].buffer.handle,
+        ]
+        .map(|buffer| {
+            vk::DescriptorBufferInfo::default()
+                .buffer(buffer)
+                .range(vk::WHOLE_SIZE)
+        });
+        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
+            .iter()
+            .enumerate()
+            .map(|(i, buffer_info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.frame_desc_sets[frame])
+                    .dst_binding(1 + i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(slice::from_ref(buffer_info))
+            })
+            .collect();
+        unsafe { self.render_device.update_descriptor_sets(&writes, &[]) };
+    }
+
     /// Waits for the device to finish `frame`'s last use, freeing up what it used.
     pub(super) fn wait_for_frame(&mut self, frame: usize) -> VkResult<()> {
         unsafe {
@@ -80,6 +111,8 @@ impl Renderer {
         draws: &DrawList,
     ) -> VkResult<FrameData> {
         unsafe {
+            self.write_palette(frame)?;
+            self.write_frame_descriptors(frame);
             self.frame_index_buffers[frame].write(
                 &self.adapter,
                 &self.render_device,

@@ -3,7 +3,7 @@ mod range_allocator;
 mod repack;
 mod staging;
 
-pub(crate) use pool::MeshPool;
+pub(crate) use pool::{MeshPool, NewMesh};
 
 use glam::Vec3;
 use std::ops::Range;
@@ -18,27 +18,66 @@ pub struct MeshId(usize);
 /// How much a `MeshPool` holds when created. It grows when `RendererConfig::grow_mesh_pool` allows.
 #[derive(Clone, Copy, Debug)]
 pub struct MeshCapacity {
-    pub vertices: u32,
+    /// Every kind of vertex shares the buffer, see `MeshKind::words_per_vertex`.
+    pub vertex_words: u32,
     pub indices: u32,
+    /// Chunks' packed voxel types, see `voxel::VoxelTypes`.
+    pub type_words: u32,
     pub meshes: u32,
 }
 
 impl Default for MeshCapacity {
-    /// 48 MiB of vertices, 16 MiB of indices and 3 MiB of mesh records.
+    /// 32 MiB of vertices, 16 MiB each of indices and voxel types, and 5 MiB of mesh records.
     fn default() -> Self {
         Self {
-            vertices: 1 << 21,
+            vertex_words: 1 << 23,
             indices: 1 << 22,
+            type_words: 1 << 22,
             meshes: 1 << 16,
         }
     }
 }
 
-/// Where a mesh lives in its pool's shared buffers, in elements, and its bounds.
+/// How a mesh's vertices are stored, and so how it's colored.
+/// Matches the `KIND_` constants in `mesh.slang`.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshKind {
+    /// `vertex::Vertex`es, world positions with their own colors.
+    Colored = 0,
+    /// `voxel::GreedyVertex`es, colored by voxel.
+    Greedy = 1,
+    /// `voxel::PackedVertex`es, colored by voxel.
+    Packed = 2,
+}
+
+impl MeshKind {
+    /// Words a vertex takes in the pool's vertex buffer.
+    #[inline]
+    pub fn words_per_vertex(self) -> u32 {
+        match self {
+            MeshKind::Colored => 4,
+            MeshKind::Greedy => 2,
+            MeshKind::Packed => 3,
+        }
+    }
+}
+
+/// Where a mesh lives in its pool's shared buffers, in words or elements, and where it is
+/// in the world.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mesh {
-    pub vertices: Range<u32>,
+    pub kind: MeshKind,
+    pub vertex_words: Range<u32>,
     pub indices: Range<u32>,
+    /// Empty for colored meshes.
+    pub type_words: Range<u32>,
+    /// World position of the mesh's local origin, a chunk's voxel `(0, 0, 0)` corner.
+    pub origin: Vec3,
+    /// World units per local unit, a chunk's voxel size.
+    pub scale: f32,
+    /// Zero for colored meshes.
+    pub voxels_per_edge: u32,
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,
 }
@@ -47,5 +86,10 @@ impl Mesh {
     #[inline]
     pub fn index_count(&self) -> u32 {
         self.indices.len() as u32
+    }
+
+    #[inline]
+    pub fn vertex_count(&self) -> u32 {
+        self.vertex_words.len() as u32 / self.kind.words_per_vertex()
     }
 }

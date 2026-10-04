@@ -21,7 +21,8 @@ use crate::{
 use ash::{khr, prelude::VkResult, vk};
 use std::slice;
 
-const SLANG_SPV: &[u8] = include_bytes!("../../assets/shader/slang.spv");
+const DYNAMIC_SPV: &[u8] = include_bytes!("../../assets/shader/slang.spv");
+const MESH_SPV: &[u8] = include_bytes!("../../assets/shader/mesh.spv");
 pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
 /// Starting size of each frame's dynamic geometry buffers, they grow to fit.
 const INITIAL_DYNAMIC_ELEMENTS: vk::DeviceSize = 1024;
@@ -103,12 +104,17 @@ impl Renderer {
             swapchain_device: khr::swapchain::Device::new(&app.instance, &render_device),
             swapchain_outdated: false,
 
-            ubo_desc_pool: vk::DescriptorPool::null(),
-            ubo_desc_set_layout: vk::DescriptorSetLayout::null(),
-            ubo_desc_sets: Vec::new(),
+            frame_desc_pool: vk::DescriptorPool::null(),
+            frame_desc_set_layout: vk::DescriptorSetLayout::null(),
+            frame_desc_sets: Vec::new(),
             uniform_buffers: Vec::new(),
+            palette: Vec::new(),
+            palette_version: 0,
+            frame_palette_buffers: Vec::new(),
+            frame_palette_versions: Vec::new(),
 
-            graphics_pipeline: vk::Pipeline::null(),
+            mesh_pipeline: vk::Pipeline::null(),
+            dynamic_pipeline: vk::Pipeline::null(),
             graphics_pipeline_layout: vk::PipelineLayout::null(),
             graphics_queue: Queue::new(&graphics_queue_family, &render_device, 0),
             graphics_queue_family,
@@ -132,41 +138,69 @@ impl Renderer {
         let device = self.render_device.clone();
         let adapter = self.adapter.clone();
 
-        // Uniform Buffers
-        let ubo_pool_size = vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(FRAMES_IN_FLIGHT);
-        self.ubo_desc_pool =
-            create_descriptor_pool(&device, slice::from_ref(&ubo_pool_size), FRAMES_IN_FLIGHT)?;
-        self.ubo_desc_set_layout = create_descriptor_set_layout(
+        // Frame Descriptors: the uniforms, then the mesh pool's vertices, mesh infos and voxel
+        // types, and the palette, matching the bindings in `mesh.slang`.
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(FRAMES_IN_FLIGHT),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(4 * FRAMES_IN_FLIGHT),
+        ];
+        self.frame_desc_pool = create_descriptor_pool(&device, &pool_sizes, FRAMES_IN_FLIGHT)?;
+        self.frame_desc_set_layout = create_descriptor_set_layout(
             &device,
-            &[vk::DescriptorType::UNIFORM_BUFFER],
-            vk::ShaderStageFlags::VERTEX,
+            &[
+                vk::DescriptorType::UNIFORM_BUFFER,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::DescriptorType::STORAGE_BUFFER,
+            ],
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         )?;
-        self.ubo_desc_sets = allocate_descriptor_sets(
+        self.frame_desc_sets = allocate_descriptor_sets(
             &device,
-            self.ubo_desc_pool,
-            self.ubo_desc_set_layout,
+            self.frame_desc_pool,
+            self.frame_desc_set_layout,
             FRAMES_IN_FLIGHT,
         )?;
         for _ in 0..FRAMES_IN_FLIGHT {
             self.uniform_buffers
                 .push(create_uniform_buffer(&adapter, &device)?);
         }
-        write_uniform_descriptor_sets(&device, &self.ubo_desc_sets, &self.uniform_buffers);
+        write_uniform_descriptor_sets(&device, &self.frame_desc_sets, &self.uniform_buffers);
 
-        // Graphics Pipeline
+        // Graphics Pipelines
         self.graphics_pipeline_layout =
-            create_pipeline_layout(&device, slice::from_ref(&self.ubo_desc_set_layout))?;
-        let shader_module = create_shader_module(&device, SLANG_SPV)?;
-        let pipeline = create_graphics_pipeline(
-            &self.surface,
-            &device,
-            shader_module,
-            self.graphics_pipeline_layout,
-        );
-        unsafe { device.destroy_shader_module(shader_module, None) };
-        self.graphics_pipeline = pipeline?;
+            create_pipeline_layout(&device, slice::from_ref(&self.frame_desc_set_layout))?;
+        for (pipeline, spv, entries, vertex_input) in [
+            (
+                &mut self.mesh_pipeline,
+                MESH_SPV,
+                (c"meshVert", c"meshFrag"),
+                false,
+            ),
+            (
+                &mut self.dynamic_pipeline,
+                DYNAMIC_SPV,
+                (c"vertMain", c"fragMain"),
+                true,
+            ),
+        ] {
+            let shader_module = create_shader_module(&device, spv)?;
+            let created = create_graphics_pipeline(
+                &self.surface,
+                &device,
+                shader_module,
+                entries,
+                vertex_input,
+                self.graphics_pipeline_layout,
+            );
+            unsafe { device.destroy_shader_module(shader_module, None) };
+            *pipeline = created?;
+        }
 
         // Swapchain
         self.swapchain = Swapchain::new(
@@ -232,6 +266,14 @@ impl Renderer {
                 vk::BufferUsageFlags::TRANSFER_DST,
                 4,
             )?);
+            self.frame_palette_buffers.push(DynamicBuffer::new(
+                &adapter,
+                &device,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                INITIAL_DYNAMIC_ELEMENTS * size_of::<[f32; 4]>() as vk::DeviceSize,
+            )?);
+            // Written by the first frame.
+            self.frame_palette_versions.push(u64::MAX);
             self.frame_index_buffers.push(dynamic_buffer(
                 vk::BufferUsageFlags::INDEX_BUFFER,
                 size_of::<Index>(),
@@ -246,7 +288,7 @@ impl Renderer {
     }
 }
 
-/// The most preferred adapter supporting Vulkan 1.3 that can render, cull, and present to
+/// The most preferred adapter with every feature the renderer needs that can render, cull, and present to
 /// the `App`'s window unless it's headless. Culling runs on the graphics queue, so it must
 /// also support compute.
 fn pick_adapter(
@@ -254,7 +296,7 @@ fn pick_adapter(
     surface_instance: &khr::surface::Instance,
 ) -> VkResult<(Adapter, QueueFamily)> {
     for adapter in app.adapters_by_preference() {
-        if !adapter.supports_vulkan_1_3() {
+        if !adapter.supports_renderer() {
             continue;
         }
         let queue_family = adapter.get_queue_family(

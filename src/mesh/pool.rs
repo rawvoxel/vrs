@@ -1,13 +1,19 @@
-use super::{Mesh, MeshCapacity, MeshId, range_allocator::RangeAllocator, staging::UploadStaging};
+use super::{
+    Mesh, MeshCapacity, MeshId, MeshKind, range_allocator::RangeAllocator, staging::UploadStaging,
+};
 use crate::{
     adapter::Adapter,
     buffer::{Buffer, create_device_local_buffer},
     bytes::slice_as_bytes,
-    vertex::{Index, Vertex},
+    vertex::Index,
 };
 use ash::{prelude::VkResult, vk};
 use glam::Vec3;
 use std::slice;
+
+/// Bytes in a word of the vertex and type buffers.
+pub(super) const WORD_SIZE: vk::DeviceSize = size_of::<u32>() as vk::DeviceSize;
+pub(super) const INDEX_SIZE: vk::DeviceSize = size_of::<Index>() as vk::DeviceSize;
 
 impl Mesh {
     #[inline]
@@ -17,15 +23,24 @@ impl Mesh {
             index_count: self.index_count(),
             bounds_max: self.bounds_max.to_array(),
             first_index: self.indices.start,
-            vertex_offset: self.vertices.start as i32,
+            origin: self.origin.to_array(),
+            scale: self.scale,
+            vertex_base: self.vertex_words.start,
+            types_base: self.type_words.start,
+            kind: self.kind as u32,
             visible: 0,
+            voxels_per_edge: self.voxels_per_edge,
+            position_steps: match self.voxels_per_edge {
+                0 => 0.0,
+                edge => crate::voxel::position_steps(edge) as f32,
+            },
             _pad: [0; 2],
         }
     }
 }
 
-/// A mesh's record in `MeshPool::info_buffer`, which culling reads to build its draw.
-/// Matches `MeshInfo` in `cull.slang`.
+/// A mesh's record in `MeshPool::info_buffer`, which culling reads to build its draw and the
+/// mesh shaders read to draw it. Matches `MeshInfo` in `cull.slang` and `mesh.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MeshInfo {
@@ -33,9 +48,18 @@ pub(crate) struct MeshInfo {
     pub index_count: u32,
     pub bounds_max: [f32; 3],
     pub first_index: u32,
-    pub vertex_offset: i32,
+    /// World position of the mesh's local origin, and world units per local unit.
+    pub origin: [f32; 3],
+    pub scale: f32,
+    /// Where the mesh's vertices and voxel types start, in words.
+    pub vertex_base: u32,
+    pub types_base: u32,
+    pub kind: u32,
     /// Written by occlusion culling, non-zero when the mesh was last found visible.
     pub visible: u32,
+    /// Zero for colored meshes.
+    pub voxels_per_edge: u32,
+    pub position_steps: f32,
     pub _pad: [u32; 2],
 }
 
@@ -46,17 +70,45 @@ impl MeshInfo {
         index_count: 0,
         bounds_max: [0.0; 3],
         first_index: 0,
-        vertex_offset: 0,
+        origin: [0.0; 3],
+        scale: 0.0,
+        vertex_base: 0,
+        types_base: 0,
+        kind: 0,
         visible: 0,
+        voxels_per_edge: 0,
+        position_steps: 0.0,
         _pad: [0; 2],
     };
 }
 
+/// A mesh for `MeshPool::create`, whatever its kind.
+pub(crate) struct NewMesh<'a> {
+    pub kind: MeshKind,
+    /// `kind.words_per_vertex()` words per vertex.
+    pub vertex_words: &'a [u32],
+    pub indices: &'a [Index],
+    /// Packed voxel types, empty for colored meshes.
+    pub type_words: &'a [u32],
+    pub origin: Vec3,
+    pub scale: f32,
+    /// Zero for colored meshes.
+    pub voxels_per_edge: u32,
+    /// In the world.
+    pub bounds: (Vec3, Vec3),
+}
+
+/// Which of the pool's buffers an upload copies into.
+const VERTICES: usize = 0;
+const INDICES: usize = 1;
+const INFOS: usize = 2;
+const TYPES: usize = 3;
+
 /// A mesh waiting for the next frame to copy its staged data into the shared buffers.
 pub(super) struct Upload {
     pub slot: usize,
-    /// Into the vertex, index and info buffers, `None` for empty data.
-    pub copies: [Option<vk::BufferCopy2<'static>>; 3],
+    /// Into the vertex, index, info and type buffers, `None` for empty data.
+    pub copies: [Option<vk::BufferCopy2<'static>>; 4],
 }
 
 /// How often a pool has been repacked, see `MeshPool::repack`.
@@ -68,9 +120,10 @@ pub(crate) struct RepackCounts {
     pub growths: u32,
 }
 
-/// Every mesh shares one `DEVICE_LOCAL` vertex buffer and one index buffer,
-/// so drawing many meshes needs no rebinding. Each mesh's `MeshInfo` lives in
-/// `info_buffer` at its `MeshId`, for culling on the device.
+/// Every mesh shares one `DEVICE_LOCAL` buffer each of vertices, indices and voxel types,
+/// so drawing many meshes needs no rebinding. Vertices are pulled by the mesh shader from
+/// a buffer of words, so meshes of every `MeshKind` share it. Each mesh's `MeshInfo` lives
+/// in `info_buffer` at its `MeshId`, for culling and drawing on the device.
 ///
 /// Creating a mesh writes its data to the current frame's staging buffer, which that frame
 /// copies in before drawing. Destroying a mesh only frees its ranges once no frame in flight
@@ -79,9 +132,11 @@ pub(crate) struct MeshPool {
     pub vertex_buffer: Buffer,
     pub index_buffer: Buffer,
     pub info_buffer: Buffer,
+    pub type_buffer: Buffer,
     pub capacity: MeshCapacity,
     pub(super) vertex_ranges: RangeAllocator,
     pub(super) index_ranges: RangeAllocator,
+    pub(super) type_ranges: RangeAllocator,
     /// Indexed by `MeshId`, `None` slots are free for reuse.
     pub(super) meshes: Vec<Option<Mesh>>,
     pub(super) uploads: Vec<Upload>,
@@ -99,8 +154,12 @@ impl MeshPool {
         frames_in_flight: usize,
     ) -> VkResult<Self> {
         let mut pool = Self::null(capacity, frames_in_flight);
-        [pool.vertex_buffer, pool.index_buffer, pool.info_buffer] =
-            create_pool_buffers(adapter, logical_device, capacity)?;
+        [
+            pool.vertex_buffer,
+            pool.index_buffer,
+            pool.info_buffer,
+            pool.type_buffer,
+        ] = create_pool_buffers(adapter, logical_device, capacity)?;
         if let Err(err) = pool
             .staging
             .create(adapter, logical_device, frames_in_flight)
@@ -117,9 +176,11 @@ impl MeshPool {
             vertex_buffer: Buffer::null(),
             index_buffer: Buffer::null(),
             info_buffer: Buffer::null(),
+            type_buffer: Buffer::null(),
             capacity,
-            vertex_ranges: RangeAllocator::new(capacity.vertices),
+            vertex_ranges: RangeAllocator::new(capacity.vertex_words),
             index_ranges: RangeAllocator::new(capacity.indices),
+            type_ranges: RangeAllocator::new(capacity.type_words),
             meshes: Vec::new(),
             uploads: Vec::new(),
             staging: UploadStaging::null(),
@@ -140,7 +201,6 @@ impl MeshPool {
     }
 
     /// Reserves space and stages the data for `frame` to upload.
-    /// Indices are relative to the mesh's own first vertex.
     ///
     /// Fails with `ERROR_OUT_OF_DEVICE_MEMORY` when the pool is full.
     ///
@@ -151,8 +211,7 @@ impl MeshPool {
         adapter: &Adapter,
         logical_device: &ash::Device,
         frame: usize,
-        indices: &[Index],
-        vertices: &[Vertex],
+        new: &NewMesh,
     ) -> VkResult<MeshId> {
         let out_of_memory = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
         let free_slot = self.meshes.iter().position(Option::is_none);
@@ -160,50 +219,53 @@ impl MeshPool {
             return Err(out_of_memory);
         }
 
-        let vertex_range = self
+        let vertex_words = self
             .vertex_ranges
-            .alloc(vertices.len() as u32)
+            .alloc(new.vertex_words.len() as u32)
             .ok_or(out_of_memory)?;
-        let Some(index_range) = self.index_ranges.alloc(indices.len() as u32) else {
-            self.vertex_ranges.free(vertex_range);
+        let Some(indices) = self.index_ranges.alloc(new.indices.len() as u32) else {
+            self.vertex_ranges.free(vertex_words);
+            return Err(out_of_memory);
+        };
+        let Some(type_words) = self.type_ranges.alloc(new.type_words.len() as u32) else {
+            self.vertex_ranges.free(vertex_words);
+            self.index_ranges.free(indices);
             return Err(out_of_memory);
         };
 
-        let (bounds_min, bounds_max) = match vertices.first() {
-            Some(first) => vertices.iter().fold(
-                (Vec3::from(first.pos), Vec3::from(first.pos)),
-                |(min, max), vertex| {
-                    let pos = Vec3::from(vertex.pos);
-                    (min.min(pos), max.max(pos))
-                },
-            ),
-            None => (Vec3::ZERO, Vec3::ZERO),
-        };
         let mesh = Mesh {
-            vertices: vertex_range,
-            indices: index_range,
-            bounds_min,
-            bounds_max,
+            kind: new.kind,
+            vertex_words,
+            indices,
+            type_words,
+            origin: new.origin,
+            scale: new.scale,
+            voxels_per_edge: new.voxels_per_edge,
+            bounds_min: new.bounds.0,
+            bounds_max: new.bounds.1,
         };
         let slot = free_slot.unwrap_or(self.meshes.len());
 
         // NOTE: Even empty meshes upload their `MeshInfo`, the slot's last one may still be there.
         let info = mesh.info();
-        let pieces = [
-            (
-                slice_as_bytes(vertices),
-                mesh.vertices.start as usize * size_of::<Vertex>(),
-            ),
-            (
-                slice_as_bytes(indices),
-                mesh.indices.start as usize * size_of::<Index>(),
-            ),
-            (
-                slice_as_bytes(slice::from_ref(&info)),
-                slot * size_of::<MeshInfo>(),
-            ),
-        ];
-        let mut copies = [None; 3];
+        let mut pieces = [(&[][..], 0); 4];
+        pieces[VERTICES] = (
+            slice_as_bytes(new.vertex_words),
+            mesh.vertex_words.start as vk::DeviceSize * WORD_SIZE,
+        );
+        pieces[INDICES] = (
+            slice_as_bytes(new.indices),
+            mesh.indices.start as vk::DeviceSize * INDEX_SIZE,
+        );
+        pieces[INFOS] = (
+            slice_as_bytes(slice::from_ref(&info)),
+            (slot * size_of::<MeshInfo>()) as vk::DeviceSize,
+        );
+        pieces[TYPES] = (
+            slice_as_bytes(new.type_words),
+            mesh.type_words.start as vk::DeviceSize * WORD_SIZE,
+        );
+        let mut copies = [None; 4];
         for (copy, (bytes, dst_offset)) in copies.iter_mut().zip(pieces) {
             if bytes.is_empty() {
                 continue;
@@ -213,7 +275,7 @@ impl MeshPool {
                     *copy = Some(
                         vk::BufferCopy2::default()
                             .src_offset(src_offset)
-                            .dst_offset(dst_offset as vk::DeviceSize)
+                            .dst_offset(dst_offset)
                             .size(bytes.len() as vk::DeviceSize),
                     );
                 }
@@ -225,14 +287,8 @@ impl MeshPool {
         }
 
         match free_slot {
-            Some(slot) => {
-                self.meshes[slot] = Some(mesh);
-                slot
-            }
-            None => {
-                self.meshes.push(Some(mesh));
-                self.meshes.len() - 1
-            }
+            Some(slot) => self.meshes[slot] = Some(mesh),
+            None => self.meshes.push(Some(mesh)),
         };
         self.uploads.push(Upload { slot, copies });
 
@@ -301,12 +357,13 @@ impl MeshPool {
 
     #[inline]
     fn release(&mut self, mesh: Mesh) {
-        self.vertex_ranges.free(mesh.vertices);
+        self.vertex_ranges.free(mesh.vertex_words);
         self.index_ranges.free(mesh.indices);
+        self.type_ranges.free(mesh.type_words);
     }
 
     /// Records copying `frame`'s staged uploads, followed by a barrier making them
-    /// visible to vertex input and culling.
+    /// visible to drawing and culling.
     ///
     /// # Safety
     /// Every upload must have been staged for `frame`.
@@ -320,26 +377,26 @@ impl MeshPool {
             return;
         }
 
-        let mut regions: [Vec<vk::BufferCopy2>; 3] = Default::default();
+        let mut regions: [Vec<vk::BufferCopy2>; 4] = Default::default();
         for upload in self.uploads.drain(..) {
             for (regions, copy) in regions.iter_mut().zip(upload.copies) {
                 regions.extend(copy);
             }
         }
-        let [vertex_regions, index_regions, info_regions] = regions;
         let staging_buffer = self.staging.buffer(frame);
         self.staging.mark_in_flight(frame);
 
         unsafe {
-            // Freed ranges are only reused once their last frame's fence was waited on, but an
-            // indexed draw could read any vertex, so validation sees frames still in flight reading
-            // the whole vertex buffer. Mesh slots are reused right away though, so frames in flight
-            // may still cull with, upload or update the visibility of a destroyed mesh's `MeshInfo`.
-            // Wait for all of these before copying.
+            // Freed ranges are only reused once their last frame's fence was waited on, but a
+            // draw could read any of its buffers, so validation sees frames still in flight
+            // reading them whole. Mesh slots are reused right away though, so frames in flight
+            // may still cull with, upload or update the visibility of a destroyed mesh's
+            // `MeshInfo`. Wait for all of these before copying.
             let reuse_barrier = vk::MemoryBarrier2::default()
                 .src_stage_mask(
                     vk::PipelineStageFlags2::INDEX_INPUT
-                        | vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
+                        | vk::PipelineStageFlags2::VERTEX_SHADER
+                        | vk::PipelineStageFlags2::FRAGMENT_SHADER
                         | vk::PipelineStageFlags2::COMPUTE_SHADER
                         | vk::PipelineStageFlags2::COPY,
                 )
@@ -352,11 +409,7 @@ impl MeshPool {
                 vk::DependencyInfo::default().memory_barriers(slice::from_ref(&reuse_barrier));
             logical_device.cmd_pipeline_barrier2(cmd_buffer, &reuse_dependency);
 
-            for (dst, regions) in [
-                (&self.vertex_buffer, &vertex_regions),
-                (&self.index_buffer, &index_regions),
-                (&self.info_buffer, &info_regions),
-            ] {
+            for (dst, regions) in self.buffers().into_iter().zip(&regions) {
                 if regions.is_empty() {
                     continue;
                 }
@@ -370,21 +423,23 @@ impl MeshPool {
             let barrier = vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COPY)
                 .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                .dst_stage_mask(
-                    vk::PipelineStageFlags2::INDEX_INPUT
-                        | vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT
-                        | vk::PipelineStageFlags2::COMPUTE_SHADER,
-                )
-                .dst_access_mask(
-                    vk::AccessFlags2::INDEX_READ
-                        | vk::AccessFlags2::VERTEX_ATTRIBUTE_READ
-                        | vk::AccessFlags2::SHADER_STORAGE_READ
-                        | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                );
+                .dst_stage_mask(DRAW_AND_CULL_STAGES)
+                .dst_access_mask(DRAW_AND_CULL_ACCESS);
             let dependency_info =
                 vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));
             logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
         }
+    }
+
+    /// The vertex, index, info and type buffers, in the order uploads copy into them.
+    #[inline]
+    pub(super) fn buffers(&self) -> [&Buffer; 4] {
+        [
+            &self.vertex_buffer,
+            &self.index_buffer,
+            &self.info_buffer,
+            &self.type_buffer,
+        ]
     }
 
     /// # Safety
@@ -392,39 +447,54 @@ impl MeshPool {
     #[inline]
     pub unsafe fn destroy_buffers(&self, logical_device: &ash::Device) {
         unsafe {
-            self.vertex_buffer.destroy(logical_device);
-            self.index_buffer.destroy(logical_device);
-            self.info_buffer.destroy(logical_device);
+            for buffer in self.buffers() {
+                buffer.destroy(logical_device);
+            }
             self.staging.destroy(logical_device);
         }
     }
 }
 
-/// The vertex, index and info buffers for `capacity`. If one fails, those already created are destroyed.
+/// Where the pool's buffers are read: indices, the mesh shaders pulling vertices and voxel
+/// types, and culling reading and updating `MeshInfo`s.
+pub(super) const DRAW_AND_CULL_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+    vk::PipelineStageFlags2::INDEX_INPUT.as_raw()
+        | vk::PipelineStageFlags2::VERTEX_SHADER.as_raw()
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER.as_raw()
+        | vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw(),
+);
+pub(super) const DRAW_AND_CULL_ACCESS: vk::AccessFlags2 = vk::AccessFlags2::from_raw(
+    vk::AccessFlags2::INDEX_READ.as_raw()
+        | vk::AccessFlags2::SHADER_STORAGE_READ.as_raw()
+        | vk::AccessFlags2::SHADER_STORAGE_WRITE.as_raw(),
+);
+
+/// The vertex, index, info and type buffers for `capacity`. If one fails, those already
+/// created are destroyed.
 pub(super) fn create_pool_buffers(
     adapter: &Adapter,
     logical_device: &ash::Device,
     capacity: MeshCapacity,
-) -> VkResult<[Buffer; 3]> {
-    let sizes = [
-        (
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            capacity.vertices as vk::DeviceSize * size_of::<Vertex>() as vk::DeviceSize,
-        ),
-        (
-            vk::BufferUsageFlags::INDEX_BUFFER,
-            capacity.indices as vk::DeviceSize * size_of::<Index>() as vk::DeviceSize,
-        ),
-        (
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            capacity.meshes as vk::DeviceSize * size_of::<MeshInfo>() as vk::DeviceSize,
-        ),
+) -> VkResult<[Buffer; 4]> {
+    let mut sizes = [(vk::BufferUsageFlags::STORAGE_BUFFER, 0); 4];
+    sizes[VERTICES].1 = capacity.vertex_words as vk::DeviceSize * WORD_SIZE;
+    sizes[INDICES] = (
+        vk::BufferUsageFlags::INDEX_BUFFER,
+        capacity.indices as vk::DeviceSize * INDEX_SIZE,
+    );
+    sizes[INFOS].1 = capacity.meshes as vk::DeviceSize * size_of::<MeshInfo>() as vk::DeviceSize;
+    sizes[TYPES].1 = capacity.type_words as vk::DeviceSize * WORD_SIZE;
+
+    let mut buffers = [
+        Buffer::null(),
+        Buffer::null(),
+        Buffer::null(),
+        Buffer::null(),
     ];
-    let mut buffers = [Buffer::null(), Buffer::null(), Buffer::null()];
     for (buffer, (usage, size)) in buffers.iter_mut().zip(sizes) {
-        // Repacking copies out of them.
+        // Repacking copies out of them. An empty buffer isn't allowed.
         let usage = usage | vk::BufferUsageFlags::TRANSFER_SRC;
-        match create_device_local_buffer(adapter, logical_device, usage, size) {
+        match create_device_local_buffer(adapter, logical_device, usage, size.max(WORD_SIZE)) {
             Ok(created) => *buffer = created,
             Err(err) => {
                 for buffer in buffers.iter() {

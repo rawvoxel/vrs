@@ -7,6 +7,10 @@ frustum culls them, then occlusion culls them against a depth pyramid in two pha
 what's visible with indirect draws the GPU counts itself. Meshes can be created and destroyed
 every frame, as chunks are remeshed, without stalling.
 
+Chunks use compact vertex formats, 8 bytes a vertex for greedy meshes and 12 for any
+other, and are colored per voxel: each pixel finds the voxel it belongs to in the chunk's
+palette packed voxel types, then that type's color in the renderer's palette.
+
 ## Usage
 
 ```rust,no_run
@@ -48,11 +52,19 @@ renderer.destroy_mesh(triangle);
 drop(renderer);
 ```
 
-- **Meshes** are created with `create_mesh`, which stages their data straight away, and drawn
-  by listing their `MeshId`s in a `DrawList`. Ids aren't `Copy`, so `destroy_mesh` taking one
-  means a destroyed mesh can't be drawn again. Its space is reused once no frame in flight
-  can still draw it. Indices are relative to each mesh's first vertex, and meshes must already
-  be in world space.
+- **Meshes** are created, staging their data straight away, and drawn by listing their
+  `MeshId`s in a `DrawList`. Ids aren't `Copy`, so `destroy_mesh` taking one means a destroyed
+  mesh can't be drawn again. Its space is reused once no frame in flight can still draw it.
+  Indices are relative to each mesh's first vertex.
+- **Chunk meshes** come from `create_chunk_mesh` and a `voxel::ChunkMesh`: `voxel::GreedyVertex`es
+  for axis aligned faces, which keep a face index instead of a normal, or `voxel::PackedVertex`es
+  for any surface. Positions are chunk local, placed by the chunk's `origin` and `voxel_size`,
+  which includes its LOD. Its `voxel::VoxelTypes` are palette compressed, and already packed
+  words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the palette from `set_palette`, 0 is empty space. Cells past a chunk's
+  edge take the chunk's own edge voxel, there's no lookup into neighbors, and see-through
+  faces are drawn like any other.
+- **Colored meshes** come from `create_mesh`, `vertex::Vertex`es in world space with colors of
+  their own, for anything that isn't a chunk.
 - **Winding**: front faces wind counter-clockwise on screen, backface culling skips the rest.
 - **Cameras**: `DrawList::proj` maps into Vulkan's clip space, where y points down and depth
   runs from 0 to 1. Flip y in an OpenGL style projection, such as glam's `perspective_rh`,
@@ -74,6 +86,8 @@ drop(renderer);
 
 - A GPU and driver supporting Vulkan 1.3. The renderer picks a discrete GPU first, then
   integrated, then anything else, that can also present to the window.
+- `drawIndirectFirstInstance` and `shaderDrawParameters`, which nearly every GPU has: each
+  indirect draw names its mesh by its first instance, which the mesh shaders read.
 - `multiDrawIndirect` and `drawIndirectCount` are used when supported, with fallbacks when not.
 - The compiled shaders in `assets/shader` are committed, so building only needs `slangc`, from
   the Vulkan SDK, after editing a `.slang` file.
@@ -90,7 +104,8 @@ cargo run -p vrs --example stress -- --headless
 `triangle` is the classic Vulkan triangle. `stress` checks the renderer the way a voxel game
 uses it and exits with a failure code if anything's wrong:
 
-- Chunk meshes behind a wall are culled with different cameras and draw paths, including the
+- Voxel chunks behind a wall, greedy and packed, are culled with different cameras and draw
+  paths, including the
   fallbacks for devices without `multiDrawIndirect` or `drawIndirectCount`. Draw counts read
   back from the GPU must match the meshes in view, and with occlusion culling, at least every
   mesh the wall can't hide.
@@ -99,8 +114,9 @@ uses it and exits with a failure code if anything's wrong:
   resized and minimized.
 - The mesh pool is made to defragment and to grow, after which every moved mesh must still
   draw correctly.
-- Each scenario's last frame is captured, and every chunk's center pixel must show the color
-  it should, which catches meshes drawn from missing data or culled while visible.
+- Each scenario's last frame is captured. Every chunk's face is two voxel types, and a pixel in
+  each half must show its type's color, which catches chunks colored by anything but their
+  voxels, drawn from missing data, or culled while visible.
 - A renderer failing partway through being built must leak nothing.
 - Debug builds fail on any validation message, with synchronization validation on.
 
@@ -132,6 +148,7 @@ For tests and tools, these stall the GPU:
 | --- | --- |
 | `renderer` | `Renderer`, building it, each frame's stages and command recording |
 | `mesh` | Mesh ids and the shared mesh pool, its staging, range allocator and repacking |
+| `voxel` | Chunk meshes: compact vertex formats and packed voxel types |
 | `cull`, `hiz` | GPU culling, and the depth pyramid occlusion culling tests against |
 | `app`, `adapter`, `surface`, `swapchain` | The instance, GPUs, and what frames are drawn into |
 | `buffer`, `image`, `pipeline`, `descriptors`, `commands`, `sync` | Vulkan building blocks |

@@ -4,6 +4,7 @@ fn main() {
     compile_slang_spv("shader.slang", "slang.spv", &["vertMain", "fragMain"]);
     compile_slang_spv("cull.slang", "cull.spv", &["cullMain"]);
     compile_slang_spv("hiz.slang", "hiz.spv", &["reduceMain"]);
+    compile_slang_spv("mesh.slang", "mesh.spv", &["meshVert", "meshFrag"]);
 }
 
 #[rustfmt::skip]
