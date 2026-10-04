@@ -84,8 +84,8 @@ impl Surface {
 
 /// `D32_SFLOAT` when it can be rendered to and sampled, otherwise `D16_UNORM`, which always can.
 fn pick_depth_format(instance: &ash::Instance, adapter: &Adapter) -> vk::Format {
-    let required = vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
-        | vk::FormatFeatureFlags::SAMPLED_IMAGE;
+    let required =
+        vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT | vk::FormatFeatureFlags::SAMPLED_IMAGE;
     let d32_features = unsafe {
         instance
             .get_physical_device_format_properties(adapter.handle, vk::Format::D32_SFLOAT)

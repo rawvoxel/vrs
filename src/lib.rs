@@ -7,6 +7,7 @@ use std::ffi::{self, CStr};
 pub mod adapter;
 pub mod alloc;
 pub mod buffer;
+pub(crate) mod bytes;
 pub mod commands;
 pub(crate) mod cull;
 pub mod debug;
@@ -114,7 +115,6 @@ impl App {
             }
         })
     }
-
 }
 
 /// Anything created from this `App`, such as a `Renderer`, must be dropped first.

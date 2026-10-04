@@ -1,8 +1,9 @@
 use crate::{
     adapter::Adapter,
+    bytes::as_bytes,
     descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
-    pipeline::{as_bytes, create_compute_pipeline},
     image::Image,
+    pipeline::create_compute_pipeline,
 };
 use ash::{prelude::VkResult, vk};
 use std::slice;
@@ -51,9 +52,9 @@ impl DepthPyramid {
         depth_extent: vk::Extent2D,
     ) -> VkResult<Self> {
         let mut pyramid = Self::null();
-        let created = pyramid
-            .create_pipeline(logical_device)
-            .and_then(|()| pyramid.create_levels(adapter, logical_device, depth_view, depth_extent));
+        let created = pyramid.create_pipeline(logical_device).and_then(|()| {
+            pyramid.create_levels(adapter, logical_device, depth_view, depth_extent)
+        });
         if let Err(err) = created {
             unsafe { pyramid.destroy(logical_device) };
             return Err(err);
@@ -100,7 +101,10 @@ impl DepthPyramid {
     fn create_pipeline(&mut self, logical_device: &ash::Device) -> VkResult<()> {
         self.desc_set_layout = create_descriptor_set_layout(
             logical_device,
-            &[vk::DescriptorType::SAMPLED_IMAGE, vk::DescriptorType::STORAGE_IMAGE],
+            &[
+                vk::DescriptorType::SAMPLED_IMAGE,
+                vk::DescriptorType::STORAGE_IMAGE,
+            ],
             vk::ShaderStageFlags::COMPUTE,
         )?;
         (self.pipeline, self.pipeline_layout) = create_compute_pipeline(
@@ -205,7 +209,11 @@ impl DepthPyramid {
     ///
     /// # Safety
     /// The device must not be using the pyramid.
-    pub unsafe fn cmd_init_layout(&self, logical_device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
+    pub unsafe fn cmd_init_layout(
+        &self,
+        logical_device: &ash::Device,
+        cmd_buffer: vk::CommandBuffer,
+    ) {
         let image_barrier = vk::ImageMemoryBarrier2::default()
             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .old_layout(vk::ImageLayout::UNDEFINED)

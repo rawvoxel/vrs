@@ -1,16 +1,6 @@
-use ash::{prelude::VkResult, util, vk};
-use std::{ffi::CStr, io::Cursor, slice};
-
-#[inline]
-pub fn create_shader_module(
-    logical_device: &ash::Device,
-    spv_bytes: &[u8],
-) -> VkResult<vk::ShaderModule> {
-    let shader_code =
-        util::read_spv(&mut Cursor::new(spv_bytes)).map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
-    let shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
-    unsafe { logical_device.create_shader_module(&shader_info, None) }
-}
+use super::create_shader_module;
+use ash::{prelude::VkResult, vk};
+use std::{ffi::CStr, slice};
 
 /// A compute pipeline with one descriptor set and `push_constant_size` bytes of push constants.
 pub fn create_compute_pipeline(
@@ -43,7 +33,9 @@ pub fn create_compute_pipeline(
                 None,
             );
             logical_device.destroy_shader_module(shader_module, None);
-            pipelines.map(|pipelines| pipelines[0]).map_err(|(_, err)| err)
+            pipelines
+                .map(|pipelines| pipelines[0])
+                .map_err(|(_, err)| err)
         });
 
         match pipeline {
@@ -54,11 +46,4 @@ pub fn create_compute_pipeline(
             }
         }
     }
-}
-
-/// Plain data as bytes, for push constants.
-#[inline]
-pub fn as_bytes<T: Copy>(data: &T) -> &[u8] {
-    // SAFETY: Only used for plain data without implicit padding.
-    unsafe { slice::from_raw_parts((data as *const T).cast(), size_of::<T>()) }
 }

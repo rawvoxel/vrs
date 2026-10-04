@@ -1,10 +1,11 @@
 use crate::{
     adapter::Adapter,
     buffer::{Buffer, DynamicBuffer},
+    bytes::as_bytes,
     descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
     hiz::DepthPyramid,
     mesh::MeshPool,
-    pipeline::{as_bytes, create_compute_pipeline},
+    pipeline::create_compute_pipeline,
 };
 use ash::{prelude::VkResult, vk};
 use glam::Mat4;

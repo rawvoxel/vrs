@@ -1,0 +1,138 @@
+//! What the stress test runs, and what it expects of each run.
+
+use glam::{Mat4, Vec3};
+
+#[derive(Clone, Copy, Debug)]
+pub enum Camera {
+    Identity,
+    /// Scales by two, so the wall fills the screen.
+    Zoom,
+    Perspective,
+}
+
+impl Camera {
+    pub fn view_proj(self, aspect: f32) -> (Mat4, Mat4) {
+        match self {
+            Camera::Identity => (Mat4::IDENTITY, Mat4::IDENTITY),
+            Camera::Zoom => (Mat4::IDENTITY, Mat4::from_scale(Vec3::new(2.0, 2.0, 1.0))),
+            Camera::Perspective => (
+                Mat4::look_at_rh(
+                    Vec3::new(0.0, 0.0, -1.5),
+                    Vec3::new(0.0, 0.0, 0.5),
+                    Vec3::NEG_Y,
+                ),
+                Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 10.0),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    /// Draw counts must match the meshes in view exactly.
+    FrustumOnly,
+    /// At least every mesh the wall can't hide, at most every mesh in view.
+    Occluded,
+    /// Only the wall, which hides everything else.
+    OnlyWall,
+    /// The draw path doesn't count draws, so only validation is checked.
+    Uncounted,
+}
+
+pub struct Scenario {
+    pub name: &'static str,
+    pub frames: u32,
+    pub camera: Camera,
+    pub wall: bool,
+    pub occlusion: bool,
+    /// Remesh chunks every frame, and resize and minimize the window.
+    pub remesh: bool,
+    /// See `Renderer::debug_limit_draw_paths`.
+    pub draw_paths: (bool, u32),
+    pub expect: Expect,
+}
+
+pub const ALL_PATHS: (bool, u32) = (true, u32::MAX);
+
+pub const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "frustum culling",
+        frames: 60,
+        camera: Camera::Identity,
+        wall: false,
+        occlusion: false,
+        remesh: false,
+        draw_paths: ALL_PATHS,
+        expect: Expect::FrustumOnly,
+    },
+    Scenario {
+        name: "frustum culling, zoomed in",
+        frames: 60,
+        camera: Camera::Zoom,
+        wall: false,
+        occlusion: false,
+        remesh: false,
+        draw_paths: ALL_PATHS,
+        expect: Expect::FrustumOnly,
+    },
+    Scenario {
+        name: "occlusion culling",
+        frames: 60,
+        camera: Camera::Identity,
+        wall: true,
+        occlusion: true,
+        remesh: false,
+        draw_paths: ALL_PATHS,
+        expect: Expect::Occluded,
+    },
+    Scenario {
+        name: "occlusion culling, perspective",
+        frames: 60,
+        camera: Camera::Perspective,
+        wall: true,
+        occlusion: true,
+        remesh: false,
+        draw_paths: ALL_PATHS,
+        expect: Expect::Occluded,
+    },
+    Scenario {
+        name: "occlusion culling, wall fills the screen",
+        frames: 60,
+        camera: Camera::Zoom,
+        wall: true,
+        occlusion: true,
+        remesh: false,
+        draw_paths: ALL_PATHS,
+        expect: Expect::OnlyWall,
+    },
+    Scenario {
+        name: "remeshing",
+        frames: 600,
+        camera: Camera::Perspective,
+        wall: true,
+        occlusion: true,
+        remesh: true,
+        draw_paths: ALL_PATHS,
+        expect: Expect::Occluded,
+    },
+    Scenario {
+        name: "remeshing, uncounted draws",
+        frames: 240,
+        camera: Camera::Perspective,
+        wall: true,
+        occlusion: true,
+        remesh: true,
+        draw_paths: (false, u32::MAX),
+        expect: Expect::Uncounted,
+    },
+    Scenario {
+        name: "remeshing, 7 draws per call",
+        frames: 240,
+        camera: Camera::Perspective,
+        wall: true,
+        occlusion: true,
+        remesh: true,
+        draw_paths: (true, 7),
+        expect: Expect::Uncounted,
+    },
+];

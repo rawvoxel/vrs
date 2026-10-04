@@ -1,4 +1,7 @@
+use crate::{adapter::Adapter, buffer::Buffer};
+use ash::{prelude::VkResult, vk};
 use glam::{Mat4, Vec4};
+use std::slice;
 
 #[derive(Clone, Copy)]
 pub struct MvpMatrices {
@@ -31,4 +34,49 @@ pub fn identity_matrix() -> Mat4 {
         z_axis:  Vec4::Z,
         w_axis:  Vec4::W,
     }
+}
+
+/// A mapped `HOST_VISIBLE` buffer the size of `MvpMatrices`.
+pub fn create_uniform_buffer(adapter: &Adapter, render_device: &ash::Device) -> VkResult<Buffer> {
+    let info = vk::BufferCreateInfo::default()
+        .size(size_of::<MvpMatrices>() as vk::DeviceSize)
+        .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+
+    let mut buffer = Buffer::new(adapter, render_device, info, flags, 0)?;
+    if let Err(err) = buffer.mem_map(render_device) {
+        unsafe { buffer.destroy(render_device) };
+        return Err(err);
+    }
+    Ok(buffer)
+}
+
+/// Points each frame's descriptor set at that frame's uniform buffer.
+pub fn write_uniform_descriptor_sets(
+    render_device: &ash::Device,
+    descriptor_sets: &[vk::DescriptorSet],
+    uniform_buffers: &[Buffer],
+) {
+    let buffer_infos: Vec<vk::DescriptorBufferInfo> = uniform_buffers
+        .iter()
+        .map(|buffer| {
+            vk::DescriptorBufferInfo::default()
+                .buffer(buffer.handle)
+                .range(size_of::<MvpMatrices>() as vk::DeviceSize)
+        })
+        .collect();
+    let writes: Vec<vk::WriteDescriptorSet> = descriptor_sets
+        .iter()
+        .zip(buffer_infos.iter())
+        .map(|(&set, buffer_info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(slice::from_ref(buffer_info))
+        })
+        .collect();
+
+    unsafe { render_device.update_descriptor_sets(&writes, &[]) }
 }

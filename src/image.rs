@@ -27,11 +27,16 @@ impl Image {
             let mut this = Self::null();
             this.handle = logical_device.create_image(&image_info, None)?;
             let memory_requirements = logical_device.get_image_memory_requirements(this.handle);
-            let bound = alloc::vk_alloc(adapter, logical_device, memory_requirements, memory_property_flags)
-                .and_then(|memory| {
-                    this.memory = memory;
-                    logical_device.bind_image_memory(this.handle, memory, 0)
-                });
+            let bound = alloc::vk_alloc(
+                adapter,
+                logical_device,
+                memory_requirements,
+                memory_property_flags,
+            )
+            .and_then(|memory| {
+                this.memory = memory;
+                logical_device.bind_image_memory(this.handle, memory, 0)
+            });
             if let Err(err) = bound {
                 this.destroy(logical_device);
                 return Err(err);

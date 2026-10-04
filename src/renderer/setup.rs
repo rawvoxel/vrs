@@ -1,198 +1,240 @@
-//! Creating the device and the graphics pipeline.
+//! Building a `Renderer`.
 
+use super::{Renderer, device::create_render_device};
 use crate::{
-    App, adapter::Adapter, buffer::Buffer, queue::QueueFamily, surface::Surface,
-    uniforms::MvpMatrices, vertex::Vertex,
+    App,
+    buffer::DynamicBuffer,
+    commands::{create_command_buffer, create_command_pool},
+    cull::Culler,
+    descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
+    hiz::DepthPyramid,
+    mesh::{MeshCapacity, MeshPool},
+    pipeline::{create_graphics_pipeline, create_pipeline_layout, create_shader_module},
+    queue::Queue,
+    surface::Surface,
+    swapchain::Swapchain,
+    sync::{create_fence, create_semaphore},
+    uniforms::{create_uniform_buffer, write_uniform_descriptor_sets},
+    vertex::{Index, Vertex},
 };
 use ash::{khr, prelude::VkResult, vk};
 use std::slice;
 
-pub(super) fn create_render_device(
-    app: &App,
-    adapter: &Adapter,
-    queue_family: &QueueFamily,
-    multi_draw_indirect: bool,
-    draw_indirect_count: bool,
-) -> VkResult<ash::Device> {
-    let queue_priorities = [1.0];
-    let device_queue_info = vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(queue_family.index)
-        .queue_priorities(&queue_priorities);
+const SLANG_SPV: &[u8] = include_bytes!("../../assets/shader/slang.spv");
+pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
+/// Starting size of each frame's dynamic geometry buffers, they grow to fit.
+const INITIAL_DYNAMIC_ELEMENTS: vk::DeviceSize = 1024;
 
-    let extension_names_raw = [
-        khr::swapchain::NAME.as_ptr(),
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        khr::portability_subset::NAME.as_ptr(),
-    ];
+impl Renderer {
+    pub fn new(app: &App, window_width: u32, window_height: u32) -> VkResult<Self> {
+        Self::with_mesh_capacity(app, window_width, window_height, MeshCapacity::default())
+    }
 
-    // NOTE: Keep in mind proper ordering when adding features.
-    let features = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(multi_draw_indirect);
-    let mut synchronization2 =
-        vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
-    let mut dynamic_rendering =
-        vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
-    let mut vulkan_12_features =
-        vk::PhysicalDeviceVulkan12Features::default().draw_indirect_count(draw_indirect_count);
+    /// Sizes the shared mesh buffers, which don't grow.
+    pub fn with_mesh_capacity(
+        app: &App,
+        window_width: u32,
+        window_height: u32,
+        mesh_capacity: MeshCapacity,
+    ) -> VkResult<Self> {
+        let adapter = app
+            .request_adapter()
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
 
-    let device_info = vk::DeviceCreateInfo::default()
-        .queue_create_infos(slice::from_ref(&device_queue_info))
-        .enabled_extension_names(&extension_names_raw)
-        .enabled_features(&features)
-        .push_next(&mut synchronization2)
-        .push_next(&mut dynamic_rendering)
-        .push_next(&mut vulkan_12_features);
+        // Surface
+        let surface_instance = app.surface_instance.clone();
+        let surface = Surface::new(app, &adapter, &surface_instance)?;
+        let surface_extent =
+            surface.extent(window_width, window_height, &adapter, &surface_instance)?;
 
-    unsafe { app.instance.create_device(adapter.handle, &device_info, None) }
-}
+        // Render Device
+        // NOTE: Culling runs on the graphics queue, so it must also support compute.
+        let graphics_queue_family = adapter
+            .get_queue_family(
+                &surface_instance,
+                &surface,
+                true,
+                vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE,
+            )?
+            .ok_or(vk::Result::ERROR_INITIALIZATION_FAILED)?;
+        let multi_draw_indirect = adapter.features.multi_draw_indirect == vk::TRUE;
+        // Compacting needs to draw every visible mesh in one counted call.
+        let draw_indirect_count = adapter.draw_indirect_count && multi_draw_indirect;
+        let render_device = create_render_device(
+            app,
+            &adapter,
+            &graphics_queue_family,
+            multi_draw_indirect,
+            draw_indirect_count,
+        )?;
 
-pub(super) fn create_pipeline_layout(
-    render_device: &ash::Device,
-    set_layouts: &[vk::DescriptorSetLayout],
-) -> VkResult<vk::PipelineLayout> {
-    let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(set_layouts);
-    unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
-}
+        // Everything else starts null, so dropping the renderer if `create` fails
+        // destroys exactly what was created.
+        let mut renderer = Self {
+            occlusion_culling: true,
 
-pub(super) fn create_graphics_pipeline(
-    surface: &Surface,
-    render_device: &ash::Device,
-    shader_module: vk::ShaderModule,
-    pipeline_layout: vk::PipelineLayout,
-) -> VkResult<vk::Pipeline> {
-    let shader_stage_infos = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .module(shader_module)
-            .name(c"vertMain")
-            .stage(vk::ShaderStageFlags::VERTEX),
-        vk::PipelineShaderStageCreateInfo::default()
-            .module(shader_module)
-            .name(c"fragMain")
-            .stage(vk::ShaderStageFlags::FRAGMENT),
-    ];
+            mesh_pool: MeshPool::null(mesh_capacity, FRAMES_IN_FLIGHT as usize),
+            frame_staging_buffers: Vec::new(),
+            culler: Culler::null(draw_indirect_count),
+            depth_pyramid: DepthPyramid::null(),
+            indirect_draw_batch: match multi_draw_indirect {
+                true => adapter.properties.limits.max_draw_indirect_count,
+                false => 1,
+            },
+            device_draw_paths: (draw_indirect_count, 1),
+            last_frame: None,
+            frame_index_buffers: Vec::new(),
+            frame_vertex_buffers: Vec::new(),
 
-    let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::default()
-        .vertex_attribute_descriptions(&Vertex::VERTEX_ATTRIBUTE_DESCRIPTIONS)
-        .vertex_binding_descriptions(&Vertex::VERTEX_BINDING_DESCRIPTIONS);
+            current_frame: 0,
+            in_flight_frames: Vec::new(),
+            available_frames: Vec::new(),
+            rendered_images: Vec::new(),
+            frame_cmd_buffers: Vec::new(),
+            frame_cmd_pools: Vec::new(),
 
-    let vertex_input_assembly_state_info =
-        vk::PipelineInputAssemblyStateCreateInfo::default().topology(Vertex::VERTEX_TOPOLOGY);
+            init_cmd_fence: vk::Fence::null(),
+            init_cmd_buffer: vk::CommandBuffer::null(),
+            init_cmd_pool: vk::CommandPool::null(),
 
-    let viewport_state_info = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
+            swapchain: Swapchain::null(),
+            swapchain_device: khr::swapchain::Device::new(&app.instance, &render_device),
+            swapchain_outdated: false,
 
-    let rasterization_info = vk::PipelineRasterizationStateCreateInfo::default()
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-        .line_width(1.0)
-        .polygon_mode(vk::PolygonMode::FILL);
+            ubo_desc_pool: vk::DescriptorPool::null(),
+            ubo_desc_set_layout: vk::DescriptorSetLayout::null(),
+            ubo_desc_sets: Vec::new(),
+            uniform_buffers: Vec::new(),
 
-    let multisample_state_info = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+            graphics_pipeline: vk::Pipeline::null(),
+            graphics_pipeline_layout: vk::PipelineLayout::null(),
+            graphics_queue: Queue::new(&graphics_queue_family, &render_device, 0),
+            graphics_queue_family,
+            render_device,
 
-    let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(false)
-        .src_color_blend_factor(vk::BlendFactor::SRC_COLOR)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_DST_COLOR)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .alpha_blend_op(vk::BlendOp::ADD)
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
+            surface,
+            surface_instance,
+            adapter,
+        };
+        renderer.device_draw_paths.1 = renderer.indirect_draw_batch;
+        renderer.create(surface_extent, mesh_capacity)?;
+        Ok(renderer)
+    }
 
-    let color_blend_state_info = vk::PipelineColorBlendStateCreateInfo::default()
-        .logic_op(vk::LogicOp::CLEAR)
-        .attachments(&color_blend_attachment_states);
+    /// Fills in everything the device makes, leaving it for `Drop` if it fails.
+    fn create(
+        &mut self,
+        surface_extent: vk::Extent2D,
+        mesh_capacity: MeshCapacity,
+    ) -> VkResult<()> {
+        let device = self.render_device.clone();
+        let adapter = self.adapter.clone();
 
-    let noop_stencil_state = vk::StencilOpState::default()
-        .fail_op(vk::StencilOp::KEEP)
-        .pass_op(vk::StencilOp::KEEP)
-        .depth_fail_op(vk::StencilOp::KEEP)
-        .compare_op(vk::CompareOp::ALWAYS);
+        // Uniform Buffers
+        let ubo_pool_size = vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(FRAMES_IN_FLIGHT);
+        self.ubo_desc_pool =
+            create_descriptor_pool(&device, slice::from_ref(&ubo_pool_size), FRAMES_IN_FLIGHT)?;
+        self.ubo_desc_set_layout = create_descriptor_set_layout(
+            &device,
+            &[vk::DescriptorType::UNIFORM_BUFFER],
+            vk::ShaderStageFlags::VERTEX,
+        )?;
+        self.ubo_desc_sets = allocate_descriptor_sets(
+            &device,
+            self.ubo_desc_pool,
+            self.ubo_desc_set_layout,
+            FRAMES_IN_FLIGHT,
+        )?;
+        for _ in 0..FRAMES_IN_FLIGHT {
+            self.uniform_buffers
+                .push(create_uniform_buffer(&adapter, &device)?);
+        }
+        write_uniform_descriptor_sets(&device, &self.ubo_desc_sets, &self.uniform_buffers);
 
-    let depth_state_info = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(true)
-        .depth_write_enable(true)
-        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
-        .front(noop_stencil_state)
-        .back(noop_stencil_state)
-        .max_depth_bounds(1.0);
+        // Graphics Pipeline
+        self.graphics_pipeline_layout =
+            create_pipeline_layout(&device, slice::from_ref(&self.ubo_desc_set_layout))?;
+        let shader_module = create_shader_module(&device, SLANG_SPV)?;
+        let pipeline = create_graphics_pipeline(
+            &self.surface,
+            &device,
+            shader_module,
+            self.graphics_pipeline_layout,
+        );
+        unsafe { device.destroy_shader_module(shader_module, None) };
+        self.graphics_pipeline = pipeline?;
 
-    let dynamic_state_info = vk::PipelineDynamicStateCreateInfo::default()
-        .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]);
+        // Swapchain
+        self.swapchain = Swapchain::new(
+            &adapter,
+            &self.surface,
+            surface_extent,
+            &self.graphics_queue_family,
+            &device,
+            &self.swapchain_device,
+            None,
+        )?;
 
-    let mut pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
-        .color_attachment_formats(slice::from_ref(&surface.format))
-        .depth_attachment_format(surface.depth_format);
+        // Global Commands
+        self.init_cmd_pool = create_command_pool(&device, &self.graphics_queue_family)?;
+        self.init_cmd_buffer =
+            create_command_buffer(&device, self.init_cmd_pool, vk::CommandBufferLevel::PRIMARY)?;
+        self.init_cmd_fence = create_fence(&device)?;
 
-    let graphics_pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-        .push_next(&mut pipeline_rendering_info)
-        .stages(&shader_stage_infos)
-        .vertex_input_state(&vertex_input_state_info)
-        .input_assembly_state(&vertex_input_assembly_state_info)
-        .viewport_state(&viewport_state_info)
-        .rasterization_state(&rasterization_info)
-        .multisample_state(&multisample_state_info)
-        .color_blend_state(&color_blend_state_info)
-        .depth_stencil_state(&depth_state_info)
-        .dynamic_state(&dynamic_state_info)
-        .layout(pipeline_layout);
+        // Frames in Flight
+        for _ in 0..FRAMES_IN_FLIGHT {
+            let pool = create_command_pool(&device, &self.graphics_queue_family)?;
+            self.frame_cmd_pools.push(pool);
+            self.frame_cmd_buffers.push(create_command_buffer(
+                &device,
+                pool,
+                vk::CommandBufferLevel::PRIMARY,
+            )?);
+            self.in_flight_frames.push(create_fence(&device)?);
+            self.available_frames.push(create_semaphore(&device)?);
+        }
+        for _ in 0..self.swapchain.present_images.len() {
+            self.rendered_images.push(create_semaphore(&device)?);
+        }
 
-    unsafe {
-        render_device
-            .create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                slice::from_ref(&graphics_pipeline_info),
-                None,
+        // Meshes
+        self.mesh_pool =
+            MeshPool::new(&adapter, &device, mesh_capacity, FRAMES_IN_FLIGHT as usize)?;
+        self.culler = Culler::new(&adapter, &device, FRAMES_IN_FLIGHT, self.culler.can_compact)?;
+        self.depth_pyramid = DepthPyramid::new(
+            &adapter,
+            &device,
+            self.swapchain.depth_image_view,
+            self.swapchain.extent,
+        )?;
+        self.init_depth_pyramid_layout()?;
+
+        // Per Frame Buffers
+        let dynamic_buffer = |usage, element_size: usize| {
+            DynamicBuffer::new(
+                &adapter,
+                &device,
+                usage,
+                INITIAL_DYNAMIC_ELEMENTS * element_size as vk::DeviceSize,
             )
-            .map(|pipelines| pipelines[0])
-            .map_err(|(_, err)| err)
+        };
+        for _ in 0..FRAMES_IN_FLIGHT {
+            self.frame_staging_buffers.push(dynamic_buffer(
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                size_of::<Vertex>(),
+            )?);
+            self.frame_index_buffers.push(dynamic_buffer(
+                vk::BufferUsageFlags::INDEX_BUFFER,
+                size_of::<Index>(),
+            )?);
+            self.frame_vertex_buffers.push(dynamic_buffer(
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                size_of::<Vertex>(),
+            )?);
+        }
+
+        Ok(())
     }
-}
-
-/// A mapped `HOST_VISIBLE` buffer the size of `MvpMatrices`.
-pub(super) fn create_uniform_buffer(
-    adapter: &Adapter,
-    render_device: &ash::Device,
-) -> VkResult<Buffer> {
-    let info = vk::BufferCreateInfo::default()
-        .size(size_of::<MvpMatrices>() as vk::DeviceSize)
-        .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
-    let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-
-    let mut buffer = Buffer::new(adapter, render_device, info, flags, 0)?;
-    if let Err(err) = buffer.mem_map(render_device) {
-        unsafe { buffer.destroy(render_device) };
-        return Err(err);
-    }
-    Ok(buffer)
-}
-
-/// Points each frame's descriptor set at that frame's uniform buffer.
-pub(super) fn write_uniform_descriptor_sets(
-    render_device: &ash::Device,
-    descriptor_sets: &[vk::DescriptorSet],
-    uniform_buffers: &[Buffer],
-) {
-    let buffer_infos: Vec<vk::DescriptorBufferInfo> = uniform_buffers
-        .iter()
-        .map(|buffer| {
-            vk::DescriptorBufferInfo::default()
-                .buffer(buffer.handle)
-                .range(size_of::<MvpMatrices>() as vk::DeviceSize)
-        })
-        .collect();
-    let writes: Vec<vk::WriteDescriptorSet> = descriptor_sets
-        .iter()
-        .zip(buffer_infos.iter())
-        .map(|(&set, buffer_info)| {
-            vk::WriteDescriptorSet::default()
-                .dst_set(set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .buffer_info(slice::from_ref(buffer_info))
-        })
-        .collect();
-
-    unsafe { render_device.update_descriptor_sets(&writes, &[]) }
 }
