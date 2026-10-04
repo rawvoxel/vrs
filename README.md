@@ -97,12 +97,26 @@ drop(renderer);
 
 ```sh
 cargo run -p vrs --example triangle
+cargo run -p vrs --example cube
+cargo run -p vrs --example terrain --release
+cargo run -p vrs --example screenshot --release -- terrain.ppm
 cargo run -p vrs --example stress
 cargo run -p vrs --example stress -- --headless
 ```
 
-`triangle` is the classic Vulkan triangle. `stress` checks the renderer the way a voxel game
-uses it and exits with a failure code if anything's wrong:
+- `triangle` is the classic Vulkan triangle, drawn as a colored mesh.
+- `cube` circles a cube of 8³ voxels checkered in two types. Greedy meshing makes each side
+  one quad, and the colors still come from the voxels.
+- `terrain` is rolling hills of greedy meshed chunks to fly around: click to look with the
+  mouse, WASD to move, Space and Shift for up and down, Ctrl to go faster. The title shows
+  how many chunks were drawn, the rest culled behind hills.
+- `screenshot` renders the terrain without a window and saves the frame as a PPM image.
+
+`cube`, `terrain` and `screenshot` share a greedy mesher for 64³ chunks in
+`examples/common`, to show how a mesher's output becomes a chunk mesh.
+
+`stress` checks the renderer the way a voxel game uses it and exits with a failure code if
+anything's wrong:
 
 - Voxel chunks behind a wall, greedy and packed, are culled with different cameras. Draw
   counts read back from the GPU must match the meshes in view, and with occlusion culling, at least every
