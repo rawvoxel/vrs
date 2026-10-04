@@ -109,9 +109,12 @@ check only sees races the GPU loses, so a missing barrier before vertex input ca
 
 ### In CI
 
-`--headless` needs no display, so the stress test can run on a machine without a GPU through a
-software Vulkan driver, such as Mesa's lavapipe (`mesa-vulkan-drivers` on Debian and Ubuntu).
-Install the validation layers too (`vulkan-validationlayers`) for it to check synchronization.
+`.github/workflows/ci.yml` checks formatting, runs clippy with warnings as errors, the tests
+and a docs build, then runs the stress test headless on Mesa's lavapipe, a Vulkan driver that
+runs on the CPU, with the validation layers installed so it checks synchronization too.
+
+The compiled shaders are committed, and `build.rs` keeps them when `slangc` isn't installed,
+since a fresh checkout's file times can make them look out of date.
 
 ## Debug hooks
 

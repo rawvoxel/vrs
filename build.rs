@@ -44,10 +44,16 @@ fn compile_slang_spv(slang_name: &str, spv_name: &str, entries: &[&str]) {
     for entry in entries {
         command.args(["-entry", entry]);
     }
-    let status = command
-        .args(["-o", spv_path.to_str().unwrap()])
-        .status()
-        .expect("Failed to run slangc!");
+    let status = match command.args(["-o", spv_path.to_str().unwrap()]).status() {
+        Ok(status) => status,
+        // Git doesn't keep file times, so a fresh checkout can look out of date. The compiled
+        // shader is committed, so without `slangc`, such as on CI, keep it.
+        Err(err) if spv_path.exists() => {
+            println!("cargo:warning=Using the committed {spv_name}, slangc couldn't run: {err}");
+            return;
+        }
+        Err(err) => panic!("Failed to run slangc, which {spv_name} needs: {err}"),
+    };
 
     if !status.success() {
         panic!("Shader compilation failed.");

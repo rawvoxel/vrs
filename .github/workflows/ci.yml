@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checks:
+    name: Formatting, lints and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # The unit tests, and the README's usage example, which is compiled but not run.
+      - run: cargo test
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  stress:
+    name: Stress test on lavapipe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Mesa's lavapipe is a Vulkan driver running on the CPU, as runners have no GPU.
+      # The validation layers let the stress test fail on synchronization errors.
+      - name: Install lavapipe and the validation layers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
+      - name: List Vulkan devices
+        run: vulkaninfo --summary
+
+      # A debug build, so validation is on.
+      - name: Run the stress test headless
+        run: cargo run --example stress -- --headless

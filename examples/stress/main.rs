@@ -121,12 +121,14 @@ impl Stress {
     fn check_failed_construction(&mut self, app: &App, size: PhysicalSize<u32>) {
         println!("failed construction");
         for mesh_capacity in [
+            // Far past any device's memory, even one that overcommits, such as lavapipe's.
+            // The first fails on the pool's first buffer, the second on its last.
             MeshCapacity {
                 vertices: u32::MAX,
                 ..CAPACITY
             },
             MeshCapacity {
-                indices: u32::MAX,
+                meshes: u32::MAX,
                 ..CAPACITY
             },
         ] {
@@ -135,7 +137,9 @@ impl Stress {
                 ..Default::default()
             };
             match Renderer::with_config(app, size.width, size.height, config) {
-                Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => (),
+                Err(
+                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+                ) => (),
                 Err(err) => self.fail(format!("impossible capacity failed with {err}")),
                 Ok(_) => self.fail("impossible capacity was created".to_string()),
             }
