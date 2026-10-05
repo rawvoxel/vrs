@@ -2,9 +2,9 @@
 
 use super::{Renderer, frame::FrameData};
 use crate::{
-    cull::{DRAW_STRIDE, Phase},
-    image,
+    culling::{DRAW_STRIDE, Phase},
     timings::GpuStage,
+    vulkan::image,
 };
 use ash::{prelude::VkResult, vk};
 use std::slice;
@@ -20,6 +20,8 @@ impl Renderer {
     ///
     /// With the shadow pass, see `Renderer::uses_shadow_pass`, those passes draw only depth,
     /// then the shadow pass traces from it, then one more pass draws color over the depth.
+    ///
+    /// The last pass drawing color draws the sky last, behind what it drew.
     pub(super) fn record_frame(
         &mut self,
         frame: usize,
@@ -95,6 +97,9 @@ impl Renderer {
             if shaded && data.dynamic_index_count > 0 {
                 self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
             }
+            if shaded && !occlusion && data.sky {
+                self.cmd_draw_sky(cmd_buffer);
+            }
             self.render_device.cmd_end_rendering(cmd_buffer);
             mark(GpuStage::FirstPass);
 
@@ -114,6 +119,9 @@ impl Renderer {
                     candidate_count,
                     mesh_pipeline,
                 );
+                if shaded && data.sky {
+                    self.cmd_draw_sky(cmd_buffer);
+                }
                 self.render_device.cmd_end_rendering(cmd_buffer);
                 mark(GpuStage::OcclusionPass);
             }
@@ -150,6 +158,9 @@ impl Renderer {
                 }
                 if data.dynamic_index_count > 0 {
                     self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
+                }
+                if data.sky {
+                    self.cmd_draw_sky(cmd_buffer);
                 }
                 self.render_device.cmd_end_rendering(cmd_buffer);
                 mark(GpuStage::ColorPass);
@@ -401,6 +412,16 @@ impl Renderer {
                 pipeline,
             )
         };
+    }
+
+    /// Draws the sky wherever the depth is still cleared, after `cmd_bind_graphics`.
+    fn cmd_draw_sky(&self, cmd_buffer: vk::CommandBuffer) {
+        self.cmd_bind_pipeline(cmd_buffer, self.sky_pipeline);
+        unsafe {
+            self.render_device
+                .cmd_set_cull_mode(cmd_buffer, vk::CullModeFlags::NONE);
+            self.render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
+        }
     }
 
     /// Draws the frame's own geometry, from its host visible buffers.

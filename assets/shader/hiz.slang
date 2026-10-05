@@ -1,7 +1,7 @@
 // Builds one level of the depth pyramid used for occlusion culling.
 // Each texel keeps the farthest depth of the 2x2 source texels it covers.
 
-// Matches `hiz::ReduceParams`.
+// Matches `culling::depth_pyramid::ReduceParams`.
 struct ReduceParams {
     uint2 srcSize;
     uint2 dstSize;

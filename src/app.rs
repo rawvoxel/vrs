@@ -1,4 +1,4 @@
-use crate::{adapter::Adapter, debug::Debug};
+use crate::vulkan::{adapter::Adapter, debug::Debug};
 use anyhow::Result;
 use ash::{ext, khr, prelude::VkResult, vk};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};

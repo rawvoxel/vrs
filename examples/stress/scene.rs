@@ -8,9 +8,8 @@ use ash::vk;
 use glam::{Mat4, Vec2, Vec3};
 use vrs::{
     App,
-    mesh::{MeshCapacity, MeshId},
+    mesh::{MeshCapacity, MeshId, Vertex},
     renderer::{Lighting, Renderer},
-    vertex::Vertex,
     voxel::{ChunkMesh, ChunkVertices, Face, GreedyVertex, PackedVertex, VoxelTypes},
 };
 

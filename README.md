@@ -13,7 +13,7 @@ palette packed voxel types, then that type's material in the renderer's palette.
 
 They're lit by a sun whose shadows are traced through the voxels, point and spot lights, and
 dynamic diffuse global illumination from light probes around the camera, with glossy
-reflections, glowing and see-through voxels, and levels of detail.
+reflections, glowing and see-through voxels, and levels of detail, under a sky.
 
 ## Usage
 
@@ -21,8 +21,8 @@ reflections, glowing and see-through voxels, and levels of detail.
 use ash::vk;
 use vrs::{
     App,
+    mesh::Vertex,
     renderer::{DrawList, Renderer},
-    vertex::Vertex,
 };
 
 // A windowed app takes the window's handles, see `App::new`.
@@ -68,8 +68,12 @@ drop(renderer);
   palette from `set_materials`, or `set_palette` for plain colors, 0 is empty space. Cells
   past a chunk's edge take the chunk's own edge voxel, there's no lookup into neighbors, and
   see-through faces are drawn like any other.
-- **Colored meshes** come from `create_mesh`, `vertex::Vertex`es in world space with colors of
+- **Colored meshes** come from `create_mesh`, `mesh::Vertex`es in world space with colors of
   their own, for anything that isn't a chunk. They aren't lit.
+- **Lit meshes** come from `create_lit_mesh`, `mesh::LitVertex`es in world space with colors
+  and normals of their own, lit like chunks as rough surfaces, for what sits among the voxels
+  without being voxels, such as leaves and grass. They cast no shadows and the light probes
+  don't see them, and a card seen from both sides needs both windings.
 - **Materials**: each palette entry is a `Material`: a color, light it gives off, roughness,
   metalness, and whether it's see-through. Glowing voxels light what's around them through
   the light probes. See-through voxels, such as glass, are drawn as solid faces, but light
@@ -131,6 +135,13 @@ drop(renderer);
   It needs a `ShadowGrid` whose chunks are a multiple of 16 voxels wide, and
   `Lighting::global_illumination` turns it off and on. Probes spaced wider than a room can
   leak light into it, so coarser cascades suit far away terrain rather than interiors.
+- **Sky and tonemapping**: with a `Lighting::sky`, a gradient from the horizon up to the
+  zenith, the ground color below it, and the sun's disc are drawn wherever no mesh is,
+  instead of the clear color, and chunks fade into it with distance by `Sky::haze_distance`.
+  `Lighting::exposure` scales shaded colors, and `Lighting::tonemapping` brings those brighter
+  than the display shows into its range, with Reinhard or ACES, rather than clipping them.
+  Both happen as each pixel is shaded, so there's no extra pass. Colored meshes keep their
+  own colors.
 - **Debug views**: `Lighting::debug_view` shows all the light reaching chunks, only the
   sun's and lights', only the rest, the ambient occlusion, or the probes drawn as cubes.
 - **Winding**: front faces wind counter-clockwise on screen, backface culling skips the rest.
@@ -180,7 +191,8 @@ cargo run -p vrs --example stress --release -- --headless
   blocks glowing in six colors between them on a glossy checkered floor. Space pauses the
   camera, and L turns on and off a point light inside each glowing block.
 - `terrain` is rolling hills of greedy meshed chunks, ringed by coarser chunks of the next
-  level of detail, under a low sun casting shadows and lit by two cascades of light probes,
+  level of detail fading into a hazy sky, under a low sun casting shadows and lit by two
+  cascades of light probes, tonemapped with ACES,
   to fly around: click to look with the mouse and Escape to let go, WASD to move, Space and
   Ctrl for up and down, Shift to go faster, L to drop a light and Backspace to take them
   away. The title also shows how many chunks were drawn, the rest culled behind hills.
@@ -241,17 +253,24 @@ For tests and tools, these stall the GPU unless they say otherwise:
 - `Renderer::debug_mesh_pool_stats` reports the mesh pool's size and how often it repacked.
 - `Renderer::debug_gpu_timings` reports how long each `GpuStage` of a recent frame took on the
   GPU, from timestamps, without stalling.
-- `debug::message_counts` counts validation errors and warnings.
+- `vulkan::debug::message_counts` counts validation errors and warnings.
 
 ## Layout
 
 | Module | |
 | --- | --- |
-| `renderer` | `Renderer`, building it, each frame's stages and command recording |
-| `mesh` | Mesh ids and the shared mesh pool, its staging, range allocator and repacking |
+| `renderer` | `Renderer`, building it, each frame's stages and command recording, and the meshes it holds |
+| `renderer::lighting` | How chunks are lit: `Lighting`, the sky, tonemapping, the shadow grid and pass, the probes and lights each frame, debug views |
+| `renderer::material` | `Material`s and the palette they're uploaded in |
+| `renderer::debug` | Hooks for tests and tools: frame stats, GPU timings and captures |
+| `mesh` | Mesh ids and vertex formats, octahedral normals, and the shared mesh pool, its GPU records, staging, range allocator and repacking |
 | `voxel` | Chunk meshes: compact vertex formats and packed voxel types |
-| `gi` | The light probe cascades and their configuration |
-| `shadows`, `lights` | Low resolution shadows, reflections and light culling, and the lights |
-| `cull`, `hiz` | GPU culling, and the depth pyramid occlusion culling tests against |
-| `app`, `adapter`, `surface`, `swapchain` | The instance, GPUs, and what frames are drawn into |
-| `buffer`, `image`, `pipeline`, `descriptors`, `commands`, `sync` | Vulkan building blocks |
+| `lighting` | Lighting's GPU resources and passes: the light probe cascades, the lights, and the shadow pass |
+| `culling` | GPU culling, and the depth pyramid occlusion culling tests against |
+| `shader` | What every shader shares: the frame's bindings and uniforms |
+| `vulkan` | Vulkan building blocks: GPUs and queues, memory, buffers, images, pipelines, descriptors, commands, sync, and the surface and swapchain frames are drawn into |
+| `app`, `timings` | The instance, and each frame's GPU timestamps |
+
+The shaders in `assets/shader` share `common.slang`, which includes one file of `common/` for
+each concept: the data shared with the CPU, the bindings, voxels, materials, ambient
+occlusion, rays, the probe volume, the lights, lighting, the sky, tonemapping and shading.

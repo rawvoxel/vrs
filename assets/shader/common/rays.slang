@@ -1,0 +1,187 @@
+// Tracing rays through the shadow grid's voxels.
+
+// How far off a surface, in voxels, its shadow ray starts, so it starts in the cell in front.
+static const float SHADOW_RAY_OFFSET = 1.0 / 64.0;
+
+// Moves a ray just past the boundary it's on, in voxels.
+static const float RAY_EPSILON = 1.0 / 4096.0;
+// Bounds on the work one ray does, so none can spin.
+static const uint MAX_RAY_CHUNKS = 256;
+static const uint MAX_RAY_VOXELS = 1024;
+
+// Where a ray from `origin` along `direction`, with `inverse` its reciprocal, leaves the box
+// from `boxMin` to `boxMax`, and across which `axis`. At least `t` plus a little, so the ray
+// always moves on.
+float exitDistance(float3 origin, float3 direction, float3 inverse, float3 boxMin, float3 boxMax, float t, out int axis) {
+    float3 exits = (select(direction > 0.0, boxMax, boxMin) - origin) * inverse;
+    axis = exits.x < exits.y ? (exits.x < exits.z ? 0 : 2) : (exits.y < exits.z ? 1 : 2);
+    return max(exits[axis], t + RAY_EPSILON);
+}
+
+// The first solid voxel along a ray.
+struct VoxelHit {
+    // How far along the ray it starts.
+    float distance;
+    // The outward normal of the face the ray entered through.
+    float3 normal;
+    // Its type.
+    uint id;
+    // How much light passes along the ray to it, or to its end without a hit, through the
+    // see-through voxels on the way, tinted by them.
+    float3 transmittance;
+    // The level of the chunk it's in, and the chunk's mesh index.
+    int level;
+    uint mesh;
+};
+
+// Whether a ray from `origin` along unit `direction`, both in the shadow grid's finest voxels,
+// enters a solid voxel within `maxDistance`, and which. Rays leaving every level's shadow
+// table hit nothing, as do rays out of their budget of `MAX_RAY_CHUNKS` chunks and
+// `MAX_RAY_VOXELS` voxels, which only very long rays through busy chunks run out of.
+//
+// An Amanatides-Woo DDA, visiting every voxel the ray passes through in order. It runs a
+// chunk at a time, through the finest level's chunk wherever there is one, in that chunk's
+// own voxels. It crosses a chunk without voxels in one step, and within a chunk crosses each
+// block its occupancy says is empty in one step. With `skipStartSolid`, solid voxels the
+// ray starts in are the surface it starts on, such as on a curved surface, so they're
+// skipped. Light passes through see-through voxels, unless `stopAtSeeThrough`.
+bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipStartSolid, bool stopAtSeeThrough, out VoxelHit hit) {
+    hit.distance = 0.0;
+    hit.normal = float3(0.0);
+    hit.id = 0;
+    hit.transmittance = float3(1.0);
+    hit.level = 0;
+    hit.mesh = NO_CHUNK;
+    // Whether the last voxel was see-through, so each pane tints the light once.
+    bool inGlass = false;
+    int edge = int(ubo.lighting.shadowGrid.y);
+    int blocksPerEdge = occupancyBlocks(edge);
+    // A ray along an axis would divide by zero.
+    direction = select(abs(direction) < 1e-6, select(direction < 0.0, -1e-6, 1e-6), direction);
+    float3 inverse = 1.0 / direction;
+    int3 stepDirection = select(direction > 0.0, int3(1), int3(-1));
+
+    float t = 0.0;
+    // The axis the ray last crossed a boundary on, whose face it entered through.
+    int axis = -1;
+    bool leftSurface = !skipStartSolid;
+    uint voxelSteps = 0;
+    for (uint chunkStep = 0; chunkStep < MAX_RAY_CHUNKS; chunkStep++) {
+        if (t > maxDistance) {
+            return false;
+        }
+        float3 position = origin + direction * (t + RAY_EPSILON);
+        int level;
+        int3 chunk;
+        int coverLevel;
+        int3 coverChunk;
+        uint meshIndex = chunkAtPoint(position, level, chunk, coverLevel, coverChunk);
+        if (coverLevel < 0) {
+            return false;
+        }
+        // The ray crosses the finest table's chunk here before looking again, no finer chunk
+        // is in it.
+        float coverSize = float(edge << coverLevel);
+        float3 regionMin = float3(coverChunk) * coverSize;
+        if (meshIndex == NO_CHUNK) {
+            // Nothing to hit, so straight to where the ray leaves it.
+            t = exitDistance(origin, direction, inverse, regionMin, regionMin + coverSize, t, axis);
+            leftSurface = true;
+            inGlass = false;
+            continue;
+        }
+
+        // In the chunk's own voxels from here, `scale` finest voxels wide.
+        float scale = float(1 << level);
+        int3 chunkMin = chunk * edge;
+        int3 cellsMin = int3(round(regionMin / scale));
+        int3 cellsMax = cellsMin + (edge >> (level - coverLevel));
+        MeshInfo mesh = meshes[meshIndex];
+        int3 cell = int3(floor(position / scale));
+        float3 delta = abs(inverse) * scale;
+        // Where the ray crosses the next cell boundary on each axis.
+        float3 crossings = (float3(cell + select(direction > 0.0, int3(1), int3(0))) * scale - origin) * inverse;
+        while (true) {
+            if (any(cell < cellsMin) || any(cell >= cellsMax)) {
+                break;
+            }
+            int3 local = cell - chunkMin;
+            if (++voxelSteps > MAX_RAY_VOXELS) {
+                return false;
+            }
+            int3 block = local / OCCUPANCY_BLOCK;
+            if (!blockOccupied(mesh.occupancyBase, blocksPerEdge, block)) {
+                // Nothing to hit, so straight to where the ray leaves the block.
+                int3 blockMin = chunkMin + block * OCCUPANCY_BLOCK;
+                int3 blockMax = min(blockMin + OCCUPANCY_BLOCK, chunkMin + edge);
+                t = exitDistance(origin, direction, inverse, float3(blockMin) * scale, float3(blockMax) * scale, t, axis);
+                if (t > maxDistance) {
+                    return false;
+                }
+                leftSurface = true;
+                inGlass = false;
+                cell = int3(floor((origin + direction * (t + RAY_EPSILON)) / scale));
+                crossings = (float3(cell + select(direction > 0.0, int3(1), int3(0))) * scale - origin) * inverse;
+                continue;
+            }
+
+            uint id = typeAt(mesh.typesBase, uint(edge), uint3(local));
+            bool glass = false;
+            bool solid = false;
+            if (id != 0) {
+                Material material = materialOf(id);
+                glass = isSeeThrough(material) && !stopAtSeeThrough;
+                solid = !glass;
+                // Light passes through see-through voxels, tinted by each pane once, and ones
+                // tinting it to next to nothing are as good as solid.
+                if (glass && !inGlass) {
+                    hit.transmittance *= material.colorRoughness.rgb;
+                    solid = all(hit.transmittance < 1.0 / 256.0);
+                }
+            }
+            if (solid && leftSurface) {
+                hit.distance = t;
+                hit.id = id;
+                hit.level = level;
+                hit.mesh = meshIndex;
+                if (axis >= 0) {
+                    hit.normal[axis] = -float(stepDirection[axis]);
+                }
+                return true;
+            }
+            if (!solid) {
+                leftSurface = true;
+            }
+            inGlass = glass;
+
+            if (crossings.x < crossings.y && crossings.x < crossings.z) {
+                axis = 0;
+                t = crossings.x;
+                cell.x += stepDirection.x;
+                crossings.x += delta.x;
+            } else if (crossings.y < crossings.z) {
+                axis = 1;
+                t = crossings.y;
+                cell.y += stepDirection.y;
+                crossings.y += delta.y;
+            } else {
+                axis = 2;
+                t = crossings.z;
+                cell.z += stepDirection.z;
+                crossings.z += delta.z;
+            }
+            if (t > maxDistance) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+// How much of the sun's light gets along a ray from `origin` along `direction`, both in the
+// shadow grid's voxels, to the shadow distance: none when a solid voxel is in the way, and
+// tinted by any see-through ones.
+float3 sunVisibility(float3 origin, float3 direction) {
+    VoxelHit hit;
+    return traceVoxels(origin, direction, ubo.lighting.shadowGrid.z, true, false, hit) ? float3(0.0) : hit.transmittance;
+}

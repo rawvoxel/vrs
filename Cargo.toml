@@ -10,7 +10,7 @@ build = "build.rs"
 anyhow = "1.0.98"
 ash = "0.38.0"
 ash-window = "0.13.0"
-glam = "0.30.5"
+glam = "0.32.1"
 raw-window-handle = "0.6.2"
 
 [dev-dependencies]

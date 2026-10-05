@@ -1,9 +1,15 @@
+//! Meshes: their vertex formats, ids, and the pool every mesh shares buffers in.
+
+mod info;
+pub mod octahedral;
 mod pool;
 mod range_allocator;
 mod repack;
 mod staging;
+mod vertex;
 
 pub(crate) use pool::{MeshPool, NewMesh};
+pub use vertex::{Index, LitVertex, Vertex};
 
 use glam::Vec3;
 use std::ops::Range;
@@ -42,16 +48,19 @@ impl Default for MeshCapacity {
 }
 
 /// How a mesh's vertices are stored, and so how it's colored.
-/// Matches the `KIND_` constants in `common.slang`.
+/// Matches the `KIND_` constants in `common/layout.slang`.
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshKind {
-    /// `vertex::Vertex`es, world positions with their own colors.
+    /// `Vertex`es, world positions with their own colors.
     Colored = 0,
     /// `voxel::GreedyVertex`es, colored by voxel.
     Greedy = 1,
     /// `voxel::PackedVertex`es, colored by voxel.
     Packed = 2,
+    /// `LitVertex`es, world positions with their own colors and normals, lit like
+    /// chunks.
+    Lit = 3,
 }
 
 impl MeshKind {
@@ -62,7 +71,14 @@ impl MeshKind {
             MeshKind::Colored => 4,
             MeshKind::Greedy => 2,
             MeshKind::Packed => 3,
+            MeshKind::Lit => 5,
         }
+    }
+
+    /// Whether it's a chunk, colored by voxel, with voxel types of its own.
+    #[inline]
+    pub fn is_chunk(self) -> bool {
+        matches!(self, MeshKind::Greedy | MeshKind::Packed)
     }
 }
 
@@ -73,17 +89,17 @@ pub struct Mesh {
     pub kind: MeshKind,
     pub vertex_words: Range<u32>,
     pub indices: Range<u32>,
-    /// A chunk's voxel types, its occupancy, then its probe cells, empty for colored meshes.
+    /// A chunk's voxel types, its occupancy, then its probe cells, empty but for chunks.
     pub type_words: Range<u32>,
     /// Where the occupancy starts in `type_words`, see `voxel::VoxelTypes::occupancy`.
     pub occupancy_offset: u32,
-    /// Where the probe cells start in `type_words`, see `gi::bake_probe_cells`.
+    /// Where the probe cells start in `type_words`, see `lighting::gi::bake_probe_cells`.
     pub probes_offset: u32,
     /// World position of the mesh's local origin, a chunk's voxel `(0, 0, 0)` corner.
     pub origin: Vec3,
     /// World units per local unit, a chunk's voxel size.
     pub scale: f32,
-    /// Zero for colored meshes.
+    /// Zero but for chunks.
     pub voxels_per_edge: u32,
     pub bounds_min: Vec3,
     pub bounds_max: Vec3,

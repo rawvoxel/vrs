@@ -4,7 +4,8 @@
 //! and stored in steps of `1 / position_steps(edge)`. Both are powers of two, so the decode
 //! is exact and neighboring chunks decode a shared edge to the same point.
 
-use glam::{Vec2, Vec3};
+use crate::mesh::octahedral;
+use glam::Vec3;
 
 /// Voxels of margin on each side of a chunk's interior a vertex may sit, for skirts and the shell.
 pub const POSITION_BIAS: f32 = 16.0;
@@ -93,7 +94,7 @@ impl PackedVertex {
     /// [`POSITION_BIAS`] margin, which no mesher should produce.
     pub fn new(voxel_position: Vec3, normal: Vec3, voxels_per_edge: u32) -> Option<Self> {
         let [position_xy, position_z_flags] = pack_position(voxel_position, voxels_per_edge)?;
-        let [u, v] = octahedral_encode(normal);
+        let [u, v] = octahedral::encode(normal);
         Some(Self {
             position_xy,
             position_z_flags,
@@ -129,7 +130,7 @@ impl GreedyVertex {
 
     /// A packed vertex of a greedy mesh, its normal turned into the nearest `Face`.
     pub fn from_packed(vertex: PackedVertex) -> Self {
-        let face = Face::from_normal(octahedral_decode(vertex.normal));
+        let face = Face::from_normal(octahedral::decode(vertex.normal));
         let flags = (vertex.flags() & SEE_THROUGH_FLAG) | ((face as u32) << FACE_SHIFT);
         Self {
             position_xy: vertex.position_xy,
@@ -167,34 +168,6 @@ pub fn unpack_position(position_xy: u32, position_z_flags: u32, voxels_per_edge:
     quantized / steps - Vec3::splat(POSITION_BIAS)
 }
 
-/// A unit normal folded onto the unit square, +Y at the center, 16 bits per axis. A
-/// zero-length normal packs as +Y.
-pub fn octahedral_encode(normal: Vec3) -> [u16; 2] {
-    let normal = normal.normalize_or(Vec3::Y);
-    let mut folded =
-        Vec2::new(normal.x, normal.z) / (normal.x.abs() + normal.y.abs() + normal.z.abs());
-    if normal.y < 0.0 {
-        let sign = Vec2::new(
-            if folded.x >= 0.0 { 1.0 } else { -1.0 },
-            if folded.y >= 0.0 { 1.0 } else { -1.0 },
-        );
-        folded = (Vec2::ONE - Vec2::new(folded.y.abs(), folded.x.abs())) * sign;
-    }
-    let unit = (folded * 0.5 + Vec2::splat(0.5)) * 65535.0;
-    [unit.x.round() as u16, unit.y.round() as u16]
-}
-
-/// Undoes `octahedral_encode` on a packed normal word. Matches `octahedralDecode` in `mesh.slang`.
-pub fn octahedral_decode(word: u32) -> Vec3 {
-    let encoded = Vec2::new((word & 0xffff) as f32, (word >> 16) as f32) / 65535.0;
-    let folded = encoded * 2.0 - 1.0;
-    let mut normal = Vec3::new(folded.x, 1.0 - folded.x.abs() - folded.y.abs(), folded.y);
-    let below = (-normal.y).max(0.0);
-    normal.x += if normal.x >= 0.0 { -below } else { below };
-    normal.z += if normal.z >= 0.0 { -below } else { below };
-    normal.normalize()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,21 +191,6 @@ mod tests {
         }
         assert!(PackedVertex::new(Vec3::new(-16.5, 0.0, 0.0), Vec3::Y, 32).is_none());
         assert!(PackedVertex::new(Vec3::new(48.0, 0.0, 0.0), Vec3::Y, 32).is_none());
-    }
-
-    #[test]
-    fn normals_round_trip() {
-        for face in Face::ALL {
-            let [u, v] = octahedral_encode(face.normal());
-            let decoded = octahedral_decode(u as u32 | ((v as u32) << 16));
-            assert!(
-                decoded.distance(face.normal()) < 1e-4,
-                "{face:?}: {decoded}"
-            );
-        }
-        let diagonal = Vec3::new(1.0, -2.0, 3.0).normalize();
-        let [u, v] = octahedral_encode(diagonal);
-        assert!(octahedral_decode(u as u32 | ((v as u32) << 16)).distance(diagonal) < 1e-3);
     }
 
     #[test]

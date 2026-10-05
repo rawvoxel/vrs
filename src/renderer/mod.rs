@@ -1,63 +1,49 @@
-mod capture;
 mod config;
 mod debug;
 mod device;
+mod draw_list;
 mod frame;
 mod lighting;
+mod material;
 mod meshes;
-mod palette;
 mod record;
 mod setup;
 
-pub use crate::gi::{GiConfig, MAX_CASCADES, ProbeTuning};
-pub use crate::lights::{Light, MAX_LIGHTS, Spot};
-pub use crate::timings::{GpuStage, GpuTimings};
-pub use capture::Capture;
+pub use crate::{
+    lighting::{
+        gi::{GiConfig, MAX_CASCADES, ProbeTuning},
+        lights::{Light, MAX_LIGHTS, Spot},
+    },
+    timings::{GpuStage, GpuTimings},
+};
 pub use config::RendererConfig;
-pub use debug::{FrameStats, MeshPoolStats};
+pub use debug::{Capture, FrameStats, MeshPoolStats};
+pub use draw_list::DrawList;
 pub(crate) use lighting::LightingUniforms;
 pub use lighting::{
-    DebugView, Lighting, MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS, ShadowGrid, ShadowResolution,
+    DebugView, Lighting, MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS, ShadowGrid, ShadowResolution, Sky,
+    Tonemapping,
 };
-pub use palette::Material;
+pub use material::Material;
 
 use crate::{
-    adapter::Adapter,
-    buffer::{Buffer, DynamicBuffer},
-    commands::record_submit_commandbuffer,
-    cull::Culler,
-    gi::ProbeVolume,
-    hiz::DepthPyramid,
-    lights::GpuLight,
+    culling::{Culler, depth_pyramid::DepthPyramid},
+    lighting::{gi::ProbeVolume, lights::GpuLight, shadows::ShadowPass},
     mesh::{MeshId, MeshPool},
-    queue::{Queue, QueueFamily},
-    shadows::ShadowPass,
-    surface::Surface,
-    swapchain::Swapchain,
-    sync::create_semaphore,
     timings::FrameTimestamps,
-    vertex::{Index, Vertex},
+    vulkan::{
+        adapter::Adapter,
+        buffer::{Buffer, DynamicBuffer},
+        commands::record_submit_commandbuffer,
+        queue::{Queue, QueueFamily},
+        surface::Surface,
+        swapchain::Swapchain,
+        sync::create_semaphore,
+    },
 };
 use ash::{khr, prelude::VkResult, vk};
-use glam::{IVec4, Mat4};
+use glam::IVec4;
 use std::collections::HashMap;
-
-/// Everything drawn by one `Renderer::submit`.
-#[derive(Clone, Copy, Default)]
-pub struct DrawList<'a> {
-    /// Meshes added with `Renderer::create_mesh`. References, so ids can stay
-    /// wherever they're kept, such as a map of chunks.
-    pub meshes: &'a [&'a MeshId],
-    /// Geometry for this frame only, read by the device straight from host visible memory.
-    pub indices: &'a [Index],
-    pub vertices: &'a [Vertex],
-    /// Meshes outside this camera's frustum, or hidden behind others, are culled on the device.
-    pub view: Mat4,
-    /// Into Vulkan's clip space, where y points down and depth runs from 0 to 1. An OpenGL style
-    /// projection, such as glam's `perspective_rh`, needs its y flipped, otherwise the image
-    /// is mirrored and backface culling skips the wrong faces.
-    pub proj: Mat4,
-}
 
 /// Draws meshes into the `App`'s window, or images of its own when headless,
 /// culling them on the device.
@@ -105,7 +91,7 @@ pub struct Renderer {
     capture_requested: bool,
     capture_buffers: Vec<DynamicBuffer>,
     /// What `debug_read_capture` reads back.
-    recorded_capture: Option<capture::RecordedCapture>,
+    recorded_capture: Option<debug::RecordedCapture>,
     frame_index_buffers: Vec<DynamicBuffer>,
     frame_vertex_buffers: Vec<DynamicBuffer>,
 
@@ -133,7 +119,7 @@ pub struct Renderer {
     frame_desc_sets: Vec<vk::DescriptorSet>,
     uniform_buffers: Vec<Buffer>,
     /// Materials by voxel type, see `set_materials`.
-    palette: Vec<palette::GpuMaterial>,
+    palette: Vec<material::GpuMaterial>,
     palette_version: u64,
     /// Whether any material is glossy, for the shadow pass to trace reflections.
     glossy_palette: bool,
@@ -174,6 +160,8 @@ pub struct Renderer {
     mesh_upscaled_indirect_pipeline: vk::Pipeline,
     /// Draws the light probes, for `DebugView::Probes`.
     probes_pipeline: vk::Pipeline,
+    /// Draws the `Lighting::sky` where no mesh is.
+    sky_pipeline: vk::Pipeline,
     /// Draws each frame's own geometry from `frame_vertex_buffers`.
     dynamic_pipeline: vk::Pipeline,
     graphics_pipeline_layout: vk::PipelineLayout,
@@ -396,6 +384,7 @@ impl Drop for Renderer {
             device.destroy_pipeline(self.mesh_over_depth_pipeline, None);
             device.destroy_pipeline(self.mesh_upscaled_indirect_pipeline, None);
             device.destroy_pipeline(self.probes_pipeline, None);
+            device.destroy_pipeline(self.sky_pipeline, None);
             device.destroy_pipeline(self.dynamic_pipeline, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             device.destroy_device(None);

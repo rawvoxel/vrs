@@ -2,13 +2,14 @@
 
 use super::{
     Mesh, MeshCapacity,
+    info::MeshInfo,
     pool::{
-        DRAW_AND_CULL_ACCESS, DRAW_AND_CULL_STAGES, INDEX_SIZE, MeshInfo, MeshPool, NewMesh,
-        WORD_SIZE, create_pool_buffers,
+        DRAW_AND_CULL_ACCESS, DRAW_AND_CULL_STAGES, INDEX_SIZE, MeshPool, NewMesh, WORD_SIZE,
+        create_pool_buffers,
     },
     range_allocator::RangeAllocator,
 };
-use crate::{adapter::Adapter, buffer::Buffer, commands::record_submit_commandbuffer};
+use crate::vulkan::{adapter::Adapter, buffer::Buffer, commands::record_submit_commandbuffer};
 use ash::{prelude::VkResult, vk};
 use std::{ops::Range, slice};
 

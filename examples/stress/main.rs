@@ -41,9 +41,10 @@ use scene::{CAPACITY, CHUNK_Z, GRID, Scene, VOXEL_SIZE, chunk_min, live, voxel_s
 use std::time::Instant;
 use target::{START_SIZE, Target};
 use vrs::{
-    App, debug,
+    App,
     mesh::MeshCapacity,
     renderer::{DrawList, MeshPoolStats, Renderer, RendererConfig},
+    vulkan::debug,
 };
 use winit::{
     application::ApplicationHandler,

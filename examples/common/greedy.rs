@@ -6,9 +6,8 @@
 use ash::prelude::VkResult;
 use glam::{Vec3, Vec3Swizzles};
 use vrs::{
-    mesh::MeshId,
+    mesh::{Index, MeshId},
     renderer::Renderer,
-    vertex::Index,
     voxel::{ChunkMesh, ChunkVertices, Face, GreedyVertex, VoxelTypes},
 };
 

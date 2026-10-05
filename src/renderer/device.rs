@@ -1,4 +1,7 @@
-use crate::{App, adapter::Adapter, queue::QueueFamily};
+use crate::{
+    App,
+    vulkan::{adapter::Adapter, queue::QueueFamily},
+};
 use ash::{khr, prelude::VkResult, vk};
 use std::slice;
 

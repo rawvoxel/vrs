@@ -11,9 +11,8 @@ use anyhow::Result;
 use ash::vk;
 use vrs::{
     App,
-    mesh::MeshId,
+    mesh::{Index, MeshId, Vertex},
     renderer::{DrawList, Renderer},
-    vertex::{Index, Vertex},
 };
 use winit::{
     application::ApplicationHandler,

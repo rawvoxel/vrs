@@ -1,6 +1,7 @@
 // Draws the mesh pool's meshes, pulling each one's vertices in whichever format it uses.
 //
-// Colored meshes carry their own colors. Chunk meshes are colored by voxel: a fragment finds
+// Colored meshes carry their own colors, unlit. Lit meshes carry theirs too, and normals, and
+// are lit as rough surfaces like chunks. Chunk meshes are colored by voxel: a fragment finds
 // the voxel it belongs to in the chunk's packed types, then that type's material. Then
 // they're lit by the sun and the lights, with the shadows the shadow pass traced, the light
 // probes or the sky and the ground, darkened by ambient occlusion, and when glossy, reflect
@@ -68,7 +69,7 @@ static const uint DEBUG_DIRECT = 2;
 static const uint DEBUG_INDIRECT = 3;
 static const uint DEBUG_OCCLUSION = 4;
 
-// Matches `voxel::octahedral_decode`.
+// Matches `mesh::octahedral::decode`.
 float3 octahedralDecode(uint word) {
     float2 folded = float2(word & 0xffff, word >> 16) / 65535.0 * 2.0 - 1.0;
     float3 normal = float3(folded.x, 1.0 - abs(folded.x) - abs(folded.y), folded.y);
@@ -105,6 +106,11 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
         word += vertexIndex * 4;
         local = asfloat(uint3(vertexWords[word], vertexWords[word + 1], vertexWords[word + 2]));
         output.color = unpackUnorm4x8ToFloat(vertexWords[word + 3]).rgb;
+    } else if (mesh.kind == KIND_LIT) {
+        word += vertexIndex * 5;
+        local = asfloat(uint3(vertexWords[word], vertexWords[word + 1], vertexWords[word + 2]));
+        output.color = unpackUnorm4x8ToFloat(vertexWords[word + 3]).rgb;
+        output.normal = octahedralDecode(vertexWords[word + 4]);
     } else if (mesh.kind == KIND_GREEDY) {
         word += vertexIndex * 2;
         uint positionZFlags = vertexWords[word + 1];
@@ -287,13 +293,17 @@ float4 meshFrag(VSOutput input) : SV_Target {
     // A face lies between its solid voxel and the empty cell in front, so its fragments are
     // nudged inside first. Curved surfaces can still be in an empty cell, then the voxel
     // one cell behind is taken.
+    bool litMesh = input.kind == KIND_LIT;
     uint edge = input.voxelsPerEdge;
-    uint id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * FACE_NUDGE, edge));
-    if (id == 0) {
-        id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * (1.0 + FACE_NUDGE), edge));
+    uint id = 0;
+    if (!litMesh) {
+        id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * FACE_NUDGE, edge));
+        if (id == 0) {
+            id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * (1.0 + FACE_NUDGE), edge));
+        }
     }
 
-    // Greedy normals are exact already, packed ones are interpolated between vertices.
+    // Greedy normals are exact already, packed and lit ones are interpolated between vertices.
     float3 normal = input.kind == KIND_GREEDY ? input.normal : normalize(input.normal);
     float3 fromCamera = input.worldPosition - ubo.gi.cameraPosition.xyz;
     float3 toViewer = -normalize(fromCamera);
@@ -334,6 +344,10 @@ float4 meshFrag(VSOutput input) : SV_Target {
         light.indirect *= openness;
     }
     Material material = materialOf(id);
+    if (litMesh) {
+        material.colorRoughness = float4(input.color, 1.0);
+        material.emissionMetalness = float4(0.0);
+    }
     float roughness = material.colorRoughness.w;
     // The sun's and the lights' highlights, which smooth faces reflect.
     float3 highlights = float3(0.0);
@@ -392,7 +406,9 @@ float4 meshFrag(VSOutput input) : SV_Target {
         return float4(light.indirect, 1.0);
     case DEBUG_OCCLUSION:
         return float4(float3(openness), 1.0);
-    default:
-        return float4(shadeSurface(material, normal, toViewer, lit, reflection), 1.0);
+    default: {
+        float3 shaded = shadeSurface(material, normal, toViewer, lit, reflection);
+        return float4(toDisplay(hazed(shaded, fromCamera)), 1.0);
+    }
     }
 }

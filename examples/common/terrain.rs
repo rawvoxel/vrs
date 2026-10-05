@@ -8,7 +8,9 @@ use ash::prelude::VkResult;
 use glam::{Mat4, Vec3};
 use vrs::{
     mesh::{MeshCapacity, MeshId},
-    renderer::{GiConfig, Renderer, RendererConfig, ShadowGrid, ShadowResolution},
+    renderer::{
+        GiConfig, Renderer, RendererConfig, ShadowGrid, ShadowResolution, Sky, Tonemapping,
+    },
 };
 
 /// Chunks across the world along x and z, and stacked up y.
@@ -124,6 +126,12 @@ pub fn create_world(renderer: &mut Renderer) -> VkResult<Vec<MeshId>> {
     renderer.lighting.shadow_grid = Some(ShadowGrid::new(1.0, EDGE as u32).with_levels(2));
     // One shadow ray per 2x2 pixels, which looks nearly the same for well under half the cost.
     renderer.lighting.shadow_resolution = ShadowResolution::Half;
+    // A blue sky, the far hills fading into it, and highlights rolling off rather than clipping.
+    renderer.lighting.sky = Some(Sky {
+        haze_distance: 1500.0,
+        ..Default::default()
+    });
+    renderer.lighting.tonemapping = Tonemapping::Aces;
     let world = World::new();
     let edge = EDGE as i32;
     let mut ids = Vec::new();

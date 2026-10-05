@@ -1,8 +1,10 @@
 //! The stages `Renderer::submit` runs a frame in, around recording it.
 
 use super::{DrawList, Renderer};
-use crate::bindings;
-use crate::uniforms::{FrameUniforms, MvpMatrices};
+use crate::shader::{
+    bindings,
+    uniforms::{FrameUniforms, MvpMatrices},
+};
 use ash::{prelude::VkResult, vk};
 use glam::Mat4;
 use std::slice;
@@ -22,6 +24,8 @@ pub(super) struct FrameData {
     pub draw_probes: bool,
     /// Whether color is drawn with the light from everywhere but the sun the shadow pass lit.
     pub upscaled_indirect: bool,
+    /// Whether the `Lighting::sky` is drawn behind the meshes.
+    pub sky: bool,
 }
 
 impl FrameData {
@@ -225,6 +229,7 @@ impl Renderer {
             // The ambient occlusion's own view needs each pixel's.
             upscaled_indirect: self.lights_indirect_in_shadow_pass()
                 && self.lighting.debug_view != super::DebugView::AmbientOcclusion,
+            sky: self.lighting.sky.is_some(),
         })
     }
 

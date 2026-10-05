@@ -1,4 +1,4 @@
-use crate::{adapter::Adapter, buffer::DynamicBuffer};
+use crate::vulkan::{adapter::Adapter, buffer::DynamicBuffer};
 use ash::{prelude::VkResult, vk};
 
 /// Starting size of each frame's staging buffer, they grow to fit.

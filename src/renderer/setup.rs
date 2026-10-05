@@ -1,30 +1,33 @@
 //! Building a `Renderer`.
 
-use super::palette::GpuMaterial;
-use super::{Lighting, Renderer, RendererConfig, device::create_render_device};
+use super::{
+    Lighting, Renderer, RendererConfig, device::create_render_device, material::GpuMaterial,
+};
 use crate::{
     App,
-    adapter::Adapter,
-    bindings,
-    buffer::DynamicBuffer,
-    commands::{create_command_buffer, create_command_pool},
-    cull::Culler,
-    descriptors::{allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout},
-    gi::ProbeVolume,
-    hiz::DepthPyramid,
-    lights::GpuLight,
-    mesh::MeshPool,
-    pipeline::{
-        PipelinePass, create_graphics_pipeline, create_pipeline_layout, create_shader_module,
+    culling::{Culler, depth_pyramid::DepthPyramid},
+    lighting::{gi::ProbeVolume, lights::GpuLight, shadows::ShadowPass},
+    mesh::{Index, MeshPool, Vertex},
+    shader::{
+        bindings,
+        uniforms::{create_uniform_buffer, write_uniform_descriptor_sets},
     },
-    queue::{Queue, QueueFamily},
-    shadows::ShadowPass,
-    surface::Surface,
-    swapchain::Swapchain,
-    sync::{create_fence, create_semaphore},
     timings::FrameTimestamps,
-    uniforms::{create_uniform_buffer, write_uniform_descriptor_sets},
-    vertex::{Index, Vertex},
+    vulkan::{
+        adapter::Adapter,
+        buffer::DynamicBuffer,
+        commands::{create_command_buffer, create_command_pool},
+        descriptors::{
+            allocate_descriptor_sets, create_descriptor_pool, create_descriptor_set_layout,
+        },
+        pipeline::{
+            PipelinePass, create_graphics_pipeline, create_pipeline_layout, create_shader_module,
+        },
+        queue::{Queue, QueueFamily},
+        surface::Surface,
+        swapchain::Swapchain,
+        sync::{create_fence, create_semaphore},
+    },
 };
 use ash::{khr, prelude::VkResult, vk};
 use std::slice;
@@ -32,6 +35,7 @@ use std::slice;
 const DYNAMIC_SPV: &[u8] = include_bytes!("../../assets/shader/slang.spv");
 const MESH_SPV: &[u8] = include_bytes!("../../assets/shader/mesh.spv");
 const PROBES_SPV: &[u8] = include_bytes!("../../assets/shader/probes.spv");
+const SKY_SPV: &[u8] = include_bytes!("../../assets/shader/sky.spv");
 pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
 /// Starting size of each frame's dynamic geometry buffers, they grow to fit.
 const INITIAL_DYNAMIC_ELEMENTS: vk::DeviceSize = 1024;
@@ -137,6 +141,7 @@ impl Renderer {
             mesh_over_depth_pipeline: vk::Pipeline::null(),
             mesh_upscaled_indirect_pipeline: vk::Pipeline::null(),
             probes_pipeline: vk::Pipeline::null(),
+            sky_pipeline: vk::Pipeline::null(),
             dynamic_pipeline: vk::Pipeline::null(),
             graphics_pipeline_layout: vk::PipelineLayout::null(),
             graphics_queue: Queue::new(&graphics_queue_family, &render_device, 0),
@@ -237,6 +242,13 @@ impl Renderer {
                 (c"probeVert", c"probeFrag"),
                 false,
                 PipelinePass::Shaded,
+            ),
+            (
+                &mut self.sky_pipeline,
+                SKY_SPV,
+                (c"skyVert", c"skyFrag"),
+                false,
+                PipelinePass::Behind,
             ),
         ] {
             let shader_module = create_shader_module(&device, spv)?;

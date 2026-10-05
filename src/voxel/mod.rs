@@ -5,11 +5,11 @@ mod vertex;
 
 pub use types::{OCCUPANCY_BLOCK, VoxelTypes};
 pub use vertex::{
-    Face, GreedyVertex, POSITION_BIAS, PackedVertex, SEE_THROUGH_FLAG, octahedral_decode,
-    octahedral_encode, position_steps, unpack_position,
+    Face, GreedyVertex, POSITION_BIAS, PackedVertex, SEE_THROUGH_FLAG, position_steps,
+    unpack_position,
 };
 
-use crate::vertex::Index;
+use crate::mesh::Index;
 use glam::Vec3;
 
 /// A chunk's vertices, in whichever format its mesher suits.
