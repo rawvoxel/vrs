@@ -1,36 +1,38 @@
 mod config;
+pub(crate) mod culling;
 mod debug;
 mod device;
 mod draw_list;
 mod frame;
-mod lighting;
+pub(crate) mod lighting;
 mod material;
+pub(crate) mod mesh_pool;
 mod meshes;
 mod record;
 mod setup;
+pub(crate) mod shader;
+pub(crate) mod timings;
 
-pub use crate::{
-    lighting::{
-        gi::{GiConfig, MAX_CASCADES, ProbeTuning},
-        lights::{Light, MAX_LIGHTS, Spot},
-    },
-    timings::{GpuStage, GpuTimings},
-};
 pub use config::RendererConfig;
 pub use debug::{Capture, FrameStats, MeshPoolStats};
 pub use draw_list::DrawList;
 pub(crate) use lighting::LightingUniforms;
 pub use lighting::{
-    DebugView, Lighting, MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS, ShadowGrid, ShadowResolution, Sky,
-    Tonemapping,
+    DebugView, GiConfig, Light, Lighting, MAX_CASCADES, MAX_LIGHTS, MAX_SHADOW_LEVELS,
+    MAX_SHADOWED_LIGHTS, ProbeTuning, ShadowGrid, ShadowResolution, Sky, Spot, Tonemapping,
 };
 pub use material::Material;
+pub use mesh_pool::MeshCapacity;
+pub use timings::{GpuStage, GpuTimings};
 
 use crate::{
-    culling::{Culler, depth_pyramid::DepthPyramid},
-    lighting::{gi::ProbeVolume, lights::GpuLight, shadows::ShadowPass},
-    mesh::{MeshId, MeshPool},
-    timings::FrameTimestamps,
+    mesh::MeshId,
+    renderer::{
+        culling::{Culler, depth_pyramid::DepthPyramid},
+        lighting::{lights::GpuLight, probes::ProbeVolume, shadows::ShadowPass},
+        mesh_pool::MeshPool,
+        timings::FrameTimestamps,
+    },
     vulkan::{
         adapter::Adapter,
         buffer::{Buffer, DynamicBuffer},
@@ -146,7 +148,7 @@ pub struct Renderer {
     /// Last frame's lighting, to notice changes in it.
     previous_lighting: Option<Lighting>,
     /// The faster converging probes still under way.
-    convergence: lighting::Convergence,
+    convergence: lighting::probes::Convergence,
     /// This frame's multipliers of the probes' hysteresis for light and distances.
     hysteresis_scale: [f32; 2],
 

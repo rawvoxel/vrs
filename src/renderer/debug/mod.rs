@@ -7,7 +7,7 @@ pub(super) use capture::RecordedCapture;
 
 use super::Renderer;
 use crate::{
-    mesh::MeshCapacity,
+    renderer::mesh_pool::MeshCapacity,
     vulkan::{buffer::Buffer, commands::record_submit_commandbuffer},
 };
 use ash::{prelude::VkResult, vk};

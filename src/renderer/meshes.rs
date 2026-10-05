@@ -2,8 +2,11 @@
 
 use super::Renderer;
 use crate::{
-    lighting::gi::bake_probe_cells,
-    mesh::{Index, LitVertex, Mesh, MeshId, MeshKind, NewMesh, Vertex, octahedral},
+    mesh::{Index, LitVertex, MeshId, Vertex, octahedral},
+    renderer::{
+        lighting::probes::bake_probe_cells,
+        mesh_pool::{Mesh, MeshKind, NewMesh},
+    },
     voxel::{ChunkMesh, ChunkVertices, unpack_position},
     vulkan::bytes::slice_as_words,
 };

@@ -1,7 +1,7 @@
 // Finding voxels: chunks' packed types and occupancy, and the shadow table's chunks around the
 // camera.
 
-// Matches `renderer::lighting::shadow_grid::NO_CHUNK`, a shadow table entry without a chunk.
+// Matches `renderer::lighting::shadows::grid::NO_CHUNK`, a shadow table entry without a chunk.
 static const uint NO_CHUNK = 0xffffffff;
 
 // Moves a point on a face into the voxel behind it, in voxels.

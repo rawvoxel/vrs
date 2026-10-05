@@ -7,9 +7,10 @@ use crate::{
 use ash::prelude::VkResult;
 use glam::{Mat4, Vec3};
 use vrs::{
-    mesh::{MeshCapacity, MeshId},
+    mesh::MeshId,
     renderer::{
-        GiConfig, Renderer, RendererConfig, ShadowGrid, ShadowResolution, Sky, Tonemapping,
+        GiConfig, MeshCapacity, Renderer, RendererConfig, ShadowGrid, ShadowResolution, Sky,
+        Tonemapping,
     },
 };
 

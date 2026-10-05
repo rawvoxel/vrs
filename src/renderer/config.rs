@@ -1,4 +1,4 @@
-use crate::{lighting::gi::GiConfig, mesh::MeshCapacity};
+use super::{lighting::GiConfig, mesh_pool::MeshCapacity};
 
 /// How a `Renderer` is built, see `Renderer::with_config`.
 ///

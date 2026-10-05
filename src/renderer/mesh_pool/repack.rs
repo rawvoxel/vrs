@@ -1,13 +1,8 @@
 //! Moving every mesh into new buffers, packed together, to defragment or grow a pool.
 
 use super::{
-    Mesh, MeshCapacity,
-    info::MeshInfo,
-    pool::{
-        DRAW_AND_CULL_ACCESS, DRAW_AND_CULL_STAGES, INDEX_SIZE, MeshPool, NewMesh, WORD_SIZE,
-        create_pool_buffers,
-    },
-    range_allocator::RangeAllocator,
+    DRAW_AND_CULL_ACCESS, DRAW_AND_CULL_STAGES, INDEX_SIZE, Mesh, MeshCapacity, MeshInfo, MeshPool,
+    NewMesh, WORD_SIZE, create_pool_buffers, range_allocator::RangeAllocator,
 };
 use crate::vulkan::{adapter::Adapter, buffer::Buffer, commands::record_submit_commandbuffer};
 use ash::{prelude::VkResult, vk};

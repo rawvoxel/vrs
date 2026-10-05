@@ -1,7 +1,9 @@
 use crate::{
-    lighting::{gi::GiUniforms, shadows::ShadowUniforms},
-    renderer::LightingUniforms,
-    shader::bindings,
+    renderer::{
+        LightingUniforms,
+        lighting::{probes::GiUniforms, shadows::ShadowUniforms},
+        shader::bindings,
+    },
     vulkan::{adapter::Adapter, buffer::Buffer},
 };
 use ash::{prelude::VkResult, vk};

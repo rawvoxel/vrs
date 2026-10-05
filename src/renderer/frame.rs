@@ -1,7 +1,7 @@
 //! The stages `Renderer::submit` runs a frame in, around recording it.
 
 use super::{DrawList, Renderer};
-use crate::shader::{
+use crate::renderer::shader::{
     bindings,
     uniforms::{FrameUniforms, MvpMatrices},
 };

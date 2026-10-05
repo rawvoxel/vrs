@@ -42,8 +42,7 @@ use std::time::Instant;
 use target::{START_SIZE, Target};
 use vrs::{
     App,
-    mesh::MeshCapacity,
-    renderer::{DrawList, MeshPoolStats, Renderer, RendererConfig},
+    renderer::{DrawList, MeshCapacity, MeshPoolStats, Renderer, RendererConfig},
     vulkan::debug,
 };
 use winit::{

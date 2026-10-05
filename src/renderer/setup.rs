@@ -5,14 +5,17 @@ use super::{
 };
 use crate::{
     App,
-    culling::{Culler, depth_pyramid::DepthPyramid},
-    lighting::{gi::ProbeVolume, lights::GpuLight, shadows::ShadowPass},
-    mesh::{Index, MeshPool, Vertex},
-    shader::{
-        bindings,
-        uniforms::{create_uniform_buffer, write_uniform_descriptor_sets},
+    mesh::{Index, Vertex},
+    renderer::{
+        culling::{Culler, depth_pyramid::DepthPyramid},
+        lighting::{lights::GpuLight, probes::ProbeVolume, shadows::ShadowPass},
+        mesh_pool::MeshPool,
+        shader::{
+            bindings,
+            uniforms::{create_uniform_buffer, write_uniform_descriptor_sets},
+        },
+        timings::FrameTimestamps,
     },
-    timings::FrameTimestamps,
     vulkan::{
         adapter::Adapter,
         buffer::DynamicBuffer,
@@ -133,7 +136,7 @@ impl Renderer {
             chunk_serials: Default::default(),
             chunk_serials_next: Default::default(),
             previous_lighting: None,
-            convergence: super::lighting::Convergence::NONE,
+            convergence: super::lighting::probes::Convergence::NONE,
             hysteresis_scale: [1.0; 2],
 
             mesh_pipeline: vk::Pipeline::null(),

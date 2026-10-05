@@ -1,13 +1,15 @@
 // The point and spot lights: their falloff, culling them into tiles, choosing the brightest,
 // and their shadows.
 
-// Pixels along each edge of a tile lights are culled for. Matches `lighting::shadows::LIGHT_TILE`.
+// Pixels along each edge of a tile lights are culled for. Matches
+// `renderer::lighting::shadows::pass::LIGHT_TILE`.
 static const uint LIGHT_TILE = 16;
-// The most lights a tile keeps, its brightest. Matches `lighting::shadows::TILE_LIGHTS`.
+// The most lights a tile keeps, its brightest. Matches
+// `renderer::lighting::shadows::pass::TILE_LIGHTS`.
 static const uint TILE_LIGHTS = 63;
 // Words a tile's light list takes: its count, then its lights.
 static const uint TILE_WORDS = TILE_LIGHTS + 1;
-// The most lights a frame has. Matches `lighting::lights::MAX_LIGHTS`.
+// The most lights a frame has. Matches `renderer::lighting::lights::MAX_LIGHTS`.
 static const uint MAX_LIGHTS = 255;
 // The most of a pixel's lights that are shadowed. Matches `renderer::MAX_SHADOWED_LIGHTS`.
 static const uint MAX_SHADOWED_LIGHTS = 4;

@@ -1,10 +1,10 @@
 // Sampling the light probes' cascades.
 
 // Voxels along each edge of a probe's cell, and between neighboring probes, in the finest
-// cascade. Matches `lighting::gi::PROBE_CELL`.
+// cascade. Matches `renderer::lighting::probes::PROBE_CELL`.
 static const int PROBE_CELL = 16;
-// Matches `lighting::gi::volume::IRRADIANCE_TEXELS` and `lighting::gi::volume::DEPTH_TEXELS`, each
-// with a one texel border.
+// Matches `renderer::lighting::probes::volume::IRRADIANCE_TEXELS` and
+// `renderer::lighting::probes::volume::DEPTH_TEXELS`, each with a one texel border.
 static const int IRRADIANCE_TEXELS = 8;
 static const int DEPTH_TEXELS = 14;
 // Irradiance is stored to the power of 1 / 5, which blends a drop in light as fast as a

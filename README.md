@@ -260,16 +260,16 @@ For tests and tools, these stall the GPU unless they say otherwise:
 | Module | |
 | --- | --- |
 | `renderer` | `Renderer`, building it, each frame's stages and command recording, and the meshes it holds |
-| `renderer::lighting` | How chunks are lit: `Lighting`, the sky, tonemapping, the shadow grid and pass, the probes and lights each frame, debug views |
+| `renderer::lighting` | How chunks are lit: `Lighting`, the sky, tonemapping, debug views, and for each of the shadows, the light probes and the lights, its settings, its GPU resources and passes, and how each frame drives them |
 | `renderer::material` | `Material`s and the palette they're uploaded in |
+| `renderer::mesh_pool` | The buffers every mesh shares, their GPU records, staging, range allocator and repacking |
+| `renderer::culling` | GPU culling, and the depth pyramid occlusion culling tests against |
+| `renderer::shader`, `renderer::timings` | What every shader shares, the frame's bindings and uniforms, and each frame's GPU timestamps |
 | `renderer::debug` | Hooks for tests and tools: frame stats, GPU timings and captures |
-| `mesh` | Mesh ids and vertex formats, octahedral normals, and the shared mesh pool, its GPU records, staging, range allocator and repacking |
+| `mesh` | Mesh ids and vertex formats, with octahedral normals |
 | `voxel` | Chunk meshes: compact vertex formats and packed voxel types |
-| `lighting` | Lighting's GPU resources and passes: the light probe cascades, the lights, and the shadow pass |
-| `culling` | GPU culling, and the depth pyramid occlusion culling tests against |
-| `shader` | What every shader shares: the frame's bindings and uniforms |
 | `vulkan` | Vulkan building blocks: GPUs and queues, memory, buffers, images, pipelines, descriptors, commands, sync, and the surface and swapchain frames are drawn into |
-| `app`, `timings` | The instance, and each frame's GPU timestamps |
+| `app` | The instance, and the window or headless images it draws to |
 
 The shaders in `assets/shader` share `common.slang`, which includes one file of `common/` for
 each concept: the data shared with the CPU, the bindings, voxels, materials, ambient

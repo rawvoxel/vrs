@@ -4,7 +4,7 @@
 [[vk::binding(1, 0)]] StructuredBuffer<uint> vertexWords;
 [[vk::binding(2, 0)]] StructuredBuffer<MeshInfo> meshes;
 // Every chunk's voxel types, laid out as `voxel::VoxelTypes` packs them, then its occupancy,
-// then its probe cells' words and voxel masks, see `lighting::gi::bake_probe_cells`.
+// then its probe cells' words and voxel masks, see `renderer::lighting::probes::bake_probe_cells`.
 [[vk::binding(3, 0)]] StructuredBuffer<uint> typeWords;
 // Materials indexed by voxel type.
 [[vk::binding(4, 0)]] StructuredBuffer<Material> palette;

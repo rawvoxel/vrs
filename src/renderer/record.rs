@@ -2,8 +2,10 @@
 
 use super::{Renderer, frame::FrameData};
 use crate::{
-    culling::{DRAW_STRIDE, Phase},
-    timings::GpuStage,
+    renderer::{
+        culling::{DRAW_STRIDE, Phase},
+        timings::GpuStage,
+    },
     vulkan::image,
 };
 use ash::{prelude::VkResult, vk};

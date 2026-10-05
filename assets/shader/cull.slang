@@ -4,7 +4,7 @@
 // phase 1 draws what was visible last frame, phase 2 tests everything against the
 // pyramid, draws what's newly visible and remembers what's visible for next frame.
 
-// Matches `mesh::MeshInfo`, and `MeshInfo` in `common.slang`.
+// Matches `renderer::mesh_pool::MeshInfo`, and `MeshInfo` in `common.slang`.
 struct MeshInfo {
     float3 boundsMin;
     uint indexCount;
@@ -32,12 +32,12 @@ struct DrawIndexedIndirectCommand {
     uint firstInstance;
 };
 
-// Matches `culling::Phase`.
+// Matches `renderer::culling::Phase`.
 static const uint PHASE_FRUSTUM = 0;
 static const uint PHASE_LAST_VISIBLE = 1;
 static const uint PHASE_OCCLUSION = 2;
 
-// Matches `culling::CullParams`.
+// Matches `renderer::culling::CullParams`.
 struct CullParams {
     // Rows of the view projection matrix.
     float4 viewProj[4];
@@ -73,7 +73,7 @@ bool inFrustum(MeshInfo mesh) {
     float4 y = params.viewProj[1];
     float4 z = params.viewProj[2];
     float4 w = params.viewProj[3];
-    // Inward facing for Vulkan's 0..1 depth, matches `culling::frustum_planes`.
+    // Inward facing for Vulkan's 0..1 depth, matches `renderer::culling::frustum_planes`.
     float4 planes[6] = { w + x, w - x, w + y, w - y, z, w - z };
     for (uint i = 0; i < 6; i++) {
         float4 plane = planes[i];

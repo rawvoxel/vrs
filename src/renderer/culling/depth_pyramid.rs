@@ -8,7 +8,7 @@ use crate::vulkan::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-const HIZ_SPV: &[u8] = include_bytes!("../../assets/shader/hiz.spv");
+const HIZ_SPV: &[u8] = include_bytes!("../../../assets/shader/hiz.spv");
 /// Matches `numthreads` in `hiz.slang`.
 const WORKGROUP_SIZE: u32 = 8;
 const PYRAMID_FORMAT: vk::Format = vk::Format::R32_SFLOAT;

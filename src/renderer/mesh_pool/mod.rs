@@ -1,9 +1,21 @@
-use super::{
-    Mesh, MeshCapacity, MeshId, MeshKind, info::MeshInfo, range_allocator::RangeAllocator,
-    staging::UploadStaging,
-};
+//! The buffers every mesh shares: vertices, indices, voxel types and the records culling and
+//! drawing read, which meshes are suballocated in, staged into, and repacked to defragment or
+//! grow.
+
+mod info;
+mod mesh;
+mod range_allocator;
+mod repack;
+mod staging;
+
+pub(crate) use info::MeshInfo;
+pub use mesh::{Mesh, MeshKind};
+
+use range_allocator::RangeAllocator;
+use staging::UploadStaging;
+
 use crate::{
-    mesh::Index,
+    mesh::{Index, MeshId},
     vulkan::{
         adapter::Adapter,
         buffer::{Buffer, create_device_local_buffer},
@@ -13,6 +25,32 @@ use crate::{
 use ash::{prelude::VkResult, vk};
 use glam::Vec3;
 use std::slice;
+
+/// How much a `MeshPool` holds when created. It grows when `RendererConfig::grow_mesh_pool` allows.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshCapacity {
+    /// Every kind of vertex shares the buffer, see `MeshKind::words_per_vertex`.
+    pub vertex_words: u32,
+    pub indices: u32,
+    /// Chunks' packed voxel types, see `voxel::VoxelTypes`, each chunk's occupancy, one bit
+    /// per block of `voxel::OCCUPANCY_BLOCK`³ voxels, and for chunks a multiple of 16 voxels
+    /// wide, a word per 16³ voxels of where its light probe goes and a bit of whether it has
+    /// voxels.
+    pub type_words: u32,
+    pub meshes: u32,
+}
+
+impl Default for MeshCapacity {
+    /// 32 MiB of vertices, 16 MiB each of indices and voxel types, and 5 MiB of mesh records.
+    fn default() -> Self {
+        Self {
+            vertex_words: 1 << 23,
+            indices: 1 << 22,
+            type_words: 1 << 22,
+            meshes: 1 << 16,
+        }
+    }
+}
 
 /// Bytes in a word of the vertex and type buffers.
 pub(super) const WORD_SIZE: vk::DeviceSize = size_of::<u32>() as vk::DeviceSize;

@@ -3,25 +3,23 @@
 //! occlusion, and reflections off glossy voxels, then exposed and tonemapped.
 
 mod debug_view;
-mod lights;
-mod probes;
-mod shadow_grid;
-mod shadow_pass;
+pub(crate) mod lights;
+pub(crate) mod probes;
+pub(crate) mod shadows;
 mod sky;
 mod tonemapping;
 
 pub use debug_view::DebugView;
-pub(super) use probes::Convergence;
-pub use shadow_grid::{MAX_SHADOW_LEVELS, ShadowGrid};
-pub use shadow_pass::{MAX_SHADOWED_LIGHTS, ShadowResolution};
+pub use lights::{Light, MAX_LIGHTS, Spot};
+pub use probes::{GiConfig, MAX_CASCADES, ProbeTuning};
+pub use shadows::{MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS, ShadowGrid, ShadowResolution};
 pub use sky::Sky;
 pub use tonemapping::Tonemapping;
 
 use super::Renderer;
-use crate::lighting::gi::ProbeTuning;
 use ash::prelude::VkResult;
 use glam::{Mat4, Vec3};
-use shadow_grid::SHADOW_TABLE_CHUNKS;
+use shadows::SHADOW_TABLE_CHUNKS;
 
 /// How chunk meshes are lit, see `Renderer::lighting`. Colored meshes keep their own colors.
 ///

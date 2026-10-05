@@ -1,7 +1,7 @@
 // The data the CPU shares with the shaders: mesh records, uniforms, lights, materials and probes,
 // each matching its Rust struct, and the limits they're sized by.
 
-// Matches `mesh::MeshInfo`, and `MeshInfo` in `cull.slang`.
+// Matches `renderer::mesh_pool::MeshInfo`, and `MeshInfo` in `cull.slang`.
 struct MeshInfo {
     float3 boundsMin;
     uint indexCount;
@@ -19,7 +19,7 @@ struct MeshInfo {
     uint probesBase;
 };
 
-// Matches `mesh::MeshKind`.
+// Matches `renderer::mesh_pool::MeshKind`.
 static const uint KIND_COLORED = 0;
 static const uint KIND_GREEDY = 1;
 static const uint KIND_PACKED = 2;
@@ -29,7 +29,7 @@ static const uint KIND_LIT = 3;
 // Matches `renderer::MAX_SHADOW_LEVELS`.
 static const int MAX_SHADOW_LEVELS = 4;
 // The most cascades of light probes, each spaced twice as far apart as the last. Matches
-// `lighting::gi::MAX_CASCADES`.
+// `renderer::lighting::probes::MAX_CASCADES`.
 static const int MAX_CASCADES = 4;
 
 // Matches `renderer::LightingUniforms`.
@@ -55,7 +55,7 @@ struct LightingUniforms {
     float4 sky[3];
 };
 
-// Matches `lighting::gi::GiUniforms`.
+// Matches `renderer::lighting::probes::GiUniforms`.
 struct GiUniforms {
     // Each cascade's probe cell at its low corner, in its own cells, w is 1 when the probes
     // light the frame.
@@ -75,7 +75,7 @@ struct GiUniforms {
     float4 rays;
 };
 
-// Matches `lighting::shadows::ShadowUniforms`.
+// Matches `renderer::lighting::shadows::pass::ShadowUniforms`.
 struct ShadowUniforms {
     // From clip space back to the world.
     float4x4 inverseViewProj;
@@ -90,7 +90,7 @@ struct ShadowUniforms {
     uint4 lights;
 };
 
-// A point or spot light. Matches `lighting::lights::GpuLight`.
+// A point or spot light. Matches `renderer::lighting::lights::GpuLight`.
 struct Light {
     // The position, then how far its light reaches, in world units.
     float4 positionRange;
@@ -110,7 +110,7 @@ struct Material {
     float4 emissionMetalness;
 };
 
-// Matches `shader::uniforms::FrameUniforms`.
+// Matches `renderer::shader::uniforms::FrameUniforms`.
 struct Uniforms {
     float4x4 model;
     float4x4 view;
@@ -120,8 +120,8 @@ struct Uniforms {
     ShadowUniforms shadow;
 };
 
-// A light probe, matches `lighting::gi::volume::PROBE_SIZE`. Positions are in the shadow grid's
-// finest voxels, cells in its cascade's.
+// A light probe, matches `renderer::lighting::probes::volume::PROBE_SIZE`. Positions are in the
+// shadow grid's finest voxels, cells in its cascade's.
 struct Probe {
     // The probe cell the probe's slot holds.
     int3 cell;

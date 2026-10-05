@@ -4,9 +4,14 @@
 //! `gi.slang`.
 
 mod cells;
+mod convergence;
 mod volume;
 
+use crate::renderer::Renderer;
+use glam::{IVec3, Mat4, Quat};
+
 pub(crate) use cells::bake_probe_cells;
+pub(in crate::renderer) use convergence::Convergence;
 pub(crate) use volume::ProbeVolume;
 
 /// Voxels along each edge of a probe's cell, and between neighboring probes, in the finest
@@ -104,4 +109,92 @@ impl Default for ProbeTuning {
             update_interval: 4,
         }
     }
+}
+
+/// The longest `ProbeTuning::update_interval`.
+const MAX_UPDATE_INTERVAL: u32 = 16;
+
+impl Renderer {
+    /// Whether this frame updates and samples the light probes, see `Lighting::global_illumination`.
+    pub(in crate::renderer) fn gi_enabled(&self) -> bool {
+        self.gi_configured
+            && self.lighting.global_illumination
+            && self
+                .lighting
+                .shadow_grid
+                .is_some_and(|grid| grid.voxels_per_edge.is_multiple_of(PROBE_CELL))
+    }
+
+    /// The light probes' uniforms, their volume centered on the camera.
+    pub(in crate::renderer) fn gi_uniforms(&self, view: Mat4) -> GiUniforms {
+        let camera = view.inverse().w_axis.truncate();
+        let counts = self.probe_volume.counts;
+        let cascades = self.probe_volume.cascades;
+        let tuning = self.lighting.probe_tuning;
+        let mut uniforms = GiUniforms {
+            volume_counts: [
+                counts[0],
+                counts[1],
+                counts[2],
+                self.probe_volume.atlas_columns,
+            ],
+            ray_rotation: random_rotation(self.frame_number).to_array(),
+            camera_position: camera.extend(1.0).to_array(),
+            tuning: [
+                tuning.hysteresis.clamp(0.0, 1.0),
+                tuning.depth_hysteresis.clamp(0.0, 1.0),
+                tuning.depth_sharpness.max(1.0),
+                tuning.self_shadow_bias.max(0.0),
+            ],
+            rays: [
+                tuning.ray_distance.max(0.0),
+                self.hysteresis_scale[0],
+                self.hysteresis_scale[1],
+                0.0,
+            ],
+            frame: [
+                self.frame_number as u32,
+                self.probe_volume.rays_per_frame,
+                cascades,
+                tuning
+                    .update_interval
+                    .clamp(1, MAX_UPDATE_INTERVAL)
+                    .next_power_of_two(),
+            ],
+            ..Default::default()
+        };
+        if self.gi_enabled()
+            && let Some(grid) = self.lighting.shadow_grid
+        {
+            for cascade in 0..cascades {
+                let cell_size = grid.voxel_size * (PROBE_CELL << cascade) as f32;
+                let center = (camera / cell_size).floor().as_ivec3();
+                let half = IVec3::from_array(counts.map(|count| count as i32 / 2));
+                uniforms.volume_mins[cascade as usize] = (center - half).extend(1).to_array();
+            }
+        }
+        uniforms
+    }
+}
+
+/// A rotation uniformly random over every rotation, the same for the same `seed` [Shoemake 1992].
+fn random_rotation(seed: u64) -> Quat {
+    // SplitMix64, for three well mixed numbers from consecutive seeds.
+    let mut state = seed;
+    let mut next = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) >> 11) as f32 / (1u64 << 53) as f32
+    };
+    let (u1, u2, u3) = (next(), next(), next());
+    let tau = std::f32::consts::TAU;
+    let (a, b) = ((1.0 - u1).sqrt(), u1.sqrt());
+    Quat::from_xyzw(
+        a * (tau * u2).sin(),
+        a * (tau * u2).cos(),
+        b * (tau * u3).sin(),
+        b * (tau * u3).cos(),
+    )
 }

@@ -2,8 +2,10 @@
 
 use super::{GiConfig, MAX_CASCADES};
 use crate::{
-    shader::bindings,
-    timings::{FrameTimestamps, GpuStage},
+    renderer::{
+        shader::bindings,
+        timings::{FrameTimestamps, GpuStage},
+    },
     vulkan::{
         adapter::Adapter, buffer::Buffer, image::StorageImage, pipeline::create_shader_module,
         sync::cmd_memory_barrier,
@@ -12,7 +14,7 @@ use crate::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-const GI_SPV: &[u8] = include_bytes!("../../../assets/shader/gi.spv");
+const GI_SPV: &[u8] = include_bytes!("../../../../assets/shader/gi.spv");
 /// Interior texels along a probe's irradiance and distance maps, each with a one texel border.
 /// Match `IRRADIANCE_TEXELS` and `DEPTH_TEXELS` in `common/probe_volume.slang`.
 const IRRADIANCE_TEXELS: u32 = 8;

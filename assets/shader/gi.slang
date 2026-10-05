@@ -11,20 +11,20 @@
 #define GI_WRITES
 #include "common.slang"
 
-// Matches `lighting::gi::volume::ACTIVE_LIST`: tracing's group counts, the updates' group counts,
-// how many probes are listed and how many rays each traces come first.
+// Matches `renderer::lighting::probes::volume::ACTIVE_LIST`: tracing's group counts, the updates'
+// group counts, how many probes are listed and how many rays each traces come first.
 static const uint ACTIVE_LIST = 8;
 static const uint ACTIVE_TRACE_GROUPS = 0;
 static const uint ACTIVE_UPDATE_GROUPS = 3;
 static const uint ACTIVE_COUNT = 6;
 static const uint ACTIVE_RAYS = 7;
 // The fewest rays a probe traces in a frame, which matches
-// `lighting::gi::volume::MIN_RAYS_PER_PROBE`, and the most.
+// `renderer::lighting::probes::volume::MIN_RAYS_PER_PROBE`, and the most.
 static const uint MIN_RAYS_PER_PROBE = 32;
 static const uint MAX_RAYS_PER_PROBE = 256;
 // Rays traced by each group of `traceProbeRays`, the fewest a probe traces.
 static const uint TRACE_GROUP = MIN_RAYS_PER_PROBE;
-// Matches `lighting::gi::cells::CELL_PLACED`.
+// Matches `renderer::lighting::probes::cells::CELL_PLACED`.
 static const uint CELL_PLACED = 1u << 31;
 // The probe's cage's diagonal, plus as far as a probe can be off its cell's center, for the
 // finest cascade. Rays going further are left out of the distance maps, so a texel's rays
@@ -54,9 +54,9 @@ uint updatePeriod(uint slot, uint fast) {
 // Where cascade `cascade`'s probe cell `cell` puts its probe, in the finest voxels, false when it
 // has no room for one. From the chunk of the finest level holding the cell's center, see
 // `chunkAtPoint`: one of the cascade's level has its cells baked when it was added, see
-// `lighting::gi::bake_probe_cells`, a finer one has the baked cell holding the center. A coarser
-// one's voxels are bigger than the cell, its probe is at its center when that's empty. A cell
-// without a chunk is empty, with its probe at its center.
+// `renderer::lighting::probes::bake_probe_cells`, a finer one has the baked cell holding the
+// center. A coarser one's voxels are bigger than the cell, its probe is at its center when that's
+// empty. A cell without a chunk is empty, with its probe at its center.
 bool probePlacement(int cascade, int3 cell, out float3 position) {
     int spacing = PROBE_CELL << cascade;
     float3 center = (float3(cell) + 0.5) * float(spacing);
