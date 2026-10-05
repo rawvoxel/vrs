@@ -6,9 +6,11 @@
 use ash::prelude::VkResult;
 use glam::{Vec3, Vec3Swizzles};
 use vrs::{
-    mesh::{Index, MeshId},
+    mesh::{
+        AxisAlignedVertex, Face, Index, MeshId,
+        chunk::{ChunkMesh, ChunkVertices, VoxelTypes},
+    },
     renderer::Renderer,
-    voxel::{ChunkMesh, ChunkVertices, Face, GreedyVertex, VoxelTypes},
 };
 
 /// Voxels along each edge of a chunk, one per bit of a word.
@@ -67,7 +69,7 @@ impl ChunkMask {
 #[derive(Default)]
 pub struct GreedyMesh {
     pub indices: Vec<Index>,
-    pub vertices: Vec<GreedyVertex>,
+    pub vertices: Vec<AxisAlignedVertex>,
 }
 
 /// Meshes the faces of `mask`'s voxels wherever the neighbor across the face is empty.
@@ -212,7 +214,7 @@ fn push_quad(mesh: &mut GreedyMesh, n: usize, plane: f32, b: f32, c: f32, h: f32
 
     let face = Face::ALL[n];
     mesh.vertices.extend(vertices.map(|vertex| {
-        GreedyVertex::new(vertex, face, EDGE as u32).expect("Quads stay inside the chunk.")
+        AxisAlignedVertex::new(vertex, face, EDGE as u32).expect("Quads stay inside the chunk.")
     }));
 }
 
@@ -243,7 +245,7 @@ pub fn create_chunk(
     renderer
         .create_chunk_mesh(&ChunkMesh {
             indices: &mesh.indices,
-            vertices: ChunkVertices::Greedy(&mesh.vertices),
+            vertices: ChunkVertices::AxisAligned(&mesh.vertices),
             origin,
             voxel_size,
             types: &VoxelTypes::pack(EDGE as u32, types),

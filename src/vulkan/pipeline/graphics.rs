@@ -1,6 +1,6 @@
 //! The renderer's graphics pipelines.
 
-use crate::{mesh::Vertex, vulkan::surface::Surface};
+use crate::vulkan::surface::Surface;
 use ash::{prelude::VkResult, vk};
 use std::{ffi::CStr, slice};
 
@@ -33,14 +33,13 @@ pub enum PipelinePass {
 }
 
 /// The renderer's pipeline drawing into `surface`, with the vertex and fragment shaders of
-/// `entries`, the fragment shader unused for `PipelinePass::DepthOnly`. With `vertex_input`
-/// it reads `Vertex`es from a vertex buffer, without, the vertex shader pulls its own.
+/// `entries`, the fragment shader unused for `PipelinePass::DepthOnly`. There's no vertex
+/// buffer, the vertex shader pulls its own vertices, as triangle lists.
 pub fn create_graphics_pipeline(
     surface: &Surface,
     render_device: &ash::Device,
     shader_module: vk::ShaderModule,
     entries: (&CStr, &CStr),
-    vertex_input: bool,
     pass: PipelinePass,
     pipeline_layout: vk::PipelineLayout,
 ) -> VkResult<vk::Pipeline> {
@@ -73,15 +72,10 @@ pub fn create_graphics_pipeline(
         _ => &all_stages[..],
     };
 
-    let vertex_input_state_info = match vertex_input {
-        true => vk::PipelineVertexInputStateCreateInfo::default()
-            .vertex_attribute_descriptions(&Vertex::VERTEX_ATTRIBUTE_DESCRIPTIONS)
-            .vertex_binding_descriptions(&Vertex::VERTEX_BINDING_DESCRIPTIONS),
-        false => vk::PipelineVertexInputStateCreateInfo::default(),
-    };
+    let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::default();
 
-    let vertex_input_assembly_state_info =
-        vk::PipelineInputAssemblyStateCreateInfo::default().topology(Vertex::VERTEX_TOPOLOGY);
+    let vertex_input_assembly_state_info = vk::PipelineInputAssemblyStateCreateInfo::default()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
 
     let viewport_state_info = vk::PipelineViewportStateCreateInfo::default()
         .viewport_count(1)

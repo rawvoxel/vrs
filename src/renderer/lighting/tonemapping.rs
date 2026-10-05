@@ -1,7 +1,7 @@
 //! Bringing shaded colors into the display's range.
 
 /// How `Lighting::exposure`d colors brighter than the display shows are brought into its
-/// range, see `Lighting::tonemapping`. Colored meshes keep their own colors.
+/// range, see `Lighting::tonemapping`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Tonemapping {

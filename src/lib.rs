@@ -3,7 +3,6 @@
 mod app;
 pub mod mesh;
 pub mod renderer;
-pub mod voxel;
 pub mod vulkan;
 
 pub use app::App;

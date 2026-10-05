@@ -32,7 +32,7 @@ use vrs::{
     App,
     mesh::MeshId,
     renderer::{
-        Capture, DrawList, GiConfig, Light, Lighting, Material, Renderer, RendererConfig,
+        Capture, DrawList, Light, Lighting, Material, ProbeConfig, Renderer, RendererConfig,
         ShadowGrid, ShadowResolution, Spot,
     },
 };
@@ -231,7 +231,7 @@ struct Scene<'a> {
     coarse: Option<Voxels<'a>>,
     /// The shadow grid's levels.
     levels: u32,
-    gi: GiConfig,
+    probes: ProbeConfig,
     lighting: Lighting,
     lights: &'a [Light],
     /// Then `CHANGE_FRAMES` frames of these voxels and this lighting.
@@ -244,7 +244,7 @@ impl<'a> Scene<'a> {
             voxels,
             coarse: None,
             levels: 1,
-            gi: GiConfig::default(),
+            probes: ProbeConfig::default(),
             lighting,
             lights: &[],
             change: None,
@@ -264,8 +264,8 @@ impl<'a> Scene<'a> {
         }
     }
 
-    fn gi(self, gi: GiConfig) -> Self {
-        Self { gi, ..self }
+    fn probes(self, probes: ProbeConfig) -> Self {
+        Self { probes, ..self }
     }
 
     fn change(self, voxels: Voxels<'a>, lighting: Lighting) -> Self {
@@ -320,7 +320,7 @@ fn create_scene(renderer: &mut Renderer, scene: &Scene, voxels: Voxels) -> VkRes
 /// frames can't be captured.
 fn render(app: &App, scene: Scene, view: View) -> VkResult<Option<Vec<f32>>> {
     let config = RendererConfig {
-        global_illumination: Some(scene.gi),
+        global_illumination: Some(scene.probes),
         ..Default::default()
     };
     let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, config)?;
@@ -340,7 +340,6 @@ fn render(app: &App, scene: Scene, view: View) -> VkResult<Option<Vec<f32>>> {
             meshes: &meshes,
             view: view_matrix,
             proj,
-            ..Default::default()
         };
         (0..count).try_for_each(|_| renderer.submit(WIDTH, HEIGHT, &draws))
     };
@@ -404,16 +403,16 @@ fn sky_floor(checks: &mut Checks) -> VkResult<()> {
 
 /// No light leaks into a sealed box, at full and half shadow resolution, and with cascades.
 fn sealed_box(checks: &mut Checks) -> VkResult<()> {
-    let four_cascades = GiConfig {
+    let four_cascades = ProbeConfig {
         cascades: 4,
-        ..GiConfig::default()
+        ..ProbeConfig::default()
     };
     for (how, scene) in [
         ("", Scene::new(&shell, bright())),
         (" at half resolution", Scene::new(&shell, half(bright()))),
         (
             " with 4 cascades",
-            Scene::new(&shell, bright()).gi(four_cascades),
+            Scene::new(&shell, bright()).probes(four_cascades),
         ),
     ] {
         let lit = fraction_over(&checks.render(scene, BOX_VIEW)?, UNLIT);
@@ -772,12 +771,12 @@ fn coarse_chunks_and_cascades(checks: &mut Checks) -> VkResult<()> {
 /// Coarser cascades bring bounced light to more of a box than too few probes cover.
 fn cascades(checks: &mut Checks) -> VkResult<()> {
     let lit = |cascades| -> VkResult<f32> {
-        let few = GiConfig {
+        let few = ProbeConfig {
             probe_counts: [4; 3],
             cascades,
-            ..GiConfig::default()
+            ..ProbeConfig::default()
         };
-        let frame = checks.render(Scene::new(&holed, sun_only()).gi(few), HOLE_VIEW)?;
+        let frame = checks.render(Scene::new(&holed, sun_only()).probes(few), HOLE_VIEW)?;
         Ok(fraction_over(&frame, BOUNCED))
     };
     let (one, four) = (lit(1)?, lit(4)?);

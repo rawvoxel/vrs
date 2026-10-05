@@ -21,9 +21,8 @@ struct MeshInfo {
 
 // Matches `renderer::mesh_pool::MeshKind`.
 static const uint KIND_COLORED = 0;
-static const uint KIND_GREEDY = 1;
+static const uint KIND_AXIS_ALIGNED = 1;
 static const uint KIND_PACKED = 2;
-static const uint KIND_LIT = 3;
 
 // The most levels of chunks the shadow grid has, each of voxels twice as big as the last.
 // Matches `renderer::MAX_SHADOW_LEVELS`.
@@ -55,8 +54,8 @@ struct LightingUniforms {
     float4 sky[3];
 };
 
-// Matches `renderer::lighting::probes::GiUniforms`.
-struct GiUniforms {
+// Matches `renderer::lighting::probes::ProbeUniforms`.
+struct ProbeUniforms {
     // Each cascade's probe cell at its low corner, in its own cells, w is 1 when the probes
     // light the frame.
     int4 volumeMins[MAX_CASCADES];
@@ -112,11 +111,10 @@ struct Material {
 
 // Matches `renderer::shader::uniforms::FrameUniforms`.
 struct Uniforms {
-    float4x4 model;
     float4x4 view;
     float4x4 proj;
     LightingUniforms lighting;
-    GiUniforms gi;
+    ProbeUniforms probeVolume;
     ShadowUniforms shadow;
 };
 

@@ -7,7 +7,7 @@
 //! second and how long frames take on the GPU.
 //!
 //! First, a renderer failing partway through being built must leak nothing, and the lighting
-//! is checked against scenes with known answers, see `gi`.
+//! is checked against scenes with known answers, see `probes`.
 //!
 //! Then a grid of chunk meshes sits behind a wall mesh. Scenarios cull it with different cameras,
 //! remesh chunks every frame against a nearly full mesh pool, and resize and
@@ -23,10 +23,10 @@
 
 #[path = "../common/camera.rs"]
 mod camera;
-mod gi;
 #[path = "../common/greedy.rs"]
 mod greedy;
 mod pixels;
+mod probes;
 mod scenarios;
 mod scene;
 mod target;
@@ -163,10 +163,10 @@ impl Stress {
         self.check_messages("failed construction");
     }
 
-    /// The light probes' lighting of scenes with known answers, see `gi`.
+    /// The light probes' lighting of scenes with known answers, see `probes`.
     fn check_global_illumination(&mut self, app: &App) {
         println!("global illumination");
-        match gi::check(app) {
+        match probes::check(app) {
             Ok(Some(failures)) => {
                 for failure in failures {
                     self.fail(format!("global illumination: {failure}"));
@@ -272,7 +272,6 @@ impl Stress {
             meshes: &live,
             view,
             proj,
-            ..Default::default()
         };
         scene
             .renderer

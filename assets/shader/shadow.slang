@@ -127,7 +127,7 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
     }
     float4 world = mul(ubo.shadow.inverseViewProj, float4(uv * 2.0 - 1.0, depth, 1.0));
     float3 position = world.xyz / world.w;
-    float3 camera = ubo.gi.cameraPosition.xyz;
+    float3 camera = ubo.probeVolume.cameraPosition.xyz;
     float distance = length(position - camera);
     // Rays start just off the surface toward the camera, which is always on its open side.
     float3 toCamera = (camera - position) / max(distance, 1e-6);
@@ -155,9 +155,9 @@ void traceShadows(uint3 threadId: SV_DispatchThreadID) {
             float face = float(faceNumber(surface.normal));
             if (lightsIndirect) {
                 float3 light = indirectLight(onFace, surface.normal, toCamera, false);
-                // Only greedy faces are darkened, as when each pixel finds its own.
+                // Only axis aligned faces are darkened, as when each pixel finds its own.
                 float occlusionStrength = ubo.lighting.options.x;
-                if (occlusionStrength > 0.0 && meshes[surface.mesh].kind == KIND_GREEDY) {
+                if (occlusionStrength > 0.0 && meshes[surface.mesh].kind == KIND_AXIS_ALIGNED) {
                     float3 inLevel = onFace / float(1 << surface.level);
                     light *= lerp(1.0, gridOpenness(surface.level, inLevel, int3(surface.normal)), occlusionStrength);
                 }

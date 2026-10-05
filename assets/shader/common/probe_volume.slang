@@ -13,7 +13,8 @@ static const float IRRADIANCE_GAMMA = 5.0;
 
 // Probes in each cascade.
 uint probesPerCascade() {
-    return ubo.gi.volumeCounts.x * ubo.gi.volumeCounts.y * ubo.gi.volumeCounts.z;
+    uint3 counts = ubo.probeVolume.volumeCounts.xyz;
+    return counts.x * counts.y * counts.z;
 }
 
 // The cascade of the probe in slot `slot`.
@@ -24,8 +25,8 @@ int cascadeOf(uint slot) {
 // The slot of the probe of cascade `cascade`'s probe cell `cell`, false outside it.
 bool probeSlot(int cascade, int3 cell, out uint slot) {
     slot = 0;
-    int3 counts = int3(ubo.gi.volumeCounts.xyz);
-    int3 relative = cell - ubo.gi.volumeMins[cascade].xyz;
+    int3 counts = int3(ubo.probeVolume.volumeCounts.xyz);
+    int3 relative = cell - ubo.probeVolume.volumeMins[cascade].xyz;
     if (any(relative < 0) || any(relative >= counts)) {
         return false;
     }
@@ -36,8 +37,8 @@ bool probeSlot(int cascade, int3 cell, out uint slot) {
 
 // Where direction `direction` of slot `slot`'s map of `texels` interior texels is in its atlas.
 float2 atlasUV(uint slot, float3 direction, int texels) {
-    uint columns = ubo.gi.volumeCounts.w;
-    uint rows = (probesPerCascade() * ubo.gi.frame.z + columns - 1) / columns;
+    uint columns = ubo.probeVolume.volumeCounts.w;
+    uint rows = (probesPerCascade() * ubo.probeVolume.frame.z + columns - 1) / columns;
     int tile = texels + 2;
     float2 tileMin = float2(slot % columns, slot / columns) * tile;
     float2 texel = tileMin + 1.0 + (octahedralEncode(direction) * 0.5 + 0.5) * texels;
@@ -56,14 +57,15 @@ float2 atlasUV(uint slot, float3 direction, int texels) {
 // moved off center blend smoothly [Roháček 2022].
 float3 sampleIrradiance(int cascade, float3 position, float3 normal, float3 toViewer, uint minUpdates, out float coverage, out bool found) {
     float spacing = float(PROBE_CELL << cascade);
-    float3 biased = position + (normal * 0.2 + toViewer * 0.8) * (0.75 * spacing * ubo.gi.tuning.w);
+    float bias = 0.75 * spacing * ubo.probeVolume.tuning.w;
+    float3 biased = position + (normal * 0.2 + toViewer * 0.8) * bias;
     // Probes sit at the centers of their cells unless voxels are in the way.
     float3 gridPosition = biased / spacing - 0.5;
     int3 base = int3(floor(gridPosition));
     float3 alpha = gridPosition - float3(base);
 
-    float3 relative = gridPosition - float3(ubo.gi.volumeMins[cascade].xyz);
-    float3 edgeDistance = min(relative, float3(ubo.gi.volumeCounts.xyz) - 1.0 - relative);
+    float3 relative = gridPosition - float3(ubo.probeVolume.volumeMins[cascade].xyz);
+    float3 edgeDistance = min(relative, float3(ubo.probeVolume.volumeCounts.xyz) - 1.0 - relative);
     coverage = saturate(min(edgeDistance.x, min(edgeDistance.y, edgeDistance.z)));
     found = false;
     if (coverage <= 0.0) {

@@ -130,7 +130,6 @@ impl ApplicationHandler for Cube {
                     meshes: &[&vulkan.cube],
                     view,
                     proj,
-                    ..Default::default()
                 };
                 vulkan
                     .renderer

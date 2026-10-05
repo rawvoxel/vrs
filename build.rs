@@ -1,11 +1,10 @@
 use std::{path::Path, process::Command};
 
 fn main() {
-    // Included by `mesh.slang`, `gi.slang`, `shadow.slang`, `probes.slang` and `sky.slang`,
-    // and including each of `common/`.
+    // Included by `mesh.slang`, `probes.slang`, `shadow.slang`, `probe_overlay.slang` and
+    // `sky.slang`, and including each of `common/`.
     println!("cargo:rerun-if-changed=assets/shader/common.slang");
     println!("cargo:rerun-if-changed=assets/shader/common");
-    compile_slang_spv("shader.slang", "slang.spv", &["vertMain", "fragMain"]);
     compile_slang_spv("cull.slang", "cull.spv", &["cullMain"]);
     compile_slang_spv("hiz.slang", "hiz.spv", &["reduceMain"]);
     compile_slang_spv("mesh.slang", "mesh.spv", &["meshVert", "meshFrag"]);
@@ -14,11 +13,15 @@ fn main() {
         "shadow.spv",
         &["cullLights", "traceShadows"],
     );
-    compile_slang_spv("probes.slang", "probes.spv", &["probeVert", "probeFrag"]);
+    compile_slang_spv(
+        "probe_overlay.slang",
+        "probe_overlay.spv",
+        &["probeVert", "probeFrag"],
+    );
     compile_slang_spv("sky.slang", "sky.spv", &["skyVert", "skyFrag"]);
     compile_slang_spv(
-        "gi.slang",
-        "gi.spv",
+        "probes.slang",
+        "probes.spv",
         &[
             "classifyProbes",
             "planRays",

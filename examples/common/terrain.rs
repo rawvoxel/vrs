@@ -9,7 +9,7 @@ use glam::{Mat4, Vec3};
 use vrs::{
     mesh::MeshId,
     renderer::{
-        GiConfig, MeshCapacity, Renderer, RendererConfig, ShadowGrid, ShadowResolution, Sky,
+        MeshCapacity, ProbeConfig, Renderer, RendererConfig, ShadowGrid, ShadowResolution, Sky,
         Tonemapping,
     },
 };
@@ -48,9 +48,9 @@ pub fn config() -> RendererConfig {
             type_words: chunks * (EDGE.pow(3) as u32 / 8 + 96),
             ..MeshCapacity::default()
         },
-        global_illumination: Some(GiConfig {
+        global_illumination: Some(ProbeConfig {
             cascades: 2,
-            ..GiConfig::default()
+            ..ProbeConfig::default()
         }),
         ..RendererConfig::default()
     }

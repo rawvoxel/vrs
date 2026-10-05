@@ -7,7 +7,7 @@ frustum culls them, then occlusion culls them against a depth pyramid in two pha
 what's visible with indirect draws the GPU counts itself. Meshes can be created and destroyed
 every frame, as chunks are remeshed, without stalling.
 
-Chunks use compact vertex formats, 8 bytes a vertex for greedy meshes and 12 for any
+Chunks use compact vertex formats, 8 bytes a vertex for axis aligned faces and 12 for any
 other, and are colored per voxel: each pixel finds the voxel it belongs to in the chunk's
 palette packed voxel types, then that type's material in the renderer's palette.
 
@@ -31,15 +31,15 @@ let app = App::headless(app_info).unwrap();
 let mut renderer = Renderer::new(&app, 800, 600).unwrap();
 
 // Uploaded by the next frame, then drawn every frame it's listed.
-let color = [1.0, 0.0, 0.0];
+let (normal, col) = ([0.0, 0.0, -1.0], [1.0, 0.0, 0.0]);
 let triangle = renderer
     .create_mesh(
         // Counter-clockwise on screen, so it faces the camera.
         &[0, 2, 1],
         &[
-            Vertex { pos: [0.0, -0.5, 0.5], col: color },
-            Vertex { pos: [0.5, 0.5, 0.5], col: color },
-            Vertex { pos: [-0.5, 0.5, 0.5], col: color },
+            Vertex { pos: [0.0, -0.5, 0.5], normal, col },
+            Vertex { pos: [0.5, 0.5, 0.5], normal, col },
+            Vertex { pos: [-0.5, 0.5, 0.5], normal, col },
         ],
     )
     .unwrap();
@@ -60,20 +60,18 @@ drop(renderer);
   `MeshId`s in a `DrawList`. Ids aren't `Copy`, so `destroy_mesh` taking one means a destroyed
   mesh can't be drawn again. Its space is reused once no frame in flight can still draw it.
   Indices are relative to each mesh's first vertex.
-- **Chunk meshes** come from `create_chunk_mesh` and a `voxel::ChunkMesh`: `voxel::GreedyVertex`es
-  for axis aligned faces, which keep a face index instead of a normal, or `voxel::PackedVertex`es
-  for any surface. Positions are chunk local, placed by the chunk's `origin` and `voxel_size`,
-  which includes its LOD. Its `voxel::VoxelTypes` are palette compressed, and already packed
-  words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the
+- **Chunk meshes** come from `create_chunk_mesh` and a `mesh::chunk::ChunkMesh`:
+  `AxisAlignedVertex`es for axis aligned faces, which keep a face index instead of a normal, or
+  `PackedVertex`es for any surface. Positions are chunk local, placed by the chunk's `origin`
+  and `voxel_size`, which includes its LOD. Its `VoxelTypes` are palette compressed, and
+  already packed words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the
   palette from `set_materials`, or `set_palette` for plain colors, 0 is empty space. Cells
   past a chunk's edge take the chunk's own edge voxel, there's no lookup into neighbors, and
   see-through faces are drawn like any other.
-- **Colored meshes** come from `create_mesh`, `mesh::Vertex`es in world space with colors of
-  their own, for anything that isn't a chunk. They aren't lit.
-- **Lit meshes** come from `create_lit_mesh`, `mesh::LitVertex`es in world space with colors
-  and normals of their own, lit like chunks as rough surfaces, for what sits among the voxels
-  without being voxels, such as leaves and grass. They cast no shadows and the light probes
-  don't see them, and a card seen from both sides needs both windings.
+- **Colored meshes** come from `create_mesh`, `mesh::Vertex`es in world space with colors and
+  normals of their own, for what sits among the voxels without being voxels, such as leaves
+  and grass. They're lit like chunks, as rough surfaces, but cast no shadows and the light
+  probes don't see them, and a card seen from both sides needs both windings.
 - **Materials**: each palette entry is a `Material`: a color, light it gives off, roughness,
   metalness, and whether it's see-through. Glowing voxels light what's around them through
   the light probes. See-through voxels, such as glass, are drawn as solid faces, but light
@@ -96,7 +94,7 @@ drop(renderer);
   each block of pixels, which shading upscales by face. That leaves sampling probes out of
   shading, which is most of its cost, so chunks the shadow grid doesn't hold are lit by the
   sky and ground colors alone then.
-  Greedy faces' corners and crevices are darkened by voxel ambient occlusion, from the voxels
+  Axis aligned faces' corners and crevices are darkened by voxel ambient occlusion, from the voxels
   around each face, `Lighting::ambient_occlusion`.
 - **Lights**: `Renderer::lights` holds up to 255 point and spot lights. Each frame lists the
   lights reaching each 16x16 pixel tile, the brightest when more than fit, and each pixel's
@@ -111,13 +109,13 @@ drop(renderer);
 - **Global illumination**: with `RendererConfig::global_illumination`, a volume of light
   probes 16 voxels apart follows the camera, and lights chunks inside it with light bounced
   off the voxels around them, in place of the sky and ground colors. With
-  `GiConfig::cascades`, further volumes follow it too, each with probes twice as far apart,
+  `ProbeConfig::cascades`, further volumes follow it too, each with probes twice as far apart,
   reaching twice as far, for coarser levels of detail. It's dynamic diffuse global
   illumination (Majercik et al. 2019 and 2021):
   - When a chunk is added, each 16³ cell of it bakes where its probe goes: the largest empty
     part of the cell nearest its center, found breadth first, or none when it's solid.
   - The probes with voxels in or next to their cell share a fixed budget of rays,
-    `GiConfig::rays_per_frame`, so the cost stays steady. Each updates every
+    `ProbeConfig::rays_per_frame`, so the cost stays steady. Each updates every
     `ProbeTuning::update_interval` frames, 4 by default, taking turns, and twice as rarely
     in each coarser cascade, but blends in as much more each time, so the light follows
     changes as fast. Each traces its share through the voxels with the same DDA, shades
@@ -140,8 +138,7 @@ drop(renderer);
   instead of the clear color, and chunks fade into it with distance by `Sky::haze_distance`.
   `Lighting::exposure` scales shaded colors, and `Lighting::tonemapping` brings those brighter
   than the display shows into its range, with Reinhard or ACES, rather than clipping them.
-  Both happen as each pixel is shaded, so there's no extra pass. Colored meshes keep their
-  own colors.
+  Both happen as each pixel is shaded, so there's no extra pass.
 - **Debug views**: `Lighting::debug_view` shows all the light reaching chunks, only the
   sun's and lights', only the rest, the ambient occlusion, or the probes drawn as cubes.
 - **Winding**: front faces wind counter-clockwise on screen, backface culling skips the rest.
@@ -152,7 +149,6 @@ drop(renderer);
   doubled when there isn't enough of it. Both copy every mesh into new buffers, stalling
   `create_mesh` until the copies finish, which is rare since the pool doubles each time.
   Without growth, `create_mesh` fails with `ERROR_OUT_OF_DEVICE_MEMORY` when it's full.
-- **Per frame geometry**, such as debug lines, goes in a `DrawList`'s `indices` and `vertices`.
 - **Settings**: a `RendererConfig` for `Renderer::with_config` sets the mesh pool's starting
   size, and starting values for growing it, vsync, occlusion culling and backface culling. At
   runtime `grow_mesh_pool`, `occlusion_culling`, `backface_culling` and `clear_color` are
@@ -184,7 +180,7 @@ cargo run -p vrs --example stress --release
 cargo run -p vrs --example stress --release -- --headless
 ```
 
-- `triangle` is the classic Vulkan triangle, drawn as a colored mesh.
+- `triangle` is the classic Vulkan triangle, drawn as a colored mesh lit head on.
 - `cube` circles a cube of 8³ voxels checkered in two types. Greedy meshing makes each side
   one quad, and the colors still come from the voxels.
 - `materials` circles rows of red lacquer and gold blocks, each rougher than the last, with
@@ -210,7 +206,7 @@ Debug builds run the stress test much slower, but check every Vulkan validation 
 `stress` checks the renderer the way a voxel game uses it and exits with a failure code if
 anything's wrong:
 
-- Voxel chunks behind a wall, greedy and packed, are culled with different cameras. Draw
+- Voxel chunks behind a wall, axis aligned and packed, are culled with different cameras. Draw
   counts read back from the GPU must match the meshes in view, and with occlusion culling,
   at least every mesh the wall can't hide.
 - A wall facing away from the camera must be skipped by backface culling.
@@ -259,15 +255,15 @@ For tests and tools, these stall the GPU unless they say otherwise:
 
 | Module | |
 | --- | --- |
-| `renderer` | `Renderer`, building it, each frame's stages and command recording, and the meshes it holds |
+| `renderer` | `Renderer`, building it, and each frame's stages and command recording |
 | `renderer::lighting` | How chunks are lit: `Lighting`, the sky, tonemapping, debug views, and for each of the shadows, the light probes and the lights, its settings, its GPU resources and passes, and how each frame drives them |
 | `renderer::material` | `Material`s and the palette they're uploaded in |
-| `renderer::mesh_pool` | The buffers every mesh shares, their GPU records, staging, range allocator and repacking |
+| `renderer::mesh_pool` | The buffers every mesh shares, the `Renderer`'s methods adding and removing meshes, their GPU records, staging, range allocator and repacking |
 | `renderer::culling` | GPU culling, and the depth pyramid occlusion culling tests against |
 | `renderer::shader`, `renderer::timings` | What every shader shares, the frame's bindings and uniforms, and each frame's GPU timestamps |
 | `renderer::debug` | Hooks for tests and tools: frame stats, GPU timings and captures |
-| `mesh` | Mesh ids and vertex formats, with octahedral normals |
-| `voxel` | Chunk meshes: compact vertex formats and packed voxel types |
+| `mesh` | Mesh ids, every mesh's vertex formats, and octahedral normals |
+| `mesh::chunk` | Chunk meshes and their packed voxel types |
 | `vulkan` | Vulkan building blocks: GPUs and queues, memory, buffers, images, pipelines, descriptors, commands, sync, and the surface and swapchain frames are drawn into |
 | `app` | The instance, and the window or headless images it draws to |
 

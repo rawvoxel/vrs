@@ -1,7 +1,7 @@
 //! Dynamic diffuse global illumination: cascades of light probes around the camera, each
 //! storing the light reaching it from every direction and how far away the nearest voxels
 //! are, those near voxels traced through them in turns and sampled when shading. See
-//! `gi.slang`.
+//! `probes.slang`.
 
 mod cells;
 mod convergence;
@@ -22,7 +22,7 @@ pub const MAX_CASCADES: u32 = 4;
 
 /// The light probe volumes, see `RendererConfig::global_illumination`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GiConfig {
+pub struct ProbeConfig {
     /// Probes along each axis of each cascade, which is centered on the camera with probes
     /// 16 of the `ShadowGrid`'s finest voxels apart in the first, and twice as far apart in
     /// each next. Each probe takes about 2.9 KB.
@@ -37,7 +37,7 @@ pub struct GiConfig {
     pub rays_per_frame: u32,
 }
 
-impl Default for GiConfig {
+impl Default for ProbeConfig {
     /// One cascade, 512 by 256 by 512 voxels, with 64 Ki rays a frame.
     fn default() -> Self {
         Self {
@@ -48,11 +48,11 @@ impl Default for GiConfig {
     }
 }
 
-/// `Lighting::global_illumination` as the shaders read it. Matches `GiUniforms` in
+/// `Lighting::global_illumination` as the shaders read it. Matches `ProbeUniforms` in
 /// `common/layout.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct GiUniforms {
+pub struct ProbeUniforms {
     /// Each cascade's probe cell at its low corner, in its own cells, w is 1 when the probes
     /// light the frame.
     pub volume_mins: [[i32; 4]; MAX_CASCADES as usize],
@@ -116,8 +116,8 @@ const MAX_UPDATE_INTERVAL: u32 = 16;
 
 impl Renderer {
     /// Whether this frame updates and samples the light probes, see `Lighting::global_illumination`.
-    pub(in crate::renderer) fn gi_enabled(&self) -> bool {
-        self.gi_configured
+    pub(in crate::renderer) fn probes_enabled(&self) -> bool {
+        self.probes_configured
             && self.lighting.global_illumination
             && self
                 .lighting
@@ -126,12 +126,12 @@ impl Renderer {
     }
 
     /// The light probes' uniforms, their volume centered on the camera.
-    pub(in crate::renderer) fn gi_uniforms(&self, view: Mat4) -> GiUniforms {
+    pub(in crate::renderer) fn probe_uniforms(&self, view: Mat4) -> ProbeUniforms {
         let camera = view.inverse().w_axis.truncate();
         let counts = self.probe_volume.counts;
         let cascades = self.probe_volume.cascades;
         let tuning = self.lighting.probe_tuning;
-        let mut uniforms = GiUniforms {
+        let mut uniforms = ProbeUniforms {
             volume_counts: [
                 counts[0],
                 counts[1],
@@ -163,7 +163,7 @@ impl Renderer {
             ],
             ..Default::default()
         };
-        if self.gi_enabled()
+        if self.probes_enabled()
             && let Some(grid) = self.lighting.shadow_grid
         {
             for cascade in 0..cascades {

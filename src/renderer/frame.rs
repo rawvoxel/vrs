@@ -1,10 +1,7 @@
 //! The stages `Renderer::submit` runs a frame in, around recording it.
 
 use super::{DrawList, Renderer};
-use crate::renderer::shader::{
-    bindings,
-    uniforms::{FrameUniforms, MvpMatrices},
-};
+use crate::renderer::shader::{bindings, uniforms::FrameUniforms};
 use ash::{prelude::VkResult, vk};
 use glam::Mat4;
 use std::slice;
@@ -13,10 +10,9 @@ use std::slice;
 pub(super) struct FrameData {
     /// `MeshPool::info_buffer` indices of the frame's meshes.
     pub candidates: Vec<u32>,
-    pub dynamic_index_count: u32,
     pub view_proj: Mat4,
     /// Whether the light probes are updated and sampled.
-    pub gi: bool,
+    pub probes: bool,
     /// Whether the frame's depth is drawn first, for the shadow pass, see
     /// `Renderer::uses_shadow_pass`.
     pub shadow_pass: bool,
@@ -190,27 +186,14 @@ impl Renderer {
             self.write_lights(frame)?;
             let lighting = self.write_lighting(frame, draws.view)?;
             self.write_frame_descriptors(frame);
-            self.frame_index_buffers[frame].write(
-                &self.adapter,
-                &self.render_device,
-                draws.indices,
-            )?;
-            self.frame_vertex_buffers[frame].write(
-                &self.adapter,
-                &self.render_device,
-                draws.vertices,
-            )?;
             lighting
         };
 
         let uniforms = FrameUniforms {
-            matrices: MvpMatrices {
-                model: Mat4::IDENTITY,
-                view: draws.view,
-                proj: draws.proj,
-            },
+            view: draws.view,
+            proj: draws.proj,
             lighting,
-            gi: self.gi_uniforms(draws.view),
+            probe_volume: self.probe_uniforms(draws.view),
             shadow: self.shadow_uniforms(draws.proj * draws.view),
         };
         self.uniform_buffers[frame].mem_write(slice::from_ref(&uniforms));
@@ -221,11 +204,11 @@ impl Renderer {
                 .iter()
                 .map(|id| self.mesh_pool.info_index(id))
                 .collect(),
-            dynamic_index_count: draws.indices.len() as u32,
             view_proj: draws.proj * draws.view,
-            gi: self.gi_enabled(),
+            probes: self.probes_enabled(),
             shadow_pass: self.uses_shadow_pass(),
-            draw_probes: self.lighting.debug_view == super::DebugView::Probes && self.gi_enabled(),
+            draw_probes: self.lighting.debug_view == super::DebugView::Probes
+                && self.probes_enabled(),
             // The ambient occlusion's own view needs each pixel's.
             upscaled_indirect: self.lights_indirect_in_shadow_pass()
                 && self.lighting.debug_view != super::DebugView::AmbientOcclusion,

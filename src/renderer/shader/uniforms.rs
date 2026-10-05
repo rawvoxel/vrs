@@ -1,7 +1,7 @@
 use crate::{
     renderer::{
         LightingUniforms,
-        lighting::{probes::GiUniforms, shadows::ShadowUniforms},
+        lighting::{probes::ProbeUniforms, shadows::ShadowUniforms},
         shader::bindings,
     },
     vulkan::{adapter::Adapter, buffer::Buffer},
@@ -10,33 +10,16 @@ use ash::{prelude::VkResult, vk};
 use glam::Mat4;
 use std::slice;
 
-/// Everything in a frame's uniform buffer. Starts with `MvpMatrices`, all the dynamic
-/// geometry's shader reads, and matches `Uniforms` in `common/layout.slang`.
+/// Everything in a frame's uniform buffer. Matches `Uniforms` in `common/layout.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FrameUniforms {
-    pub matrices: MvpMatrices,
-    pub lighting: LightingUniforms,
-    pub gi: GiUniforms,
-    pub shadow: ShadowUniforms,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MvpMatrices {
-    pub model: Mat4,
+    /// From the world to the camera, and the camera to Vulkan's clip space.
     pub view: Mat4,
     pub proj: Mat4,
-}
-
-impl Default for MvpMatrices {
-    fn default() -> Self {
-        Self {
-            model: Mat4::IDENTITY,
-            view: Mat4::IDENTITY,
-            proj: Mat4::IDENTITY,
-        }
-    }
+    pub lighting: LightingUniforms,
+    pub probe_volume: ProbeUniforms,
+    pub shadow: ShadowUniforms,
 }
 
 /// A mapped `HOST_VISIBLE` buffer the size of `FrameUniforms`.

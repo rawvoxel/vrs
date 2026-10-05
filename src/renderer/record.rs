@@ -11,7 +11,7 @@ use crate::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-/// Vertices `probes.slang` draws each probe's cube with, 2 triangles a face.
+/// Vertices `probe_overlay.slang` draws each probe's cube with, 2 triangles a face.
 const PROBE_CUBE_VERTICES: u32 = 36;
 
 impl Renderer {
@@ -52,7 +52,7 @@ impl Renderer {
             self.mesh_pool
                 .cmd_upload(&self.render_device, frame, cmd_buffer);
             mark(GpuStage::Uploads);
-            if data.gi {
+            if data.probes {
                 self.probe_volume.cmd_update(
                     &self.render_device,
                     cmd_buffer,
@@ -83,7 +83,7 @@ impl Renderer {
                 false => (None, self.mesh_depth_pipeline),
             };
 
-            // Pass 1, with all dynamic geometry when it's shaded
+            // Pass 1
             let clear = vk::AttachmentLoadOp::CLEAR;
             self.cmd_begin_rendering(cmd_buffer, color.map(|view| (view, clear)), clear);
             self.cmd_bind_graphics(cmd_buffer, frame);
@@ -95,9 +95,6 @@ impl Renderer {
                     candidate_count,
                     mesh_pipeline,
                 );
-            }
-            if shaded && data.dynamic_index_count > 0 {
-                self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
             }
             if shaded && !occlusion && data.sky {
                 self.cmd_draw_sky(cmd_buffer);
@@ -157,9 +154,6 @@ impl Renderer {
                             pipeline,
                         );
                     }
-                }
-                if data.dynamic_index_count > 0 {
-                    self.cmd_draw_dynamic(cmd_buffer, frame, data.dynamic_index_count);
                 }
                 if data.sky {
                     self.cmd_draw_sky(cmd_buffer);
@@ -423,27 +417,6 @@ impl Renderer {
             self.render_device
                 .cmd_set_cull_mode(cmd_buffer, vk::CullModeFlags::NONE);
             self.render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
-        }
-    }
-
-    /// Draws the frame's own geometry, from its host visible buffers.
-    fn cmd_draw_dynamic(&self, cmd_buffer: vk::CommandBuffer, frame: usize, index_count: u32) {
-        self.cmd_bind_pipeline(cmd_buffer, self.dynamic_pipeline);
-        unsafe {
-            self.render_device.cmd_bind_index_buffer(
-                cmd_buffer,
-                self.frame_index_buffers[frame].buffer.handle,
-                0,
-                vk::IndexType::UINT32,
-            );
-            self.render_device.cmd_bind_vertex_buffers(
-                cmd_buffer,
-                0,
-                &[self.frame_vertex_buffers[frame].buffer.handle],
-                &[0],
-            );
-            self.render_device
-                .cmd_draw_indexed(cmd_buffer, index_count, 1, 0, 0, 0);
         }
     }
 

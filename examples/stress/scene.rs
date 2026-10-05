@@ -2,15 +2,17 @@
 //!
 //! Chunks are voxel chunks, colored per voxel through the palette. Each is the face of a slab
 //! one voxel thick, half one type and half another, so its color has to come from the voxel
-//! under each pixel, not the face. Every third chunk uses packed vertices, the rest greedy.
+//! under each pixel, not the face. Every third chunk uses packed vertices, the rest axis aligned.
 
 use ash::vk;
 use glam::{Mat4, Vec2, Vec3};
 use vrs::{
     App,
-    mesh::{MeshId, Vertex},
+    mesh::{
+        AxisAlignedVertex, Face, MeshId, PackedVertex, Vertex,
+        chunk::{ChunkMesh, ChunkVertices, VoxelTypes},
+    },
     renderer::{Lighting, MeshCapacity, Renderer},
-    voxel::{ChunkMesh, ChunkVertices, Face, GreedyVertex, PackedVertex, VoxelTypes},
 };
 
 pub const GRID: u32 = 16;
@@ -27,7 +29,7 @@ const WALL_TYPE: u16 = SHADES as u16 + 1;
 pub const WALL_COLOR: [f32; 3] = [0.9, 0.8, 0.1];
 /// Room for half again the grid's geometry, so remeshing has to reuse freed space.
 pub const CAPACITY: MeshCapacity = MeshCapacity {
-    // Packed vertices are 3 words, greedy 2.
+    // Packed vertices are 3 words, axis aligned ones 2.
     vertex_words: GRID * GRID * 4 * 3 * 3 / 2 + 16,
     indices: GRID * GRID * 6 * 3 / 2 + 6,
     // A header, two palette words, four index words and an occupancy word a chunk.
@@ -100,7 +102,8 @@ pub fn voxel_slab(
         Vec3::new(0.0, edge, 1.0),
         Vec3::new(edge, edge, 1.0),
     ];
-    let greedy = corners.map(|corner| GreedyVertex::new(corner, Face::NegZ, SLAB_EDGE).unwrap());
+    let aligned =
+        corners.map(|corner| AxisAlignedVertex::new(corner, Face::NegZ, SLAB_EDGE).unwrap());
     let packed_vertices =
         corners.map(|corner| PackedVertex::new(corner, Vec3::NEG_Z, SLAB_EDGE).unwrap());
     // Front faces wind counter-clockwise on screen.
@@ -112,7 +115,7 @@ pub fn voxel_slab(
         indices: &indices,
         vertices: match packed {
             true => ChunkVertices::Packed(&packed_vertices),
-            false => ChunkVertices::Greedy(&greedy),
+            false => ChunkVertices::AxisAligned(&aligned),
         },
         origin: face_corner - Vec3::Z * voxel_size,
         voxel_size,
@@ -225,10 +228,11 @@ impl Scene {
     pub fn add_ballast(&mut self, words: u32) -> Result<(), vk::Result> {
         let far = Vertex {
             pos: [1000.0, 1000.0, CHUNK_Z],
+            normal: [0.0, 0.0, -1.0],
             col: [1.0; 3],
         };
-        // Colored vertices are 4 words.
-        let vertices = vec![far; words.div_ceil(4) as usize];
+        // Colored vertices are 5 words.
+        let vertices = vec![far; words.div_ceil(5) as usize];
         self.ballast = Some(self.renderer.create_mesh(&[0, 1, 2], &vertices)?);
         Ok(())
     }

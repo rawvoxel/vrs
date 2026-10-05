@@ -1,4 +1,4 @@
-use super::{lighting::GiConfig, mesh_pool::MeshCapacity};
+use super::{lighting::ProbeConfig, mesh_pool::MeshCapacity};
 
 /// How a `Renderer` is built, see `Renderer::with_config`.
 ///
@@ -17,7 +17,7 @@ pub struct RendererConfig {
     pub backface_culling: bool,
     /// The light probes chunks are lit by, `None` for none. They follow the camera, so they
     /// can't be resized later. See `Lighting::global_illumination`.
-    pub global_illumination: Option<GiConfig>,
+    pub global_illumination: Option<ProbeConfig>,
 }
 
 impl Default for RendererConfig {

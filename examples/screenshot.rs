@@ -76,7 +76,6 @@ fn main() -> Result<()> {
         meshes: &meshes,
         view,
         proj,
-        ..Default::default()
     };
     // The first frame uploads the chunks, and the probes take a while to light them.
     renderer.converge_lighting();

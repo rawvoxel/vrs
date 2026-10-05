@@ -6,7 +6,7 @@ static const uint NO_CHUNK = 0xffffffff;
 
 // Moves a point on a face into the voxel behind it, in voxels.
 static const float FACE_NUDGE = 1.0 / 256.0;
-// Matches `voxel::OCCUPANCY_BLOCK`, voxels along each edge of a block of a chunk's occupancy.
+// Matches `mesh::chunk::OCCUPANCY_BLOCK`, voxels along each edge of a block of a chunk's occupancy.
 static const int OCCUPANCY_BLOCK = 8;
 
 // World position `world` in the shadow grid's finest voxels.
@@ -15,7 +15,7 @@ float3 toGrid(float3 world) {
 }
 
 // The type id of voxel `cell` of the chunk whose types start at word `base`.
-// Matches `voxel::VoxelTypes::type_at`.
+// Matches `mesh::chunk::VoxelTypes::type_at`.
 uint typeAt(uint base, uint edge, uint3 cell) {
     uint header = typeWords[base];
     uint bits = header & 0xff;
@@ -33,7 +33,7 @@ int occupancyBlocks(int edge) {
 }
 
 // Whether any voxel of block `block` of the chunk whose occupancy starts at word `base` isn't
-// empty. Matches `voxel::VoxelTypes::occupancy`.
+// empty. Matches `mesh::chunk::VoxelTypes::occupancy`.
 bool blockOccupied(uint base, int blocksPerEdge, int3 block) {
     uint index = uint(block.x + blocksPerEdge * (block.y + blocksPerEdge * block.z));
     return (typeWords[base + index / 32] & (1u << (index % 32))) != 0;

@@ -8,15 +8,12 @@ use std::ops::Range;
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeshKind {
-    /// `Vertex`es, world positions with their own colors.
+    /// `mesh::Vertex`es, in the world with colors and normals of their own.
     Colored = 0,
-    /// `voxel::GreedyVertex`es, colored by voxel.
-    Greedy = 1,
-    /// `voxel::PackedVertex`es, colored by voxel.
+    /// `mesh::AxisAlignedVertex`es, colored by voxel.
+    AxisAligned = 1,
+    /// `mesh::PackedVertex`es, colored by voxel.
     Packed = 2,
-    /// `LitVertex`es, world positions with their own colors and normals, lit like
-    /// chunks.
-    Lit = 3,
 }
 
 impl MeshKind {
@@ -24,17 +21,16 @@ impl MeshKind {
     #[inline]
     pub fn words_per_vertex(self) -> u32 {
         match self {
-            MeshKind::Colored => 4,
-            MeshKind::Greedy => 2,
+            MeshKind::Colored => 5,
+            MeshKind::AxisAligned => 2,
             MeshKind::Packed => 3,
-            MeshKind::Lit => 5,
         }
     }
 
     /// Whether it's a chunk, colored by voxel, with voxel types of its own.
     #[inline]
     pub fn is_chunk(self) -> bool {
-        matches!(self, MeshKind::Greedy | MeshKind::Packed)
+        matches!(self, MeshKind::AxisAligned | MeshKind::Packed)
     }
 }
 
@@ -47,7 +43,7 @@ pub struct Mesh {
     pub indices: Range<u32>,
     /// A chunk's voxel types, its occupancy, then its probe cells, empty but for chunks.
     pub type_words: Range<u32>,
-    /// Where the occupancy starts in `type_words`, see `voxel::VoxelTypes::occupancy`.
+    /// Where the occupancy starts in `type_words`, see `mesh::chunk::VoxelTypes::occupancy`.
     pub occupancy_offset: u32,
     /// Where the probe cells start in `type_words`, see `lighting::probes::bake_probe_cells`.
     pub probes_offset: u32,

@@ -1,18 +1,17 @@
 // Draws the mesh pool's meshes, pulling each one's vertices in whichever format it uses.
 //
-// Colored meshes carry their own colors, unlit. Lit meshes carry theirs too, and normals, and
-// are lit as rough surfaces like chunks. Chunk meshes are colored by voxel: a fragment finds
-// the voxel it belongs to in the chunk's packed types, then that type's material. Then
-// they're lit by the sun and the lights, with the shadows the shadow pass traced, the light
+// Colored meshes carry their own colors and normals, and are lit as rough surfaces. Chunk
+// meshes are colored by voxel: a fragment finds the voxel it belongs to in the chunk's packed
+// types, then that type's material. Then they're lit by the sun and the lights, with the shadows the shadow pass traced, the light
 // probes or the sky and the ground, darkened by ambient occlusion, and when glossy, reflect
 // what's around them. Below full resolution, the shadow pass lit them with the light from
 // everywhere but the sun too, and they upscale it.
 
 #include "common.slang"
 
-// Matches `voxel::POSITION_BIAS`.
+// Matches `mesh::POSITION_BIAS`.
 static const float POSITION_BIAS = 16.0;
-// Matches `voxel::Face::normal`, indexed by the face in a greedy vertex's flags bits 1 to 3.
+// Matches `mesh::Face::normal`, indexed by the face in an axis aligned vertex's flags bits 1 to 3.
 static const float3 FACE_NORMALS[6] = {
     float3(-1.0, 0.0, 0.0),
     float3(1.0, 0.0, 0.0),
@@ -21,7 +20,7 @@ static const float3 FACE_NORMALS[6] = {
     float3(0.0, 0.0, -1.0),
     float3(0.0, 0.0, 1.0),
 };
-// How far greedy quads are pushed out past their edges, in pixels, so where one quad's corner
+// How far axis aligned quads are pushed out past their edges, in pixels, so where one quad's corner
 // meets the middle of another's edge, rounding can't open a crack between them.
 static const float QUAD_OVERLAP_PIXELS = 0.25;
 // How much nearer or further, relative to its distance, a shadow texel's surface can be than
@@ -79,7 +78,7 @@ float3 octahedralDecode(uint word) {
     return normalize(normal);
 }
 
-// Matches `voxel::unpack_position`.
+// Matches `mesh::unpack_position`.
 float3 unpackPosition(uint positionXy, uint positionZFlags, float steps) {
     float3 quantized = float3(positionXy & 0xffff, positionXy >> 16, positionZFlags & 0xffff);
     return quantized / steps - POSITION_BIAS;
@@ -99,24 +98,20 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
     output.normal = float3(0.0, 1.0, 0.0);
 
     float3 local;
-    // Away from the middle of the vertex's quad, for greedy quads, which overlap a little.
+    // Away from the middle of the vertex's quad, for axis aligned quads, which overlap a little.
     float3 outward = float3(0.0);
     uint word = mesh.vertexBase;
     if (mesh.kind == KIND_COLORED) {
-        word += vertexIndex * 4;
-        local = asfloat(uint3(vertexWords[word], vertexWords[word + 1], vertexWords[word + 2]));
-        output.color = unpackUnorm4x8ToFloat(vertexWords[word + 3]).rgb;
-    } else if (mesh.kind == KIND_LIT) {
         word += vertexIndex * 5;
         local = asfloat(uint3(vertexWords[word], vertexWords[word + 1], vertexWords[word + 2]));
         output.color = unpackUnorm4x8ToFloat(vertexWords[word + 3]).rgb;
         output.normal = octahedralDecode(vertexWords[word + 4]);
-    } else if (mesh.kind == KIND_GREEDY) {
+    } else if (mesh.kind == KIND_AXIS_ALIGNED) {
         word += vertexIndex * 2;
         uint positionZFlags = vertexWords[word + 1];
         local = unpackPosition(vertexWords[word], positionZFlags, mesh.positionSteps);
         output.normal = FACE_NORMALS[min((positionZFlags >> 17) & 7, 5)];
-        // Greedy quads are 4 vertices in a row.
+        // Axis aligned quads are 4 vertices in a row.
         uint quad = mesh.vertexBase + (vertexIndex & ~3u) * 2;
         float3 center = float3(0.0);
         for (uint corner = 0; corner < 4; corner++) {
@@ -257,7 +252,7 @@ bool occludes(VSOutput input, int3 cell, int3 gridCell) {
     return inGrid && gridOccludes(0, gridCell);
 }
 
-// How open a greedy face is where `input` lies on it, from 0, enclosed, to 1: each corner of
+// How open an axis aligned face is where `input` lies on it, from 0, enclosed, to 1: each corner of
 // its voxel darkens with the voxels around it in front of the face, two solid sides closing
 // it entirely, and the pixel blends its voxel's four corners [classic voxel ambient
 // occlusion].
@@ -286,26 +281,24 @@ float4 meshFrag(VSOutput input) : SV_Target {
     // The triangle's outward normal, from screen derivatives. Taken before any branch, so
     // every pixel of the quad takes part.
     float3 faceNormal = normalize(cross(ddy(input.voxelPosition), ddx(input.voxelPosition)));
-    if (input.kind == KIND_COLORED) {
-        return float4(input.color, 1.0);
-    }
 
-    // A face lies between its solid voxel and the empty cell in front, so its fragments are
-    // nudged inside first. Curved surfaces can still be in an empty cell, then the voxel
-    // one cell behind is taken.
-    bool litMesh = input.kind == KIND_LIT;
+    // A chunk's face lies between its solid voxel and the empty cell in front, so its
+    // fragments are nudged inside first. Curved surfaces can still be in an empty cell, then
+    // the voxel one cell behind is taken.
+    bool colored = input.kind == KIND_COLORED;
     uint edge = input.voxelsPerEdge;
     uint id = 0;
-    if (!litMesh) {
+    if (!colored) {
         id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * FACE_NUDGE, edge));
         if (id == 0) {
             id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * (1.0 + FACE_NUDGE), edge));
         }
     }
 
-    // Greedy normals are exact already, packed and lit ones are interpolated between vertices.
-    float3 normal = input.kind == KIND_GREEDY ? input.normal : normalize(input.normal);
-    float3 fromCamera = input.worldPosition - ubo.gi.cameraPosition.xyz;
+    // Axis aligned normals are exact already, packed and colored ones are interpolated between
+    // vertices.
+    float3 normal = input.kind == KIND_AXIS_ALIGNED ? input.normal : normalize(input.normal);
+    float3 fromCamera = input.worldPosition - ubo.probeVolume.cameraPosition.xyz;
     float3 toViewer = -normalize(fromCamera);
     // With the shadow pass, the sun's and the lights' shadows are upscaled from it.
     bool shadowPass = ubo.shadow.frameSize.z != 0;
@@ -338,13 +331,13 @@ float4 meshFrag(VSOutput input) : SV_Target {
     } else if (!upscaled) {
         light.indirect = indirectLight(toGrid(input.worldPosition), normal, toViewer, false);
         float occlusionStrength = ubo.lighting.options.x;
-        if (input.kind == KIND_GREEDY && occlusionStrength > 0.0) {
+        if (input.kind == KIND_AXIS_ALIGNED && occlusionStrength > 0.0) {
             openness = lerp(1.0, voxelOcclusion(input, int3(round(normal))), occlusionStrength);
         }
         light.indirect *= openness;
     }
     Material material = materialOf(id);
-    if (litMesh) {
+    if (colored) {
         material.colorRoughness = float4(input.color, 1.0);
         material.emissionMetalness = float4(0.0);
     }

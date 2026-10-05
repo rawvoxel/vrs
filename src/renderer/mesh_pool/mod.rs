@@ -5,6 +5,7 @@
 mod info;
 mod mesh;
 mod range_allocator;
+mod renderer;
 mod repack;
 mod staging;
 
@@ -32,8 +33,8 @@ pub struct MeshCapacity {
     /// Every kind of vertex shares the buffer, see `MeshKind::words_per_vertex`.
     pub vertex_words: u32,
     pub indices: u32,
-    /// Chunks' packed voxel types, see `voxel::VoxelTypes`, each chunk's occupancy, one bit
-    /// per block of `voxel::OCCUPANCY_BLOCK`³ voxels, and for chunks a multiple of 16 voxels
+    /// Chunks' packed voxel types, see `mesh::chunk::VoxelTypes`, each chunk's occupancy, one bit
+    /// per block of `mesh::chunk::OCCUPANCY_BLOCK`³ voxels, and for chunks a multiple of 16 voxels
     /// wide, a word per 16³ voxels of where its light probe goes and a bit of whether it has
     /// voxels.
     pub type_words: u32,

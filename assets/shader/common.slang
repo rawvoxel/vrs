@@ -2,7 +2,7 @@
 // rays through them, and lighting from the sun, the sky, the light probes and the lights,
 // with ambient occlusion and glossy reflections.
 //
-// `gi.slang` defines `GI_WRITES` first, for the bindings only its compute shaders write.
+// `probes.slang` defines `PROBE_WRITES` first, for the bindings only its compute shaders write.
 
 #include "common/layout.slang"
 #include "common/bindings.slang"

@@ -21,7 +21,7 @@ impl Mesh {
             voxels_per_edge: self.voxels_per_edge,
             position_steps: match self.voxels_per_edge {
                 0 => 0.0,
-                edge => crate::voxel::position_steps(edge) as f32,
+                edge => crate::mesh::position_steps(edge) as f32,
             },
         }
     }

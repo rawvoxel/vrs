@@ -209,7 +209,6 @@ impl Terrain {
             meshes: &meshes,
             view,
             proj,
-            ..Default::default()
         };
         vulkan
             .renderer

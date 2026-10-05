@@ -15,7 +15,7 @@ pub fn as_bytes<T: Copy>(value: &T) -> &[u8] {
     slice_as_bytes(slice::from_ref(value))
 }
 
-/// Only for types made of `u32`s and nothing else, such as `voxel::PackedVertex`.
+/// Only for types made of `u32`s and nothing else, such as `mesh::PackedVertex`.
 #[inline]
 pub fn slice_as_words<T: Copy>(data: &[T]) -> &[u32] {
     const {

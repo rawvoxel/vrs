@@ -5,7 +5,6 @@ use super::{
 };
 use crate::{
     App,
-    mesh::{Index, Vertex},
     renderer::{
         culling::{Culler, depth_pyramid::DepthPyramid},
         lighting::{lights::GpuLight, probes::ProbeVolume, shadows::ShadowPass},
@@ -35,13 +34,12 @@ use crate::{
 use ash::{khr, prelude::VkResult, vk};
 use std::slice;
 
-const DYNAMIC_SPV: &[u8] = include_bytes!("../../assets/shader/slang.spv");
 const MESH_SPV: &[u8] = include_bytes!("../../assets/shader/mesh.spv");
-const PROBES_SPV: &[u8] = include_bytes!("../../assets/shader/probes.spv");
+const PROBE_OVERLAY_SPV: &[u8] = include_bytes!("../../assets/shader/probe_overlay.spv");
 const SKY_SPV: &[u8] = include_bytes!("../../assets/shader/sky.spv");
 pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
-/// Starting size of each frame's dynamic geometry buffers, they grow to fit.
-const INITIAL_DYNAMIC_ELEMENTS: vk::DeviceSize = 1024;
+/// Materials each frame's palette buffer starts with room for, it grows to fit.
+const INITIAL_MATERIALS: vk::DeviceSize = 1024;
 /// Frames start as the near black the renderer used before it drew in sRGB.
 const DEFAULT_CLEAR_COLOR: [f32; 4] = [0.01, 0.01, 0.01, 1.0];
 
@@ -92,7 +90,7 @@ impl Renderer {
             depth_pyramid: DepthPyramid::null(),
             probe_volume: ProbeVolume::null(),
             shadow_pass: ShadowPass::null(),
-            gi_configured: config.global_illumination.is_some(),
+            probes_configured: config.global_illumination.is_some(),
             frame_number: 0,
             last_frame: None,
             frame_timestamps: Vec::new(),
@@ -100,8 +98,6 @@ impl Renderer {
             capture_requested: false,
             capture_buffers: Vec::new(),
             recorded_capture: None,
-            frame_index_buffers: Vec::new(),
-            frame_vertex_buffers: Vec::new(),
 
             current_frame: 0,
             in_flight_frames: Vec::new(),
@@ -145,7 +141,6 @@ impl Renderer {
             mesh_upscaled_indirect_pipeline: vk::Pipeline::null(),
             probes_pipeline: vk::Pipeline::null(),
             sky_pipeline: vk::Pipeline::null(),
-            dynamic_pipeline: vk::Pipeline::null(),
             graphics_pipeline_layout: vk::PipelineLayout::null(),
             graphics_queue: Queue::new(&graphics_queue_family, &render_device, 0),
             graphics_queue_family,
@@ -203,54 +198,41 @@ impl Renderer {
         self.graphics_pipeline_layout =
             create_pipeline_layout(&device, slice::from_ref(&self.frame_desc_set_layout))?;
         let mesh_entries = (c"meshVert", c"meshFrag");
-        for (pipeline, spv, entries, vertex_input, pass) in [
+        for (pipeline, spv, entries, pass) in [
             (
                 &mut self.mesh_pipeline,
                 MESH_SPV,
                 mesh_entries,
-                false,
                 PipelinePass::Shaded,
             ),
             (
                 &mut self.mesh_depth_pipeline,
                 MESH_SPV,
                 mesh_entries,
-                false,
                 PipelinePass::DepthOnly,
             ),
             (
                 &mut self.mesh_over_depth_pipeline,
                 MESH_SPV,
                 mesh_entries,
-                false,
                 PipelinePass::ShadedOverDepth,
             ),
             (
                 &mut self.mesh_upscaled_indirect_pipeline,
                 MESH_SPV,
                 mesh_entries,
-                false,
                 PipelinePass::ShadedOverUpscaledIndirect,
             ),
             (
-                &mut self.dynamic_pipeline,
-                DYNAMIC_SPV,
-                (c"vertMain", c"fragMain"),
-                true,
-                PipelinePass::Shaded,
-            ),
-            (
                 &mut self.probes_pipeline,
-                PROBES_SPV,
+                PROBE_OVERLAY_SPV,
                 (c"probeVert", c"probeFrag"),
-                false,
                 PipelinePass::Shaded,
             ),
             (
                 &mut self.sky_pipeline,
                 SKY_SPV,
                 (c"skyVert", c"skyFrag"),
-                false,
                 PipelinePass::Behind,
             ),
         ] {
@@ -260,7 +242,6 @@ impl Renderer {
                 &device,
                 shader_module,
                 entries,
-                vertex_input,
                 pass,
                 self.graphics_pipeline_layout,
             );
@@ -341,16 +322,7 @@ impl Renderer {
         )?;
         self.init_depth_pyramid_layout()?;
 
-        // Per Frame Buffers
-        let dynamic_buffer = |usage, element_size: usize| {
-            DynamicBuffer::new(
-                &adapter,
-                &device,
-                usage,
-                INITIAL_DYNAMIC_ELEMENTS * element_size as vk::DeviceSize,
-            )
-        };
-        // Grown to fit what each frame writes.
+        // Per Frame Buffers, grown to fit what each frame writes.
         let storage_buffer = |size: usize| {
             DynamicBuffer::new(
                 &adapter,
@@ -367,9 +339,11 @@ impl Renderer {
                 vk::BufferUsageFlags::TRANSFER_DST,
                 4,
             )?);
-            self.frame_palette_buffers.push(dynamic_buffer(
+            self.frame_palette_buffers.push(DynamicBuffer::new(
+                &adapter,
+                &device,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
-                size_of::<GpuMaterial>(),
+                INITIAL_MATERIALS * size_of::<GpuMaterial>() as vk::DeviceSize,
             )?);
             // Written by the first frame.
             self.frame_palette_versions.push(u64::MAX);
@@ -377,14 +351,6 @@ impl Renderer {
             self.frame_changed_chunks.push(storage_buffer(4)?);
             self.frame_light_buffers
                 .push(storage_buffer(size_of::<GpuLight>())?);
-            self.frame_index_buffers.push(dynamic_buffer(
-                vk::BufferUsageFlags::INDEX_BUFFER,
-                size_of::<Index>(),
-            )?);
-            self.frame_vertex_buffers.push(dynamic_buffer(
-                vk::BufferUsageFlags::VERTEX_BUFFER,
-                size_of::<Vertex>(),
-            )?);
         }
 
         Ok(())

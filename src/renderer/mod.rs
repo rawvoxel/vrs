@@ -7,7 +7,6 @@ mod frame;
 pub(crate) mod lighting;
 mod material;
 pub(crate) mod mesh_pool;
-mod meshes;
 mod record;
 mod setup;
 pub(crate) mod shader;
@@ -18,8 +17,8 @@ pub use debug::{Capture, FrameStats, MeshPoolStats};
 pub use draw_list::DrawList;
 pub(crate) use lighting::LightingUniforms;
 pub use lighting::{
-    DebugView, GiConfig, Light, Lighting, MAX_CASCADES, MAX_LIGHTS, MAX_SHADOW_LEVELS,
-    MAX_SHADOWED_LIGHTS, ProbeTuning, ShadowGrid, ShadowResolution, Sky, Spot, Tonemapping,
+    DebugView, Light, Lighting, MAX_CASCADES, MAX_LIGHTS, MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS,
+    ProbeConfig, ProbeTuning, ShadowGrid, ShadowResolution, Sky, Spot, Tonemapping,
 };
 pub use material::Material;
 pub use mesh_pool::MeshCapacity;
@@ -80,7 +79,7 @@ pub struct Renderer {
     /// each frame's depth, see `uses_shadow_pass`.
     shadow_pass: ShadowPass,
     /// Whether there's a `RendererConfig::global_illumination`.
-    gi_configured: bool,
+    probes_configured: bool,
     /// Frames submitted, which seeds each frame's probe rays.
     frame_number: u64,
     /// What `debug_frame_stats` reads back.
@@ -94,8 +93,6 @@ pub struct Renderer {
     capture_buffers: Vec<DynamicBuffer>,
     /// What `debug_read_capture` reads back.
     recorded_capture: Option<debug::RecordedCapture>,
-    frame_index_buffers: Vec<DynamicBuffer>,
-    frame_vertex_buffers: Vec<DynamicBuffer>,
 
     current_frame: usize,
     in_flight_frames: Vec<vk::Fence>,
@@ -164,8 +161,6 @@ pub struct Renderer {
     probes_pipeline: vk::Pipeline,
     /// Draws the `Lighting::sky` where no mesh is.
     sky_pipeline: vk::Pipeline,
-    /// Draws each frame's own geometry from `frame_vertex_buffers`.
-    dynamic_pipeline: vk::Pipeline,
     graphics_pipeline_layout: vk::PipelineLayout,
     graphics_queue: Queue,
     graphics_queue_family: QueueFamily,
@@ -351,8 +346,6 @@ impl Drop for Renderer {
                 .chain(&self.frame_shadow_tables)
                 .chain(&self.frame_changed_chunks)
                 .chain(&self.frame_light_buffers)
-                .chain(&self.frame_index_buffers)
-                .chain(&self.frame_vertex_buffers)
             {
                 buffer.destroy(device);
             }
@@ -387,7 +380,6 @@ impl Drop for Renderer {
             device.destroy_pipeline(self.mesh_upscaled_indirect_pipeline, None);
             device.destroy_pipeline(self.probes_pipeline, None);
             device.destroy_pipeline(self.sky_pipeline, None);
-            device.destroy_pipeline(self.dynamic_pipeline, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             device.destroy_device(None);
         }

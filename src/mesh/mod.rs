@@ -1,10 +1,14 @@
-//! Meshes as they're handed to the renderer: their ids, and their vertex formats, with normals
-//! packed in a word. Chunk meshes' are `voxel`'s.
+//! Meshes as they're handed to the renderer: their ids, every mesh's vertex formats, normals
+//! packed in a word, and chunk meshes, see `chunk`.
 
+pub mod chunk;
 pub mod octahedral;
 mod vertex;
 
-pub use vertex::{Index, LitVertex, Vertex};
+pub use vertex::{
+    AxisAlignedVertex, Face, Index, POSITION_BIAS, PackedVertex, SEE_THROUGH_FLAG, Vertex,
+    position_steps, unpack_position,
+};
 
 /// Refers to a mesh in a `MeshPool`.
 ///

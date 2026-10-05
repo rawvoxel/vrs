@@ -1,6 +1,6 @@
 //! The probes' buffers, atlases and compute passes, updated each frame.
 
-use super::{GiConfig, MAX_CASCADES};
+use super::{MAX_CASCADES, ProbeConfig};
 use crate::{
     renderer::{
         shader::bindings,
@@ -14,7 +14,7 @@ use crate::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-const GI_SPV: &[u8] = include_bytes!("../../../../assets/shader/gi.spv");
+const PROBES_SPV: &[u8] = include_bytes!("../../../../assets/shader/probes.spv");
 /// Interior texels along a probe's irradiance and distance maps, each with a one texel border.
 /// Match `IRRADIANCE_TEXELS` and `DEPTH_TEXELS` in `common/probe_volume.slang`.
 const IRRADIANCE_TEXELS: u32 = 8;
@@ -24,13 +24,13 @@ const ATLAS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Matches `Probe` in `common/layout.slang`.
 const PROBE_SIZE: vk::DeviceSize = 32;
 /// The fewest rays a probe traces in a frame, however many probes share the budget. Matches
-/// `MIN_RAYS_PER_PROBE` in `gi.slang`.
+/// `MIN_RAYS_PER_PROBE` in `probes.slang`.
 const MIN_RAYS_PER_PROBE: vk::DeviceSize = 32;
-/// Matches `numthreads` of `classifyProbes` in `gi.slang`.
+/// Matches `numthreads` of `classifyProbes` in `probes.slang`.
 const CLASSIFY_WORKGROUP: u32 = 64;
 /// Words before the active probe list in its buffer: the tracing dispatch's group counts, the
 /// updates' group counts, how many probes are active and how many rays each traces. Matches
-/// `ACTIVE_LIST` in `gi.slang`.
+/// `ACTIVE_LIST` in `probes.slang`.
 const ACTIVE_LIST: vk::DeviceSize = 8;
 /// Where the updates' group counts are in the active probe list's buffer, in bytes.
 const UPDATE_GROUPS: vk::DeviceSize = 3 * size_of::<u32>() as vk::DeviceSize;
@@ -89,7 +89,7 @@ impl ProbeVolume {
     pub fn new(
         adapter: &Adapter,
         logical_device: &ash::Device,
-        config: Option<GiConfig>,
+        config: Option<ProbeConfig>,
         layout: vk::PipelineLayout,
     ) -> VkResult<Self> {
         let mut volume = Self::null();
@@ -179,7 +179,7 @@ impl ProbeVolume {
             .max_lod(0.0);
         self.sampler = unsafe { logical_device.create_sampler(&sampler_info, None)? };
 
-        let module = create_shader_module(logical_device, GI_SPV)?;
+        let module = create_shader_module(logical_device, PROBES_SPV)?;
         let entries = [
             c"classifyProbes",
             c"planRays",

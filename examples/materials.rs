@@ -30,7 +30,7 @@ use vrs::{
     App,
     mesh::MeshId,
     renderer::{
-        DrawList, GiConfig, Light, Lighting, Material, Renderer, RendererConfig, ShadowGrid,
+        DrawList, Light, Lighting, Material, ProbeConfig, Renderer, RendererConfig, ShadowGrid,
         ShadowResolution,
     },
 };
@@ -228,7 +228,7 @@ impl Vulkan {
             app_info,
         )?;
         let config = RendererConfig {
-            global_illumination: Some(GiConfig::default()),
+            global_illumination: Some(ProbeConfig::default()),
             ..RendererConfig::default()
         };
         let mut renderer = Renderer::with_config(&app, size.width, size.height, config)?;
@@ -315,7 +315,6 @@ impl ApplicationHandler for Materials {
                     meshes: &[&vulkan.scene],
                     view,
                     proj,
-                    ..Default::default()
                 };
                 vulkan
                     .renderer

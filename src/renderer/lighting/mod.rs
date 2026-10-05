@@ -11,7 +11,7 @@ mod tonemapping;
 
 pub use debug_view::DebugView;
 pub use lights::{Light, MAX_LIGHTS, Spot};
-pub use probes::{GiConfig, MAX_CASCADES, ProbeTuning};
+pub use probes::{MAX_CASCADES, ProbeConfig, ProbeTuning};
 pub use shadows::{MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS, ShadowGrid, ShadowResolution};
 pub use sky::Sky;
 pub use tonemapping::Tonemapping;
@@ -21,7 +21,8 @@ use ash::prelude::VkResult;
 use glam::{Mat4, Vec3};
 use shadows::SHADOW_TABLE_CHUNKS;
 
-/// How chunk meshes are lit, see `Renderer::lighting`. Colored meshes keep their own colors.
+/// How meshes are lit, see `Renderer::lighting`. Colored meshes are lit as rough surfaces of
+/// their own colors.
 ///
 /// A face's light is the sky's and the ground's, blended by how far it faces up or down, or
 /// with `global_illumination`, the light probes' in their place, darkened in corners by
@@ -49,7 +50,7 @@ pub struct Lighting {
     pub global_illumination: bool,
     /// How the light probes blend what they see and are sampled.
     pub probe_tuning: ProbeTuning,
-    /// How much greedy chunks' corners and crevices darken the light from everywhere but the
+    /// How much axis aligned chunks' corners and crevices darken the light from everywhere but the
     /// sun, from 0, not at all, to 1, a corner closed on two sides gets none. Read from the
     /// voxels around each face, in neighboring chunks too when they're in the `shadow_grid`.
     pub ambient_occlusion: f32,

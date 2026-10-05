@@ -1,15 +1,11 @@
-//! Chunk meshes in compact vertex formats, colored per voxel from a palette.
+//! Chunk meshes, in `PackedVertex` or `AxisAlignedVertex` formats, colored per voxel from their
+//! palette compressed `VoxelTypes`.
 
 mod types;
-mod vertex;
 
 pub use types::{OCCUPANCY_BLOCK, VoxelTypes};
-pub use vertex::{
-    Face, GreedyVertex, POSITION_BIAS, PackedVertex, SEE_THROUGH_FLAG, position_steps,
-    unpack_position,
-};
 
-use crate::mesh::Index;
+use crate::mesh::{AxisAlignedVertex, Index, PackedVertex};
 use glam::Vec3;
 
 /// A chunk's vertices, in whichever format its mesher suits.
@@ -18,7 +14,7 @@ pub enum ChunkVertices<'a> {
     /// Axis aligned faces only, such as from greedy meshing, 8 bytes a vertex. Each quad is 4
     /// vertices in a row, which the renderer overlaps a little with its neighbors so no
     /// cracks open where one quad's corner meets the middle of another's edge.
-    Greedy(&'a [GreedyVertex]),
+    AxisAligned(&'a [AxisAlignedVertex]),
     /// Any surface, such as from surface nets or marching cubes, 12 bytes a vertex.
     Packed(&'a [PackedVertex]),
 }
@@ -27,7 +23,7 @@ impl ChunkVertices<'_> {
     #[inline]
     pub fn len(&self) -> usize {
         match self {
-            ChunkVertices::Greedy(vertices) => vertices.len(),
+            ChunkVertices::AxisAligned(vertices) => vertices.len(),
             ChunkVertices::Packed(vertices) => vertices.len(),
         }
     }

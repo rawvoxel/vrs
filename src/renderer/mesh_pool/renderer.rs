@@ -1,54 +1,31 @@
-//! Adding and removing meshes, which the mesh pool holds.
+//! The `Renderer`'s methods adding meshes to the pool and removing them.
 
-use super::Renderer;
+use super::{Mesh, MeshKind, NewMesh};
 use crate::{
-    mesh::{Index, LitVertex, MeshId, Vertex, octahedral},
-    renderer::{
-        lighting::probes::bake_probe_cells,
-        mesh_pool::{Mesh, MeshKind, NewMesh},
+    mesh::{
+        Index, MeshId, Vertex,
+        chunk::{ChunkMesh, ChunkVertices},
+        unpack_position,
     },
-    voxel::{ChunkMesh, ChunkVertices, unpack_position},
+    renderer::{Renderer, lighting::probes::bake_probe_cells},
     vulkan::bytes::slice_as_words,
 };
 use ash::{prelude::VkResult, vk};
 use glam::Vec3;
 
 impl Renderer {
-    /// Adds a mesh with colors of its own, in world space, uploaded by the next `submit`.
-    /// Indices are relative to the mesh's first vertex, and an empty mesh draws nothing.
+    /// Adds a mesh with colors of its own, in world space, uploaded by the next `submit`, lit
+    /// like chunks, by the sun, the lights, and the probes or the sky and ground, as a rough
+    /// surface. For what isn't voxels but sits among them, such as leaves and grass. It casts
+    /// no shadows and isn't seen by the probes, which trace voxels, and it's backface culled
+    /// like anything else, so a thin card seen from both sides needs both windings. Indices are
+    /// relative to the mesh's first vertex, and an empty mesh draws nothing.
     ///
     /// See `add_mesh` for when this stalls or fails.
     pub fn create_mesh(&mut self, indices: &[Index], vertices: &[Vertex]) -> VkResult<MeshId> {
-        let vertex_words: Vec<u32> = vertices.iter().flat_map(colored_words).collect();
+        let vertex_words: Vec<u32> = vertices.iter().flat_map(Vertex::words).collect();
         self.add_mesh(&NewMesh {
             kind: MeshKind::Colored,
-            vertex_words: &vertex_words,
-            indices,
-            type_words: &[],
-            occupancy: &[],
-            probes: &[],
-            origin: Vec3::ZERO,
-            scale: 1.0,
-            voxels_per_edge: 0,
-            bounds: bounds(vertices.iter().map(|vertex| Vec3::from(vertex.pos))),
-        })
-    }
-
-    /// Adds a mesh lit like chunks, by the sun, the lights, and the probes or the sky and
-    /// ground, as a rough surface of its vertices' colors, uploaded by the next `submit`.
-    /// For what isn't voxels but sits among them, such as leaves and grass. It casts no
-    /// shadows and isn't seen by the probes, which trace voxels, and it's backface culled like
-    /// anything else, so a thin card seen from both sides needs both windings.
-    ///
-    /// See `add_mesh` for when this stalls or fails.
-    pub fn create_lit_mesh(
-        &mut self,
-        indices: &[Index],
-        vertices: &[LitVertex],
-    ) -> VkResult<MeshId> {
-        let vertex_words: Vec<u32> = vertices.iter().flat_map(lit_words).collect();
-        self.add_mesh(&NewMesh {
-            kind: MeshKind::Lit,
             vertex_words: &vertex_words,
             indices,
             type_words: &[],
@@ -68,7 +45,9 @@ impl Renderer {
     pub fn create_chunk_mesh(&mut self, chunk: &ChunkMesh) -> VkResult<MeshId> {
         let edge = chunk.types.voxels_per_edge();
         let (kind, vertex_words) = match chunk.vertices {
-            ChunkVertices::Greedy(vertices) => (MeshKind::Greedy, slice_as_words(vertices)),
+            ChunkVertices::AxisAligned(vertices) => {
+                (MeshKind::AxisAligned, slice_as_words(vertices))
+            }
             ChunkVertices::Packed(vertices) => (MeshKind::Packed, slice_as_words(vertices)),
         };
         let positions = vertex_words
@@ -159,27 +138,6 @@ impl Renderer {
                 .create(&self.adapter, &self.render_device, frame, new)
         }
     }
-}
-
-/// A colored vertex as the mesh shader pulls it: its position's floats, then its color as
-/// linear 8 bit RGBA.
-fn colored_words(vertex: &Vertex) -> [u32; 4] {
-    let [r, g, b] = vertex
-        .col
-        .map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u32);
-    let [x, y, z] = vertex.pos.map(f32::to_bits);
-    [x, y, z, r | (g << 8) | (b << 16) | (255 << 24)]
-}
-
-/// A lit vertex's words: its position, color, and octahedral normal, as `mesh.slang` reads
-/// them.
-fn lit_words(vertex: &LitVertex) -> [u32; 5] {
-    let [x, y, z, color] = colored_words(&Vertex {
-        pos: vertex.pos,
-        col: vertex.col,
-    });
-    let [u, v] = octahedral::encode(Vec3::from(vertex.normal).normalize_or(Vec3::Y));
-    [x, y, z, color, u as u32 | ((v as u32) << 16)]
 }
 
 /// The box around `positions`, zero sized at the origin when there are none.

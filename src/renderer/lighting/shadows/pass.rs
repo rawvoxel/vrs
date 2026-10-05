@@ -408,7 +408,7 @@ impl Renderer {
     /// cheaper than every pixel finding it. Not for `DebugView::AmbientOcclusion`, which shows
     /// each pixel's.
     pub(in crate::renderer) fn lights_indirect_in_shadow_pass(&self) -> bool {
-        let indirect_work = self.gi_enabled() || self.lighting.ambient_occlusion > 0.0;
+        let indirect_work = self.probes_enabled() || self.lighting.ambient_occlusion > 0.0;
         self.uses_shadow_pass()
             && self.shadow_scale() > 1
             && indirect_work
