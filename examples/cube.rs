@@ -42,7 +42,7 @@ const PALETTE: [[f32; 3]; 3] = [[0.0; 3], [0.9, 0.35, 0.1], [0.1, 0.45, 0.9]];
 const ORBIT_SPEED: f32 = 0.6;
 
 fn create_cube(renderer: &mut Renderer) -> Result<MeshId> {
-    renderer.set_palette(&PALETTE);
+    renderer.set_matte_colors(&PALETTE);
     let inside = |x: i32, y: i32, z: i32| [x, y, z].iter().all(|&v| (0..CUBE as i32).contains(&v));
     let types = greedy::chunk_types(|x, y, z| match inside(x, y, z) {
         true => 1 + (x + y + z) as u16 % 2,

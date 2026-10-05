@@ -2,16 +2,17 @@
 // rays through them, and lighting from the sun, the sky, the light probes and the lights,
 // with ambient occlusion and glossy reflections.
 //
-// `probes.slang` defines `PROBE_WRITES` first, for the bindings only its compute shaders write.
+// `probe_update.slang` defines `PROBE_WRITES` first, for the bindings only its compute shaders
+// write.
 
 #include "common/layout.slang"
 #include "common/bindings.slang"
 #include "common/math.slang"
 #include "common/voxels.slang"
-#include "common/materials.slang"
+#include "common/material.slang"
 #include "common/occlusion.slang"
 #include "common/rays.slang"
-#include "common/probe_volume.slang"
+#include "common/probes.slang"
 #include "common/lights.slang"
 #include "common/lighting.slang"
 #include "common/sky.slang"

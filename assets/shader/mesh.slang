@@ -1,11 +1,11 @@
 // Draws the mesh pool's meshes, pulling each one's vertices in whichever format it uses.
 //
-// Colored meshes carry their own colors and normals, and are lit as rough surfaces. Chunk
-// meshes are colored by voxel: a fragment finds the voxel it belongs to in the chunk's packed
-// types, then that type's material. Then they're lit by the sun and the lights, with the shadows the shadow pass traced, the light
-// probes or the sky and the ground, darkened by ambient occlusion, and when glossy, reflect
-// what's around them. Below full resolution, the shadow pass lit them with the light from
-// everywhere but the sun too, and they upscale it.
+// Colored meshes carry their own colors and normals, and are lit as rough surfaces. Chunk meshes
+// are colored by voxel: a fragment finds the voxel it belongs to in the chunk's packed types, then
+// that type's material. Then they're lit by the sun and the lights, with the shadows the trace pass
+// traced, the light probes or the sky and the ground, darkened by ambient occlusion, and when
+// glossy, reflect what's around them. Below full resolution, the trace pass lit them with the light
+// from everywhere but the sun too, and they upscale it.
 
 #include "common.slang"
 
@@ -23,22 +23,22 @@ static const float3 FACE_NORMALS[6] = {
 // How far axis aligned quads are pushed out past their edges, in pixels, so where one quad's corner
 // meets the middle of another's edge, rounding can't open a crack between them.
 static const float QUAD_OVERLAP_PIXELS = 0.25;
-// How much nearer or further, relative to its distance, a shadow texel's surface can be than
+// How much nearer or further, relative to its distance, a trace texel's surface can be than
 // a pixel's and still shadow it.
 static const float SHADOW_DEPTH_TOLERANCE = 0.08;
 
 // The sun's visibility and the surface's distance for each block of pixels, from the shadow
-// pass, see `shadow.slang`.
-[[vk::binding(15, 0)]] Sampler2D<float4> shadowTexels;
-// The lights reaching each tile of pixels, see `cullLights` in `shadow.slang`.
-[[vk::binding(18, 0)]] StructuredBuffer<uint> tileLights;
-// Each block's shadowed lights and how much of each gets through, see `traceShadows`.
-[[vk::binding(20, 0)]] Texture2D<uint2> lightShadowTexels;
-// Each block's sharp reflection when its voxel is glossy, see `traceShadows`.
-[[vk::binding(22, 0)]] Texture2D<float4> reflectionTexels;
+// pass, see `trace_pass.slang`.
+[[vk::binding(15, 0)]] Sampler2D<float4> shadows;
+// The lights reaching each tile of pixels, see `cullLights` in `trace_pass.slang`.
+[[vk::binding(18, 0)]] StructuredBuffer<uint> lightTiles;
+// Each block's shadowed lights and how much of each gets through, see `traceSurfaces`.
+[[vk::binding(20, 0)]] Texture2D<uint2> lightShadows;
+// Each block's sharp reflection when its voxel is glossy, see `traceSurfaces`.
+[[vk::binding(22, 0)]] Texture2D<float4> reflections;
 // Each block's light from everywhere but the sun, with its ambient occlusion, see
-// `traceShadows`.
-[[vk::binding(24, 0)]] Texture2D<float4> indirectTexels;
+// `traceSurfaces`.
+[[vk::binding(24, 0)]] Texture2D<float4> indirect;
 
 struct VSOutput {
     float4 position : SV_Position;
@@ -56,9 +56,9 @@ struct VSOutput {
     nointerpolation float scale;
 };
 
-// Whether pixels the shadow pass didn't light with the light from everywhere but the sun find
+// Whether pixels the trace pass didn't light with the light from everywhere but the sun find
 // it themselves, from the probes, with ambient occlusion, else take the sky's and the
-// ground's. Off for `PipelinePass::ShadedOverUpscaledIndirect`, which leaves that code out,
+// ground's. Off for `PipelinePass::ColorOverUpscaledIndirect`, which leaves that code out,
 // whose registers would slow every pixel.
 [vk::constant_id(0)] const bool PER_PIXEL_INDIRECT = true;
 
@@ -66,7 +66,7 @@ struct VSOutput {
 static const uint DEBUG_LIGHT = 1;
 static const uint DEBUG_DIRECT = 2;
 static const uint DEBUG_INDIRECT = 3;
-static const uint DEBUG_OCCLUSION = 4;
+static const uint DEBUG_AMBIENT_OCCLUSION = 4;
 
 // Matches `mesh::octahedral::decode`.
 float3 octahedralDecode(uint word) {
@@ -126,26 +126,26 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
     output.voxelPosition = local;
 
     float4 world = float4(mesh.origin + local * mesh.scale, 1.0);
-    output.position = mul(ubo.proj, mul(ubo.view, world));
+    output.position = mul(uniforms.proj, mul(uniforms.view, world));
     if (any(outward != 0.0)) {
         // A pixel's width in the world at the vertex's distance, for any projection.
-        float pixel = 2.0 * output.position.w / (abs(ubo.proj[1][1]) * float(ubo.shadow.frameSize.y));
+        float pixel = 2.0 * output.position.w / (abs(uniforms.proj[1][1]) * float(uniforms.frameSize.y));
         world.xyz += outward * pixel * QUAD_OVERLAP_PIXELS;
-        output.position = mul(ubo.proj, mul(ubo.view, world));
+        output.position = mul(uniforms.proj, mul(uniforms.view, world));
     }
     output.worldPosition = world.xyz;
     return output;
 }
 
 // The chunk voxel containing voxel position `p`. Past the chunk's edges, its edge voxel.
-uint3 cellAt(float3 p, uint edge) {
+uint3 voxelAt(float3 p, uint edge) {
     return uint3(clamp(int3(floor(p)), int3(0), int3(int(edge) - 1)));
 }
 
-// The 4 shadow texels nearest a frame pixel, weighted by how near each is, of those whose
+// The 4 trace texels nearest a frame pixel, weighted by how near each is, of those whose
 // surface is about as far from the camera as the pixel's, so shadows don't bleed across
 // edges. With none, the one whose surface is nearest in distance counts alone. All zero
-// without the shadow pass.
+// without the trace pass.
 struct ShadowTaps {
     int2 texels[4];
     float weights[4];
@@ -158,8 +158,8 @@ struct ShadowTaps {
 // camera.
 ShadowTaps shadowTaps(float2 pixel, float distance) {
     ShadowTaps taps;
-    float scale = float(ubo.shadow.params.x);
-    float2 size = float2(ubo.shadow.params.yz);
+    float scale = float(uniforms.trace.pixelsPerTexel);
+    float2 size = float2(uniforms.trace.imageSize);
     // Each texel holds the pixel at its block's center.
     float2 texel = (pixel - 0.5 - floor(scale * 0.5)) / scale;
     int2 base = int2(floor(texel));
@@ -171,7 +171,7 @@ ShadowTaps shadowTaps(float2 pixel, float distance) {
         int2 offset = int2(i & 1, i >> 1);
         float2 tap = clamp(float2(base + offset), 0.0, size - 1.0);
         taps.texels[i] = int2(tap);
-        taps.sun[i] = shadowTexels.SampleLevel((tap + 0.5) / size, 0.0);
+        taps.sun[i] = shadows.SampleLevel((tap + 0.5) / size, 0.0);
         float difference = abs(taps.sun[i].w - distance) / max(distance, 1e-3);
         if (difference < closest) {
             closest = difference;
@@ -225,7 +225,7 @@ float upscaledLightShadow(ShadowTaps taps, uint lightIndex) {
         if (taps.weights[i] <= 0.0) {
             continue;
         }
-        uint2 shadowed = lightShadowTexels.Load(int3(taps.texels[i], 0));
+        uint2 shadowed = lightShadows.Load(int3(taps.texels[i], 0));
         for (uint k = 0; k < MAX_SHADOWED_LIGHTS; k++) {
             if (((shadowed.x >> (k * 8)) & NO_LIGHT) == lightIndex) {
                 visible += taps.weights[i] * float((shadowed.y >> (k * 8)) & 0xff) / 255.0;
@@ -238,17 +238,17 @@ float upscaledLightShadow(ShadowTaps taps, uint lightIndex) {
 }
 
 // Whether chunk voxel `cell` blocks light from reaching a corner: solid and not see-through.
-// Past the chunk's edges, the shadow grid's voxel at `gridCell`, when the chunk is the grid's
+// Past the chunk's edges, the voxel grid's voxel at `gridCell`, when the chunk is the grid's
 // finest size, otherwise open.
 bool occludes(VSOutput input, int3 cell, int3 gridCell) {
     int edge = int(input.voxelsPerEdge);
     if (all(cell >= 0) && all(cell < edge)) {
         return voxelOccludes(input.typesBase, input.occupancyBase, edge, cell);
     }
-    float gridSize = ubo.lighting.shadowGrid.x;
-    bool inGrid = ubo.lighting.shadowTable.w > 0
+    float gridSize = uniforms.lighting.gridVoxelSize;
+    bool inGrid = uniforms.lighting.gridLevels > 0
         && abs(input.scale - gridSize) <= gridSize * 1e-5
-        && int(ubo.lighting.shadowGrid.y) == edge;
+        && int(uniforms.lighting.gridVoxelsPerEdge) == edge;
     return inGrid && gridOccludes(0, gridCell);
 }
 
@@ -257,7 +257,7 @@ bool occludes(VSOutput input, int3 cell, int3 gridCell) {
 // it entirely, and the pixel blends its voxel's four corners [classic voxel ambient
 // occlusion].
 float voxelOcclusion(VSOutput input, int3 normal) {
-    // The face's voxel, the empty one in front, and the same in the shadow grid.
+    // The face's voxel, the empty one in front, and the same in the voxel grid.
     int3 solid = int3(floor(input.voxelPosition - float3(normal) * FACE_NUDGE));
     int3 front = solid + normal;
     int3 gridFront = int3(floor(toGrid(input.worldPosition) - float3(normal) * FACE_NUDGE)) + normal;
@@ -289,19 +289,19 @@ float4 meshFrag(VSOutput input) : SV_Target {
     uint edge = input.voxelsPerEdge;
     uint id = 0;
     if (!colored) {
-        id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * FACE_NUDGE, edge));
+        id = typeAt(input.typesBase, edge, voxelAt(input.voxelPosition - faceNormal * FACE_NUDGE, edge));
         if (id == 0) {
-            id = typeAt(input.typesBase, edge, cellAt(input.voxelPosition - faceNormal * (1.0 + FACE_NUDGE), edge));
+            id = typeAt(input.typesBase, edge, voxelAt(input.voxelPosition - faceNormal * (1.0 + FACE_NUDGE), edge));
         }
     }
 
     // Axis aligned normals are exact already, packed and colored ones are interpolated between
     // vertices.
     float3 normal = input.kind == KIND_AXIS_ALIGNED ? input.normal : normalize(input.normal);
-    float3 fromCamera = input.worldPosition - ubo.probeVolume.cameraPosition.xyz;
+    float3 fromCamera = input.worldPosition - uniforms.cameraPosition;
     float3 toViewer = -normalize(fromCamera);
-    // With the shadow pass, the sun's and the lights' shadows are upscaled from it.
-    bool shadowPass = ubo.shadow.frameSize.z != 0;
+    // With the trace pass, the sun's and the lights' shadows are upscaled from it.
+    bool shadowPass = uniforms.usesTracePass != 0;
     ShadowTaps taps = {};
     float3 sunVisible = float3(-1.0);
     if (shadowPass) {
@@ -309,17 +309,17 @@ float4 meshFrag(VSOutput input) : SV_Target {
         sunVisible = upscaledShadow(taps);
     }
     // The light from everywhere but the sun, darkened in corners and crevices, upscaled from
-    // the shadow pass when it lit faces, else for each pixel.
+    // the trace pass when it lit faces, else for each pixel.
     SurfaceLight light;
     light.direct = sunLight(input.worldPosition, normal, faceNormal, sunVisible);
-    uint debugView = uint(ubo.lighting.options.y);
+    uint debugView = uniforms.lighting.debugView;
     bool upscaled = false;
     // Packed faces take that of the side of their voxel they face most.
-    if (shadowPass && ubo.shadow.frameSize.w != 0 && debugView != DEBUG_OCCLUSION) {
-        light.indirect = upscaledByFace(indirectTexels, taps, faceNumber(normal), upscaled);
+    if (shadowPass && uniforms.tracedIndirect != 0 && debugView != DEBUG_AMBIENT_OCCLUSION) {
+        light.indirect = upscaledByFace(indirect, taps, faceNumber(normal), upscaled);
         // Along edges, where no texel near is of the same face, the nearest's, which looks
         // the same, rather than some pixels finding their own and slowing those around them.
-        float4 nearest = indirectTexels.Load(int3(taps.texels[taps.closest], 0));
+        float4 nearest = indirect.Load(int3(taps.texels[taps.closest], 0));
         if (!upscaled && nearest.w > 0.0) {
             light.indirect = nearest.rgb;
             upscaled = true;
@@ -330,7 +330,7 @@ float4 meshFrag(VSOutput input) : SV_Target {
         light.indirect = ambientLight(normal);
     } else if (!upscaled) {
         light.indirect = indirectLight(toGrid(input.worldPosition), normal, toViewer, false);
-        float occlusionStrength = ubo.lighting.options.x;
+        float occlusionStrength = uniforms.lighting.ambientOcclusion;
         if (input.kind == KIND_AXIS_ALIGNED && occlusionStrength > 0.0) {
             openness = lerp(1.0, voxelOcclusion(input, int3(round(normal))), occlusionStrength);
         }
@@ -346,15 +346,15 @@ float4 meshFrag(VSOutput input) : SV_Target {
     float3 highlights = float3(0.0);
     bool glossy = roughness < GLOSSY_ROUGHNESS;
     if (glossy) {
-        highlights += light.direct * highlight(normal, toViewer, ubo.lighting.sunDirection.xyz, roughness);
+        highlights += light.direct * highlight(normal, toViewer, uniforms.lighting.sunDirection, roughness);
     }
 
     // The lights reaching the pixel's tile.
-    if (shadowPass && ubo.shadow.lights.x > 0) {
+    if (shadowPass && uniforms.trace.lightCount > 0) {
         uint tile = tileOf(uint2(input.position.xy)) * TILE_WORDS;
-        uint count = tileLights[tile];
+        uint count = lightTiles[tile];
         for (uint i = 0; i < count; i++) {
-            uint lightIndex = tileLights[tile + 1 + i];
+            uint lightIndex = lightTiles[tile + 1 + i];
             float3 toLight;
             float distance;
             float3 reaching = lightReaching(lights[lightIndex], input.worldPosition, normal, toLight, distance);
@@ -369,7 +369,7 @@ float4 meshFrag(VSOutput input) : SV_Target {
     }
 
     // What the face reflects: the light reaching it from everywhere when it's rough, and when
-    // it's glossy, blending into a sharp reflection, traced by the shadow pass where it could,
+    // it's glossy, blending into a sharp reflection, traced by the trace pass where it could,
     // or the probes' light from the way the viewer's reflected, the sky's and ground's without
     // `PER_PIXEL_INDIRECT`.
     float3 lit = light.direct + light.indirect;
@@ -379,7 +379,7 @@ float4 meshFrag(VSOutput input) : SV_Target {
         bool found = false;
         float3 sharp = float3(0.0);
         if (shadowPass) {
-            sharp = upscaledByFace(reflectionTexels, taps, faceNumber(normal), found);
+            sharp = upscaledByFace(reflections, taps, faceNumber(normal), found);
         }
         if (!found) {
             sharp = PER_PIXEL_INDIRECT
@@ -397,7 +397,7 @@ float4 meshFrag(VSOutput input) : SV_Target {
         return float4(light.direct, 1.0);
     case DEBUG_INDIRECT:
         return float4(light.indirect, 1.0);
-    case DEBUG_OCCLUSION:
+    case DEBUG_AMBIENT_OCCLUSION:
         return float4(float3(openness), 1.0);
     default: {
         float3 shaded = shadeSurface(material, normal, toViewer, lit, reflection);

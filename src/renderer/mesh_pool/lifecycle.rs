@@ -1,6 +1,6 @@
 //! The `Renderer`'s methods adding meshes to the pool and removing them.
 
-use super::{Mesh, MeshKind, NewMesh};
+use super::{MeshKind, MeshRecord, NewMesh};
 use crate::{
     mesh::{
         Index, MeshId, Vertex,
@@ -22,7 +22,11 @@ impl Renderer {
     /// relative to the mesh's first vertex, and an empty mesh draws nothing.
     ///
     /// See `add_mesh` for when this stalls or fails.
-    pub fn create_mesh(&mut self, indices: &[Index], vertices: &[Vertex]) -> VkResult<MeshId> {
+    pub fn create_colored_mesh(
+        &mut self,
+        indices: &[Index],
+        vertices: &[Vertex],
+    ) -> VkResult<MeshId> {
         let vertex_words: Vec<u32> = vertices.iter().flat_map(Vertex::words).collect();
         self.add_mesh(&NewMesh {
             kind: MeshKind::Colored,
@@ -34,7 +38,7 @@ impl Renderer {
             origin: Vec3::ZERO,
             scale: 1.0,
             voxels_per_edge: 0,
-            bounds: bounds(vertices.iter().map(|vertex| Vec3::from(vertex.pos))),
+            bounds: bounds(vertices.iter().map(|vertex| Vec3::from(vertex.position))),
         })
     }
 
@@ -82,7 +86,7 @@ impl Renderer {
     /// # Panics
     /// If `id` came from another renderer.
     #[inline]
-    pub fn mesh(&self, id: &MeshId) -> &Mesh {
+    pub fn mesh(&self, id: &MeshId) -> &MeshRecord {
         self.mesh_pool.get(id)
     }
 
@@ -105,7 +109,7 @@ impl Renderer {
         }
         // Frames in flight may still hold destroyed meshes' space.
         if self.mesh_pool.has_pending_releases() {
-            unsafe { self.render_device.device_wait_idle()? };
+            unsafe { self.device.device_wait_idle()? };
             self.mesh_pool.release_all();
             created = self.stage_mesh(frame, new);
             if !out_of_room(&created) {
@@ -117,10 +121,10 @@ impl Renderer {
             return created;
         };
         unsafe {
-            self.render_device.device_wait_idle()?;
+            self.device.device_wait_idle()?;
             self.mesh_pool.repack(
                 &self.adapter,
-                &self.render_device,
+                &self.device,
                 self.graphics_queue.handle,
                 self.init_cmd_buffer,
                 self.init_cmd_fence,
@@ -135,7 +139,7 @@ impl Renderer {
         // SAFETY: `add_mesh` waited for `frame`, which readies its staging buffer.
         unsafe {
             self.mesh_pool
-                .create(&self.adapter, &self.render_device, frame, new)
+                .create(&self.adapter, &self.device, frame, new)
         }
     }
 }

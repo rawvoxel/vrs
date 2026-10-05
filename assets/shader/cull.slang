@@ -4,7 +4,7 @@
 // phase 1 draws what was visible last frame, phase 2 tests everything against the
 // pyramid, draws what's newly visible and remembers what's visible for next frame.
 
-// Matches `renderer::mesh_pool::MeshInfo`, and `MeshInfo` in `common.slang`.
+// Matches `renderer::mesh_pool::MeshInfo`, and `MeshInfo` in `common/layout.slang`.
 struct MeshInfo {
     float3 boundsMin;
     uint indexCount;
@@ -131,7 +131,7 @@ bool isOccluded(MeshInfo mesh) {
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void cullMain(uint3 threadId: SV_DispatchThreadID) {
+void cullMeshes(uint3 threadId: SV_DispatchThreadID) {
     uint candidate = threadId.x;
     if (candidate >= params.candidateCount) {
         return;

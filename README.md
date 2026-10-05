@@ -31,15 +31,15 @@ let app = App::headless(app_info).unwrap();
 let mut renderer = Renderer::new(&app, 800, 600).unwrap();
 
 // Uploaded by the next frame, then drawn every frame it's listed.
-let (normal, col) = ([0.0, 0.0, -1.0], [1.0, 0.0, 0.0]);
+let (normal, color) = ([0.0, 0.0, -1.0], [1.0, 0.0, 0.0]);
 let triangle = renderer
-    .create_mesh(
+    .create_colored_mesh(
         // Counter-clockwise on screen, so it faces the camera.
         &[0, 2, 1],
         &[
-            Vertex { pos: [0.0, -0.5, 0.5], normal, col },
-            Vertex { pos: [0.5, 0.5, 0.5], normal, col },
-            Vertex { pos: [-0.5, 0.5, 0.5], normal, col },
+            Vertex { position: [0.0, -0.5, 0.5], normal, color },
+            Vertex { position: [0.5, 0.5, 0.5], normal, color },
+            Vertex { position: [-0.5, 0.5, 0.5], normal, color },
         ],
     )
     .unwrap();
@@ -62,48 +62,49 @@ drop(renderer);
   Indices are relative to each mesh's first vertex.
 - **Chunk meshes** come from `create_chunk_mesh` and a `mesh::chunk::ChunkMesh`:
   `AxisAlignedVertex`es for axis aligned faces, which keep a face index instead of a normal, or
-  `PackedVertex`es for any surface. Positions are chunk local, placed by the chunk's `origin`
-  and `voxel_size`, which includes its LOD. Its `VoxelTypes` are palette compressed, and
-  already packed words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the
-  palette from `set_materials`, or `set_palette` for plain colors, 0 is empty space. Cells
-  past a chunk's edge take the chunk's own edge voxel, there's no lookup into neighbors, and
-  see-through faces are drawn like any other.
-- **Colored meshes** come from `create_mesh`, `mesh::Vertex`es in world space with colors and
-  normals of their own, for what sits among the voxels without being voxels, such as leaves
-  and grass. They're lit like chunks, as rough surfaces, but cast no shadows and the light
-  probes don't see them, and a card seen from both sides needs both windings.
+  `PackedVertex`es for any surface. Positions are chunk local, placed by the chunk's `origin` and
+  `voxel_size`, which includes its LOD. Its `VoxelTypes` are palette compressed, and already packed
+  words can be handed over as they are with `VoxelTypes::from_words`. Type ids index the palette
+  from `set_materials`, or `set_matte_colors` for plain colors, 0 is empty space. Cells past a
+  chunk's edge take the chunk's own edge voxel, there's no lookup into neighbors, and see-through
+  faces are drawn like any other.
+- **Colored meshes** come from `create_colored_mesh`, `mesh::Vertex`es in world space with colors
+  and normals of their own, for what sits among the voxels without being voxels, such as leaves and
+  grass. They're lit like chunks, as rough surfaces, but cast no shadows and the light probes don't
+  see them, and a card seen from both sides needs both windings.
 - **Materials**: each palette entry is a `Material`: a color, light it gives off, roughness,
   metalness, and whether it's see-through. Glowing voxels light what's around them through
   the light probes. See-through voxels, such as glass, are drawn as solid faces, but light
   passes through them tinted by their color, once per pane. Smooth materials reflect what's
   around them, more at grazing angles, and metals reflect in their own color.
 - **Lighting**: `Renderer::lighting` lights chunks with sky and ground colors, blended by
-  which way a face points, and a sun. With a `ShadowGrid`, shadow rays are traced toward the
+  which way a face points, and a sun. With a `VoxelGrid`, shadow rays are traced toward the
   sun through the voxels with a DDA, across chunks, so hills shadow their neighbors. Each
   chunk also keeps one bit per 8³ block of voxels saying whether any is solid, and rays cross
   empty blocks in one step. The grid is the chunks of one voxel size and width, placed on a
-  grid from the world's origin, and with `ShadowGrid::levels`, coarser levels of detail of
+  grid from the world's origin, and with `VoxelGrid::levels`, coarser levels of detail of
   them, each of voxels twice as big. Rays go through the finest level's chunk wherever there
-  is one. Chunks of other sizes are lit but cast no shadows, and chunks with no faces, such as
+  is one. Reflections, the light probes and ambient occlusion trace through the same grid.
+  Chunks of other sizes are lit, but no ray sees them, and chunks with no faces, such as
   under the ground, should still be created for their voxels to cast shadows.
   With shadows or lights, frames draw their depth first, trace the shadows from it, then draw
-  their color over it, which saves tracing for pixels drawn over. `Lighting::shadow_resolution`
+  their color over it, which saves tracing for pixels drawn over. `Lighting::trace_resolution`
   traces one shadow ray per 2x2 or 4x4 pixels instead of every pixel, upscaling the shadows by
-  distance so they don't bleed across edges. Below full resolution, the shadow pass also
+  distance so they don't bleed across edges. Below full resolution, the trace pass also
   finds the light from everywhere but the sun, the probes' and the ambient occlusion, for
   each block of pixels, which shading upscales by face. That leaves sampling probes out of
-  shading, which is most of its cost, so chunks the shadow grid doesn't hold are lit by the
+  shading, which is most of its cost, so chunks the voxel grid doesn't hold are lit by the
   sky and ground colors alone then.
-  Axis aligned faces' corners and crevices are darkened by voxel ambient occlusion, from the voxels
-  around each face, `Lighting::ambient_occlusion`.
+  Axis aligned faces' corners and crevices are darkened by voxel ambient occlusion, from the
+  voxels around each face, `Lighting::ambient_occlusion`.
 - **Lights**: `Renderer::lights` holds up to 255 point and spot lights. Each frame lists the
   lights reaching each 16x16 pixel tile, the brightest when more than fit, and each pixel's
-  brightest `Lighting::shadowed_lights`, up to 4, are shadowed at the shadow resolution.
+  brightest `Lighting::shadowed_lights`, up to 4, are shadowed at the trace resolution.
   Shadow rays start from the light, past any voxels it's inside, so a light can sit inside a
   glowing block as its lamp.
   The light probes see the lights too.
 - **Reflections**: smooth voxels, with a roughness under 0.5, have a reflection ray traced
-  for each shadow texel and upscaled like the shadows, which blends into the probes' light
+  for each trace texel and upscaled like the shadows, which blends into the probes' light
   from the reflected direction as they get rougher. The sun's and the lights' highlights are
   added on top.
 - **Global illumination**: with `RendererConfig::global_illumination`, a volume of light
@@ -130,7 +131,7 @@ drop(renderer);
     leaking through walls. The finest cascade covering a point lights it, blending into the
     next at its edge.
 
-  It needs a `ShadowGrid` whose chunks are a multiple of 16 voxels wide, and
+  It needs a `VoxelGrid` whose chunks are a multiple of 16 voxels wide, and
   `Lighting::global_illumination` turns it off and on. Probes spaced wider than a room can
   leak light into it, so coarser cascades suit far away terrain rather than interiors.
 - **Sky and tonemapping**: with a `Lighting::sky`, a gradient from the horizon up to the
@@ -147,8 +148,8 @@ drop(renderer);
   otherwise the image is mirrored and the wrong faces are culled.
 - **The mesh pool** is defragmented when its free space is too scattered for a new mesh, and
   doubled when there isn't enough of it. Both copy every mesh into new buffers, stalling
-  `create_mesh` until the copies finish, which is rare since the pool doubles each time.
-  Without growth, `create_mesh` fails with `ERROR_OUT_OF_DEVICE_MEMORY` when it's full.
+  `create_colored_mesh` until the copies finish, which is rare since the pool doubles each time.
+  Without growth, `create_colored_mesh` fails with `ERROR_OUT_OF_DEVICE_MEMORY` when it's full.
 - **Settings**: a `RendererConfig` for `Renderer::with_config` sets the mesh pool's starting
   size, and starting values for growing it, vsync, occlusion culling and backface culling. At
   runtime `grow_mesh_pool`, `occlusion_culling`, `backface_culling` and `clear_color` are
@@ -195,8 +196,8 @@ cargo run -p vrs --example stress --release -- --headless
 - `screenshot` renders the terrain without a window and saves the frame as a PPM image.
 
 The windowed examples' titles show frames a second and how long frames take on the GPU,
-split into updating the light probes, tracing shadows and drawing, from
-`Renderer::debug_gpu_timings`.
+split into updating the light probes, the trace pass and drawing, from
+`Renderer::gpu_timings`.
 
 The examples share a greedy mesher for 64³ chunks in `examples/common`, to show how a
 mesher's output becomes a chunk mesh, the Vulkan projection, and the title.
@@ -242,21 +243,24 @@ since a fresh checkout's file times can make them look out of date.
 
 ## Debug hooks
 
-For tests and tools, these stall the GPU unless they say otherwise:
+For tests and tools, these stall the GPU:
 
 - `Renderer::debug_frame_stats` reads back how many meshes the last frame drew.
 - `Renderer::debug_capture_next_frame` and `debug_read_capture` copy a frame back.
-- `Renderer::debug_mesh_pool_stats` reports the mesh pool's size and how often it repacked.
-- `Renderer::debug_gpu_timings` reports how long each `GpuStage` of a recent frame took on the
-  GPU, from timestamps, without stalling.
-- `vulkan::debug::message_counts` counts validation errors and warnings.
+
+These don't, so they suit every frame, such as for a performance overlay:
+
+- `Renderer::gpu_timings` reports how long each `GpuStage` of a recent frame took on the
+  GPU, from timestamps.
+- `Renderer::mesh_pool_stats` reports the mesh pool's size and how often it repacked.
+- `vulkan::validation::message_counts` counts validation errors and warnings.
 
 ## Layout
 
 | Module | |
 | --- | --- |
 | `renderer` | `Renderer`, building it, and each frame's stages and command recording |
-| `renderer::lighting` | How chunks are lit: `Lighting`, the sky, tonemapping, debug views, and for each of the shadows, the light probes and the lights, its settings, its GPU resources and passes, and how each frame drives them |
+| `renderer::lighting` | How chunks are lit: `Lighting`, the sky, tonemapping, debug views, the voxel grid every ray traces through, the trace pass, the light probes and the lights: each one's settings, GPU resources and passes, and how each frame drives them |
 | `renderer::material` | `Material`s and the palette they're uploaded in |
 | `renderer::mesh_pool` | The buffers every mesh shares, the `Renderer`'s methods adding and removing meshes, their GPU records, staging, range allocator and repacking |
 | `renderer::culling` | GPU culling, and the depth pyramid occlusion culling tests against |
@@ -264,7 +268,7 @@ For tests and tools, these stall the GPU unless they say otherwise:
 | `renderer::debug` | Hooks for tests and tools: frame stats, GPU timings and captures |
 | `mesh` | Mesh ids, every mesh's vertex formats, and octahedral normals |
 | `mesh::chunk` | Chunk meshes and their packed voxel types |
-| `vulkan` | Vulkan building blocks: GPUs and queues, memory, buffers, images, pipelines, descriptors, commands, sync, and the surface and swapchain frames are drawn into |
+| `vulkan` | Vulkan building blocks: GPUs and queues, memory, buffers, images, pipelines, descriptors, commands, sync, the validation layer's messages, and the surface and swapchain frames are drawn into |
 | `app` | The instance, and the window or headless images it draws to |
 
 The shaders in `assets/shader` share `common.slang`, which includes one file of `common/` for

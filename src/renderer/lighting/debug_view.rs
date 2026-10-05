@@ -1,8 +1,7 @@
 //! Seeing how chunks are lit.
 
-/// What chunk meshes show instead of their colors, for seeing how they're lit, see
-/// `Lighting::debug_view`. Matches the `DEBUG_` constants in `mesh.slang`, but for `Probes`,
-/// which shades chunks as usual.
+/// What chunk meshes show, for seeing how they're lit, see `Lighting::debug_view`. Matches the
+/// `DEBUG_` constants in `mesh.slang`, but for `Probes`, which shades chunks as usual.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DebugView {
     /// Their colors, lit, as usual.

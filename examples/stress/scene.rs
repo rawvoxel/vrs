@@ -33,7 +33,7 @@ pub const CAPACITY: MeshCapacity = MeshCapacity {
     vertex_words: GRID * GRID * 4 * 3 * 3 / 2 + 16,
     indices: GRID * GRID * 6 * 3 / 2 + 6,
     // A header, two palette words, four index words and an occupancy word a chunk.
-    type_words: GRID * GRID * 8 * 3 / 2 + 8,
+    chunk_words: GRID * GRID * 8 * 3 / 2 + 8,
     meshes: GRID * GRID * 3 / 2,
 };
 
@@ -170,7 +170,7 @@ pub fn live<'a>(
 
 impl Scene {
     pub fn new(mut renderer: Renderer, app: App) -> Self {
-        renderer.set_palette(&palette());
+        renderer.set_matte_colors(&palette());
         // Full light from every side and no sun, so every face shows its palette color.
         renderer.lighting = Lighting {
             sun_color: [0.0; 3],
@@ -227,13 +227,13 @@ impl Scene {
     /// frustum culled every frame.
     pub fn add_ballast(&mut self, words: u32) -> Result<(), vk::Result> {
         let far = Vertex {
-            pos: [1000.0, 1000.0, CHUNK_Z],
+            position: [1000.0, 1000.0, CHUNK_Z],
             normal: [0.0, 0.0, -1.0],
-            col: [1.0; 3],
+            color: [1.0; 3],
         };
         // Colored vertices are 5 words.
         let vertices = vec![far; words.div_ceil(5) as usize];
-        self.ballast = Some(self.renderer.create_mesh(&[0, 1, 2], &vertices)?);
+        self.ballast = Some(self.renderer.create_colored_mesh(&[0, 1, 2], &vertices)?);
         Ok(())
     }
 
@@ -275,7 +275,7 @@ impl Scene {
                 cell.is_multiple_of(3),
                 false,
             )?,
-            None => self.renderer.create_mesh(&[], &[])?,
+            None => self.renderer.create_colored_mesh(&[], &[])?,
         };
         self.chunks[index] = Some(id);
         self.colors[index] = chunk_colors(cell, frame);

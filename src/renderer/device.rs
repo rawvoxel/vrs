@@ -5,7 +5,7 @@ use crate::{
 use ash::{khr, prelude::VkResult, vk};
 use std::slice;
 
-pub(super) fn create_render_device(
+pub(super) fn create_device(
     app: &App,
     adapter: &Adapter,
     queue_family: &QueueFamily,

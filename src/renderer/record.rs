@@ -20,8 +20,8 @@ impl Renderer {
     /// With occlusion culling: phase 1 culling, pass 1, the depth pyramid,
     /// phase 2 culling and pass 2. Without, frustum culling and one pass.
     ///
-    /// With the shadow pass, see `Renderer::uses_shadow_pass`, those passes draw only depth,
-    /// then the shadow pass traces from it, then one more pass draws color over the depth.
+    /// With the trace pass, see `Renderer::uses_trace_pass`, those passes draw only depth,
+    /// then the trace pass traces from it, then one more pass draws color over the depth.
     ///
     /// The last pass drawing color draws the sky last, behind what it drew.
     pub(super) fn record_frame(
@@ -43,18 +43,16 @@ impl Renderer {
         unsafe {
             let begin_info = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            self.render_device
-                .begin_command_buffer(cmd_buffer, &begin_info)?;
+            self.device.begin_command_buffer(cmd_buffer, &begin_info)?;
 
-            self.frame_timestamps[frame].cmd_start(&self.render_device, cmd_buffer);
+            self.frame_timestamps[frame].cmd_start(&self.device, cmd_buffer);
             let timestamps = &self.frame_timestamps[frame];
-            let mark = |stage| timestamps.cmd_mark(&self.render_device, cmd_buffer, stage);
-            self.mesh_pool
-                .cmd_upload(&self.render_device, frame, cmd_buffer);
+            let mark = |stage| timestamps.cmd_mark(&self.device, cmd_buffer, stage);
+            self.mesh_pool.cmd_upload(&self.device, frame, cmd_buffer);
             mark(GpuStage::Uploads);
             if data.probes {
                 self.probe_volume.cmd_update(
-                    &self.render_device,
+                    &self.device,
                     cmd_buffer,
                     self.frame_desc_sets[frame],
                     self.graphics_pipeline_layout,
@@ -65,7 +63,7 @@ impl Renderer {
             if culling {
                 self.culler.prepare(
                     &self.adapter,
-                    &self.render_device,
+                    &self.device,
                     &self.mesh_pool,
                     &self.depth_pyramid,
                     frame,
@@ -77,7 +75,7 @@ impl Renderer {
             }
 
             self.cmd_begin_attachments(cmd_buffer, image_index);
-            let shaded = !data.shadow_pass;
+            let shaded = !data.trace_pass;
             let (color, mesh_pipeline) = match shaded {
                 true => (Some(color_view), self.mesh_pipeline),
                 false => (None, self.mesh_depth_pipeline),
@@ -99,7 +97,7 @@ impl Renderer {
             if shaded && !occlusion && data.sky {
                 self.cmd_draw_sky(cmd_buffer);
             }
-            self.render_device.cmd_end_rendering(cmd_buffer);
+            self.device.cmd_end_rendering(cmd_buffer);
             mark(GpuStage::FirstPass);
 
             let load = vk::AttachmentLoadOp::LOAD;
@@ -121,15 +119,15 @@ impl Renderer {
                 if shaded && data.sky {
                     self.cmd_draw_sky(cmd_buffer);
                 }
-                self.render_device.cmd_end_rendering(cmd_buffer);
+                self.device.cmd_end_rendering(cmd_buffer);
                 mark(GpuStage::OcclusionPass);
             }
 
             if !shaded {
                 // Shadows from the depth, then color over it.
                 self.cmd_depth_for_compute(cmd_buffer);
-                self.shadow_pass.cmd_trace(
-                    &self.render_device,
+                self.trace_pass.cmd_trace(
+                    &self.device,
                     cmd_buffer,
                     self.frame_desc_sets[frame],
                     self.graphics_pipeline_layout,
@@ -158,22 +156,22 @@ impl Renderer {
                 if data.sky {
                     self.cmd_draw_sky(cmd_buffer);
                 }
-                self.render_device.cmd_end_rendering(cmd_buffer);
+                self.device.cmd_end_rendering(cmd_buffer);
                 mark(GpuStage::ColorPass);
             }
 
-            if data.draw_probes {
+            if data.probe_overlay {
                 self.cmd_begin_rendering(cmd_buffer, Some((color_view, load)), load);
                 self.cmd_bind_graphics(cmd_buffer, frame);
-                self.cmd_bind_pipeline(cmd_buffer, self.probes_pipeline);
-                self.render_device.cmd_draw(
+                self.cmd_bind_pipeline(cmd_buffer, self.probe_overlay_pipeline);
+                self.device.cmd_draw(
                     cmd_buffer,
                     PROBE_CUBE_VERTICES,
                     self.probe_volume.probe_count(),
                     0,
                     0,
                 );
-                self.render_device.cmd_end_rendering(cmd_buffer);
+                self.device.cmd_end_rendering(cmd_buffer);
                 mark(GpuStage::ProbeOverlay);
             }
 
@@ -195,7 +193,7 @@ impl Renderer {
             if !self.is_headless() {
                 let (layout, access, stage) = last_use;
                 image::transition_layout(
-                    &self.render_device,
+                    &self.device,
                     image,
                     cmd_buffer,
                     layout,
@@ -208,7 +206,7 @@ impl Renderer {
                 );
             }
 
-            self.render_device.end_command_buffer(cmd_buffer)
+            self.device.end_command_buffer(cmd_buffer)
         }
     }
 
@@ -222,7 +220,7 @@ impl Renderer {
     ) {
         unsafe {
             self.culler.cmd_cull(
-                &self.render_device,
+                &self.device,
                 &self.depth_pyramid,
                 frame,
                 cmd_buffer,
@@ -236,7 +234,7 @@ impl Renderer {
     /// Readies the swapchain image and the depth buffer for pass 1, which clears both.
     fn cmd_begin_attachments(&self, cmd_buffer: vk::CommandBuffer, image_index: u32) {
         image::transition_layout(
-            &self.render_device,
+            &self.device,
             self.swapchain.present_images[image_index as usize],
             cmd_buffer,
             vk::ImageLayout::UNDEFINED,
@@ -250,7 +248,7 @@ impl Renderer {
         );
         // Every frame shares the depth buffer, last frame may still be using it.
         image::transition_layout(
-            &self.render_device,
+            &self.device,
             self.swapchain.depth_image.handle,
             cmd_buffer,
             vk::ImageLayout::UNDEFINED,
@@ -268,10 +266,7 @@ impl Renderer {
     /// Builds the depth pyramid from pass 1's depth.
     fn cmd_build_depth_pyramid(&self, cmd_buffer: vk::CommandBuffer) {
         self.cmd_depth_for_compute(cmd_buffer);
-        unsafe {
-            self.depth_pyramid
-                .cmd_build(&self.render_device, cmd_buffer)
-        };
+        unsafe { self.depth_pyramid.cmd_build(&self.device, cmd_buffer) };
     }
 
     /// Readies pass 1's attachments for pass 2, which depth tests against
@@ -307,7 +302,7 @@ impl Renderer {
             .memory_barriers(slice::from_ref(&color_barrier))
             .image_memory_barriers(slice::from_ref(&depth_barrier));
         unsafe {
-            self.render_device
+            self.device
                 .cmd_pipeline_barrier2(cmd_buffer, &dependency_info)
         };
     }
@@ -315,7 +310,7 @@ impl Renderer {
     /// Readies the depth buffer for compute shaders to sample, after a pass drew it.
     fn cmd_depth_for_compute(&self, cmd_buffer: vk::CommandBuffer) {
         image::transition_layout(
-            &self.render_device,
+            &self.device,
             self.swapchain.depth_image.handle,
             cmd_buffer,
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -364,10 +359,7 @@ impl Renderer {
             .color_attachments(color_attachment.as_slice())
             .depth_attachment(&depth_attachment_info)
             .layer_count(1);
-        unsafe {
-            self.render_device
-                .cmd_begin_rendering(cmd_buffer, &rendering_info)
-        };
+        unsafe { self.device.cmd_begin_rendering(cmd_buffer, &rendering_info) };
     }
 
     /// The pass's dynamic state and this frame's descriptors, which every graphics pipeline
@@ -379,16 +371,16 @@ impl Renderer {
             .height(extent.height as f32)
             .max_depth(1.0);
         unsafe {
-            self.render_device
+            self.device
                 .cmd_set_viewport(cmd_buffer, 0, slice::from_ref(&viewport));
-            self.render_device
+            self.device
                 .cmd_set_scissor(cmd_buffer, 0, slice::from_ref(&extent.into()));
             let cull_mode = match self.backface_culling {
                 true => vk::CullModeFlags::BACK,
                 false => vk::CullModeFlags::NONE,
             };
-            self.render_device.cmd_set_cull_mode(cmd_buffer, cull_mode);
-            self.render_device.cmd_bind_descriptor_sets(
+            self.device.cmd_set_cull_mode(cmd_buffer, cull_mode);
+            self.device.cmd_bind_descriptor_sets(
                 cmd_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline_layout,
@@ -402,11 +394,8 @@ impl Renderer {
     #[inline]
     fn cmd_bind_pipeline(&self, cmd_buffer: vk::CommandBuffer, pipeline: vk::Pipeline) {
         unsafe {
-            self.render_device.cmd_bind_pipeline(
-                cmd_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline,
-            )
+            self.device
+                .cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline)
         };
     }
 
@@ -414,9 +403,9 @@ impl Renderer {
     fn cmd_draw_sky(&self, cmd_buffer: vk::CommandBuffer) {
         self.cmd_bind_pipeline(cmd_buffer, self.sky_pipeline);
         unsafe {
-            self.render_device
+            self.device
                 .cmd_set_cull_mode(cmd_buffer, vk::CullModeFlags::NONE);
-            self.render_device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
+            self.device.cmd_draw(cmd_buffer, 3, 1, 0, 0);
         }
     }
 
@@ -432,7 +421,7 @@ impl Renderer {
         // The mesh shaders pull vertices themselves, there's no vertex buffer.
         self.cmd_bind_pipeline(cmd_buffer, pipeline);
         unsafe {
-            self.render_device.cmd_bind_index_buffer(
+            self.device.cmd_bind_index_buffer(
                 cmd_buffer,
                 self.mesh_pool.index_buffer.handle,
                 0,
@@ -444,7 +433,7 @@ impl Renderer {
         let first_draw_offset =
             region as vk::DeviceSize * candidate_count as vk::DeviceSize * DRAW_STRIDE;
         unsafe {
-            self.render_device.cmd_draw_indexed_indirect_count(
+            self.device.cmd_draw_indexed_indirect_count(
                 cmd_buffer,
                 draw_buffer,
                 first_draw_offset,

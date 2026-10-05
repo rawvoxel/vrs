@@ -9,8 +9,8 @@ use glam::{Mat4, Vec3};
 use vrs::{
     mesh::MeshId,
     renderer::{
-        MeshCapacity, ProbeConfig, Renderer, RendererConfig, ShadowGrid, ShadowResolution, Sky,
-        Tonemapping,
+        MeshCapacity, ProbeConfig, Renderer, RendererConfig, Sky, Tonemapping, TraceResolution,
+        VoxelGrid,
     },
 };
 
@@ -45,7 +45,7 @@ pub fn config() -> RendererConfig {
     let chunks = (CHUNKS[0] * CHUNKS[1] * CHUNKS[2] + ring) as u32;
     RendererConfig {
         mesh_capacity: MeshCapacity {
-            type_words: chunks * (EDGE.pow(3) as u32 / 8 + 96),
+            chunk_words: chunks * (EDGE.pow(3) as u32 / 8 + 96),
             ..MeshCapacity::default()
         },
         global_illumination: Some(ProbeConfig {
@@ -122,11 +122,11 @@ impl World {
 /// Around the world's `CHUNKS`, a ring `RING_CHUNKS` wide of chunks of the next level of
 /// detail carries the hills on, each of voxels twice as big, as far again on every side.
 pub fn create_world(renderer: &mut Renderer) -> VkResult<Vec<MeshId>> {
-    renderer.set_palette(&PALETTE);
+    renderer.set_matte_colors(&PALETTE);
     renderer.lighting.sun_direction = Vec3::new(-0.6, 0.5, 0.25);
-    renderer.lighting.shadow_grid = Some(ShadowGrid::new(1.0, EDGE as u32).with_levels(2));
+    renderer.lighting.voxel_grid = Some(VoxelGrid::new(1.0, EDGE as u32).with_levels(2));
     // One shadow ray per 2x2 pixels, which looks nearly the same for well under half the cost.
-    renderer.lighting.shadow_resolution = ShadowResolution::Half;
+    renderer.lighting.trace_resolution = TraceResolution::Half;
     // A blue sky, the far hills fading into it, and highlights rolling off rather than clipping.
     renderer.lighting.sky = Some(Sky {
         haze_distance: 1500.0,

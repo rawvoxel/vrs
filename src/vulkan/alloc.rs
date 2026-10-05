@@ -4,7 +4,7 @@ use ash::{prelude::VkResult, vk};
 #[inline]
 pub fn vk_alloc(
     adapter: &Adapter,
-    logical_device: &ash::Device,
+    device: &ash::Device,
     memory_requirements: vk::MemoryRequirements,
     memory_property_flags: vk::MemoryPropertyFlags,
 ) -> VkResult<vk::DeviceMemory> {
@@ -22,7 +22,7 @@ pub fn vk_alloc(
         .allocation_size(memory_requirements.size)
         .memory_type_index(memory_type_index);
 
-    unsafe { logical_device.allocate_memory(&memory_allocate_info, None) }
+    unsafe { device.allocate_memory(&memory_allocate_info, None) }
 }
 
 #[inline]

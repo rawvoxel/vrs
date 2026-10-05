@@ -5,7 +5,7 @@ use ash::prelude::VkResult;
 use glam::Vec3;
 
 /// The most lights a frame lights with, the rest are left out. Light indices fit 8 bits in
-/// `shadow.slang`'s light shadows.
+/// `trace_pass.slang`'s light shadows.
 pub const MAX_LIGHTS: usize = 255;
 
 /// A point light, or a spot light with a `spot`, lighting chunk meshes within its `range`.
@@ -124,11 +124,7 @@ impl Renderer {
             self.gpu_lights.push(GpuLight::NONE);
         }
         unsafe {
-            self.frame_light_buffers[frame].write(
-                &self.adapter,
-                &self.render_device,
-                &self.gpu_lights,
-            )
+            self.frame_light_buffers[frame].write(&self.adapter, &self.device, &self.gpu_lights)
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::{
     renderer::{
         LightingUniforms,
-        lighting::{probes::ProbeUniforms, shadows::ShadowUniforms},
+        lighting::{probes::ProbeUniforms, trace::TraceUniforms},
         shader::bindings,
     },
     vulkan::{adapter::Adapter, buffer::Buffer},
@@ -17,22 +17,40 @@ pub struct FrameUniforms {
     /// From the world to the camera, and the camera to Vulkan's clip space.
     pub view: Mat4,
     pub proj: Mat4,
+    /// From clip space back to the world, to find a pixel's position from its depth.
+    pub inverse_view_proj: Mat4,
+    pub camera_position: [f32; 3],
+    pub padding: f32,
+    /// The frame's width and height in pixels.
+    pub frame_size: [u32; 2],
+    /// 1 when the trace pass runs, and when it also finds the light from everywhere but the
+    /// sun, for shading to upscale.
+    pub uses_trace_pass: u32,
+    pub traced_indirect: u32,
     pub lighting: LightingUniforms,
     pub probe_volume: ProbeUniforms,
-    pub shadow: ShadowUniforms,
+    pub trace: TraceUniforms,
 }
 
+// Each part fills whole 16 byte rows, as the shaders' std140 layout lays them out.
+const _: () = {
+    assert!(size_of::<LightingUniforms>().is_multiple_of(16));
+    assert!(size_of::<ProbeUniforms>().is_multiple_of(16));
+    assert!(size_of::<TraceUniforms>().is_multiple_of(16));
+    assert!(size_of::<FrameUniforms>().is_multiple_of(16));
+};
+
 /// A mapped `HOST_VISIBLE` buffer the size of `FrameUniforms`.
-pub fn create_uniform_buffer(adapter: &Adapter, render_device: &ash::Device) -> VkResult<Buffer> {
+pub fn create_uniform_buffer(adapter: &Adapter, device: &ash::Device) -> VkResult<Buffer> {
     let info = vk::BufferCreateInfo::default()
         .size(size_of::<FrameUniforms>() as vk::DeviceSize)
         .usage(vk::BufferUsageFlags::UNIFORM_BUFFER)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
 
-    let mut buffer = Buffer::new(adapter, render_device, info, flags, 0)?;
-    if let Err(err) = buffer.mem_map(render_device) {
-        unsafe { buffer.destroy(render_device) };
+    let mut buffer = Buffer::new(adapter, device, info, flags, 0)?;
+    if let Err(err) = buffer.mem_map(device) {
+        unsafe { buffer.destroy(device) };
         return Err(err);
     }
     Ok(buffer)
@@ -40,7 +58,7 @@ pub fn create_uniform_buffer(adapter: &Adapter, render_device: &ash::Device) -> 
 
 /// Points each frame's descriptor set at that frame's uniform buffer.
 pub fn write_uniform_descriptor_sets(
-    render_device: &ash::Device,
+    device: &ash::Device,
     descriptor_sets: &[vk::DescriptorSet],
     uniform_buffers: &[Buffer],
 ) {
@@ -64,5 +82,5 @@ pub fn write_uniform_descriptor_sets(
         })
         .collect();
 
-    unsafe { render_device.update_descriptor_sets(&writes, &[]) }
+    unsafe { device.update_descriptor_sets(&writes, &[]) }
 }

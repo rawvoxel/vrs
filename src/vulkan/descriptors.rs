@@ -2,7 +2,7 @@ use ash::{prelude::VkResult, vk};
 
 #[inline]
 pub fn create_descriptor_pool(
-    logical_device: &ash::Device,
+    device: &ash::Device,
     pool_sizes: &[vk::DescriptorPoolSize],
     max_sets: u32,
 ) -> VkResult<vk::DescriptorPool> {
@@ -10,13 +10,13 @@ pub fn create_descriptor_pool(
         .max_sets(max_sets)
         .pool_sizes(pool_sizes);
 
-    unsafe { logical_device.create_descriptor_pool(&info, None) }
+    unsafe { device.create_descriptor_pool(&info, None) }
 }
 
 /// One descriptor per binding, numbered in the order of `types`.
 #[inline]
 pub fn create_descriptor_set_layout(
-    logical_device: &ash::Device,
+    device: &ash::Device,
     types: &[vk::DescriptorType],
     stage_flags: vk::ShaderStageFlags,
 ) -> VkResult<vk::DescriptorSetLayout> {
@@ -33,13 +33,13 @@ pub fn create_descriptor_set_layout(
         .collect();
     let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
-    unsafe { logical_device.create_descriptor_set_layout(&info, None) }
+    unsafe { device.create_descriptor_set_layout(&info, None) }
 }
 
 /// `count` sets of the same layout.
 #[inline]
 pub fn allocate_descriptor_sets(
-    logical_device: &ash::Device,
+    device: &ash::Device,
     descriptor_pool: vk::DescriptorPool,
     set_layout: vk::DescriptorSetLayout,
     count: u32,
@@ -49,5 +49,5 @@ pub fn allocate_descriptor_sets(
         .descriptor_pool(descriptor_pool)
         .set_layouts(&set_layouts);
 
-    unsafe { logical_device.allocate_descriptor_sets(&info) }
+    unsafe { device.allocate_descriptor_sets(&info) }
 }

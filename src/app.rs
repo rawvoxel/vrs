@@ -1,4 +1,4 @@
-use crate::vulkan::{adapter::Adapter, debug::Debug};
+use crate::vulkan::{adapter::Adapter, validation::Messenger};
 use anyhow::Result;
 use ash::{ext, khr, prelude::VkResult, vk};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -12,7 +12,7 @@ pub struct App {
     pub(crate) instance: ash::Instance,
     pub(crate) debug_instance: ext::debug_utils::Instance,
     /// Only present in debug builds, when the validation layer is installed.
-    pub(crate) debug: Option<Debug>,
+    pub(crate) messenger: Option<Messenger>,
     pub(crate) surface_instance: khr::surface::Instance,
     /// The window's surface, owned by the `App`. Null when headless.
     pub(crate) surface: vk::SurfaceKHR,
@@ -52,7 +52,7 @@ impl App {
         // Dropping the `App` destroys whatever was created, if anything below fails.
         let mut app = Self {
             debug_instance: ext::debug_utils::Instance::new(&entry, &instance),
-            debug: None,
+            messenger: None,
             surface_instance: khr::surface::Instance::new(&entry, &instance),
             surface: vk::SurfaceKHR::null(),
             adapters: Vec::new(),
@@ -60,7 +60,7 @@ impl App {
             instance,
         };
         if validation {
-            app.debug = Some(Debug::new(&app.debug_instance)?);
+            app.messenger = Some(Messenger::new(&app.debug_instance)?);
         }
         app.adapters = unsafe {
             app.instance
@@ -96,7 +96,7 @@ impl App {
     /// Only in debug builds, when the validation layer is installed.
     #[inline]
     pub fn validation_enabled(&self) -> bool {
-        self.debug.is_some()
+        self.messenger.is_some()
     }
 
     #[inline]
@@ -126,8 +126,8 @@ impl Drop for App {
             if let Some(surface) = self.surface() {
                 self.surface_instance.destroy_surface(surface, None);
             }
-            if let Some(debug) = &self.debug {
-                debug.destroy(&self.debug_instance);
+            if let Some(messenger) = &self.messenger {
+                messenger.destroy(&self.debug_instance);
             }
             self.instance.destroy_instance(None);
         }

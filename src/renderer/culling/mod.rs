@@ -79,14 +79,10 @@ pub struct Culler {
 }
 
 impl Culler {
-    pub fn new(
-        adapter: &Adapter,
-        logical_device: &ash::Device,
-        frames_in_flight: u32,
-    ) -> VkResult<Self> {
+    pub fn new(adapter: &Adapter, device: &ash::Device, frames_in_flight: u32) -> VkResult<Self> {
         let mut culler = Self::null();
-        if let Err(err) = culler.create(adapter, logical_device, frames_in_flight) {
-            unsafe { culler.destroy(logical_device) };
+        if let Err(err) = culler.create(adapter, device, frames_in_flight) {
+            unsafe { culler.destroy(device) };
             return Err(err);
         }
         Ok(culler)
@@ -110,12 +106,12 @@ impl Culler {
     fn create(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         frames_in_flight: u32,
     ) -> VkResult<()> {
         // Mesh infos, candidates, draws, draw counts and the depth pyramid.
         self.desc_set_layout = create_descriptor_set_layout(
-            logical_device,
+            device,
             &[
                 vk::DescriptorType::STORAGE_BUFFER,
                 vk::DescriptorType::STORAGE_BUFFER,
@@ -133,18 +129,18 @@ impl Culler {
                 .ty(vk::DescriptorType::SAMPLED_IMAGE)
                 .descriptor_count(frames_in_flight),
         ];
-        self.desc_pool = create_descriptor_pool(logical_device, &pool_sizes, frames_in_flight)?;
+        self.desc_pool = create_descriptor_pool(device, &pool_sizes, frames_in_flight)?;
         self.frame_desc_sets = allocate_descriptor_sets(
-            logical_device,
+            device,
             self.desc_pool,
             self.desc_set_layout,
             frames_in_flight,
         )?;
 
         (self.pipeline, self.pipeline_layout) = create_compute_pipeline(
-            logical_device,
+            device,
             CULL_SPV,
-            c"cullMain",
+            c"cullMeshes",
             self.desc_set_layout,
             size_of::<CullParams>() as u32,
         )?;
@@ -162,20 +158,20 @@ impl Culler {
         for _ in 0..frames_in_flight {
             self.frame_candidate_buffers.push(DynamicBuffer::new(
                 adapter,
-                logical_device,
+                device,
                 vk::BufferUsageFlags::STORAGE_BUFFER,
                 INITIAL_CANDIDATES * size_of::<u32>() as vk::DeviceSize,
             )?);
             self.frame_draw_buffers.push(DynamicBuffer::with_memory(
                 adapter,
-                logical_device,
+                device,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 2 * INITIAL_CANDIDATES * DRAW_STRIDE,
             )?);
             self.frame_count_buffers.push(Buffer::new(
                 adapter,
-                logical_device,
+                device,
                 count_info,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 0,
@@ -194,7 +190,7 @@ impl Culler {
     pub unsafe fn prepare(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         mesh_pool: &MeshPool,
         depth_pyramid: &DepthPyramid,
         frame: usize,
@@ -203,8 +199,8 @@ impl Culler {
     ) -> VkResult<()> {
         let draws_size = 2 * candidates.len() as vk::DeviceSize * DRAW_STRIDE;
         unsafe {
-            self.frame_candidate_buffers[frame].write(adapter, logical_device, candidates)?;
-            self.frame_draw_buffers[frame].reserve(adapter, logical_device, draws_size)?;
+            self.frame_candidate_buffers[frame].write(adapter, device, candidates)?;
+            self.frame_draw_buffers[frame].reserve(adapter, device, draws_size)?;
         }
         let count_buffer = self.frame_count_buffers[frame].handle;
 
@@ -244,11 +240,11 @@ impl Culler {
         );
 
         unsafe {
-            logical_device.update_descriptor_sets(&writes, &[]);
+            device.update_descriptor_sets(&writes, &[]);
 
             // Last frame's phase 2 updated mesh visibility, which this frame reads.
             // The draw counts are reset.
-            logical_device.cmd_fill_buffer(cmd_buffer, count_buffer, 0, vk::WHOLE_SIZE, 0);
+            device.cmd_fill_buffer(cmd_buffer, count_buffer, 0, vk::WHOLE_SIZE, 0);
             let barrier = vk::MemoryBarrier2::default()
                 .src_stage_mask(
                     vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::CLEAR,
@@ -262,7 +258,7 @@ impl Culler {
                 );
             let dependency_info =
                 vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));
-            logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
+            device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
         }
 
         Ok(())
@@ -277,7 +273,7 @@ impl Culler {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn cmd_cull(
         &self,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         depth_pyramid: &DepthPyramid,
         frame: usize,
         cmd_buffer: vk::CommandBuffer,
@@ -301,12 +297,8 @@ impl Culler {
         };
 
         unsafe {
-            logical_device.cmd_bind_pipeline(
-                cmd_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline,
-            );
-            logical_device.cmd_bind_descriptor_sets(
+            device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_descriptor_sets(
                 cmd_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
@@ -314,14 +306,14 @@ impl Culler {
                 slice::from_ref(&self.frame_desc_sets[frame]),
                 &[],
             );
-            logical_device.cmd_push_constants(
+            device.cmd_push_constants(
                 cmd_buffer,
                 self.pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
                 as_bytes(&params),
             );
-            logical_device.cmd_dispatch(cmd_buffer, candidate_count.div_ceil(WORKGROUP_SIZE), 1, 1);
+            device.cmd_dispatch(cmd_buffer, candidate_count.div_ceil(WORKGROUP_SIZE), 1, 1);
 
             let barrier = vk::MemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
@@ -330,28 +322,28 @@ impl Culler {
                 .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ);
             let dependency_info =
                 vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));
-            logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
+            device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
         }
     }
 
     /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
-    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
             for buffer in self
                 .frame_candidate_buffers
                 .iter()
                 .chain(&self.frame_draw_buffers)
             {
-                buffer.destroy(logical_device);
+                buffer.destroy(device);
             }
             for buffer in self.frame_count_buffers.iter() {
-                buffer.destroy(logical_device);
+                buffer.destroy(device);
             }
-            logical_device.destroy_descriptor_pool(self.desc_pool, None);
-            logical_device.destroy_descriptor_set_layout(self.desc_set_layout, None);
-            logical_device.destroy_pipeline(self.pipeline, None);
-            logical_device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.desc_pool, None);
+            device.destroy_descriptor_set_layout(self.desc_set_layout, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }

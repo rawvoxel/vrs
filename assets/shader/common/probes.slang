@@ -4,16 +4,16 @@
 // cascade. Matches `renderer::lighting::probes::PROBE_CELL`.
 static const int PROBE_CELL = 16;
 // Matches `renderer::lighting::probes::volume::IRRADIANCE_TEXELS` and
-// `renderer::lighting::probes::volume::DEPTH_TEXELS`, each with a one texel border.
+// `renderer::lighting::probes::volume::DISTANCE_TEXELS`, each with a one texel border.
 static const int IRRADIANCE_TEXELS = 8;
-static const int DEPTH_TEXELS = 14;
+static const int DISTANCE_TEXELS = 14;
 // Irradiance is stored to the power of 1 / 5, which blends a drop in light as fast as a
 // rise looks [Majercik et al. 2021].
 static const float IRRADIANCE_GAMMA = 5.0;
 
 // Probes in each cascade.
 uint probesPerCascade() {
-    uint3 counts = ubo.probeVolume.volumeCounts.xyz;
+    uint3 counts = uniforms.probeVolume.volumeCounts;
     return counts.x * counts.y * counts.z;
 }
 
@@ -25,8 +25,8 @@ int cascadeOf(uint slot) {
 // The slot of the probe of cascade `cascade`'s probe cell `cell`, false outside it.
 bool probeSlot(int cascade, int3 cell, out uint slot) {
     slot = 0;
-    int3 counts = int3(ubo.probeVolume.volumeCounts.xyz);
-    int3 relative = cell - ubo.probeVolume.volumeMins[cascade].xyz;
+    int3 counts = int3(uniforms.probeVolume.volumeCounts);
+    int3 relative = cell - uniforms.probeVolume.volumeMins[cascade].xyz;
     if (any(relative < 0) || any(relative >= counts)) {
         return false;
     }
@@ -37,8 +37,8 @@ bool probeSlot(int cascade, int3 cell, out uint slot) {
 
 // Where direction `direction` of slot `slot`'s map of `texels` interior texels is in its atlas.
 float2 atlasUV(uint slot, float3 direction, int texels) {
-    uint columns = ubo.probeVolume.volumeCounts.w;
-    uint rows = (probesPerCascade() * ubo.probeVolume.frame.z + columns - 1) / columns;
+    uint columns = uniforms.probeVolume.atlasColumns;
+    uint rows = (probesPerCascade() * uniforms.probeVolume.cascades + columns - 1) / columns;
     int tile = texels + 2;
     float2 tileMin = float2(slot % columns, slot / columns) * tile;
     float2 texel = tileMin + 1.0 + (octahedralEncode(direction) * 0.5 + 0.5) * texels;
@@ -46,7 +46,7 @@ float2 atlasUV(uint slot, float3 direction, int texels) {
 }
 
 // The irradiance cascade `cascade`'s probes around a surface see, for a point `position` in
-// the shadow grid's finest voxels with unit normal `normal`, seen from direction `toViewer`.
+// the voxel grid's finest voxels with unit normal `normal`, seen from direction `toViewer`.
 // Only probes updated at least `minUpdates` times count. `coverage` falls from 1 to 0 over the
 // cascade's last cell, and `found` is false when no probe counted.
 //
@@ -57,15 +57,15 @@ float2 atlasUV(uint slot, float3 direction, int texels) {
 // moved off center blend smoothly [Roháček 2022].
 float3 sampleIrradiance(int cascade, float3 position, float3 normal, float3 toViewer, uint minUpdates, out float coverage, out bool found) {
     float spacing = float(PROBE_CELL << cascade);
-    float bias = 0.75 * spacing * ubo.probeVolume.tuning.w;
+    float bias = 0.75 * spacing * uniforms.probeVolume.selfShadowBias;
     float3 biased = position + (normal * 0.2 + toViewer * 0.8) * bias;
     // Probes sit at the centers of their cells unless voxels are in the way.
     float3 gridPosition = biased / spacing - 0.5;
     int3 base = int3(floor(gridPosition));
     float3 alpha = gridPosition - float3(base);
 
-    float3 relative = gridPosition - float3(ubo.probeVolume.volumeMins[cascade].xyz);
-    float3 edgeDistance = min(relative, float3(ubo.probeVolume.volumeCounts.xyz) - 1.0 - relative);
+    float3 relative = gridPosition - float3(uniforms.probeVolume.volumeMins[cascade].xyz);
+    float3 edgeDistance = min(relative, float3(uniforms.probeVolume.volumeCounts) - 1.0 - relative);
     coverage = saturate(min(edgeDistance.x, min(edgeDistance.y, edgeDistance.z)));
     found = false;
     if (coverage <= 0.0) {
@@ -97,7 +97,7 @@ float3 sampleIrradiance(int cascade, float3 position, float3 normal, float3 toVi
         // Probes whose voxels are nearer than the point most likely can't see it.
         float3 probeToPoint = biased - probe.position;
         float distance = length(probeToPoint);
-        float2 moments = probeDepth.SampleLevel(atlasUV(slot, probeToPoint / max(distance, 1e-4), DEPTH_TEXELS), 0.0).xy;
+        float2 moments = probeDistances.SampleLevel(atlasUV(slot, probeToPoint / max(distance, 1e-4), DISTANCE_TEXELS), 0.0).xy;
         if (distance > moments.x) {
             float variance = abs(moments.x * moments.x - moments.y);
             float beyond = distance - moments.x;

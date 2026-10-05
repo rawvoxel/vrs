@@ -29,26 +29,22 @@ impl Image {
 
     pub fn new(
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         image_info: vk::ImageCreateInfo,
         memory_property_flags: vk::MemoryPropertyFlags,
     ) -> VkResult<Self> {
         unsafe {
             let mut this = Self::null();
-            this.handle = logical_device.create_image(&image_info, None)?;
-            let memory_requirements = logical_device.get_image_memory_requirements(this.handle);
-            let bound = alloc::vk_alloc(
-                adapter,
-                logical_device,
-                memory_requirements,
-                memory_property_flags,
-            )
-            .and_then(|memory| {
-                this.memory = memory;
-                logical_device.bind_image_memory(this.handle, memory, 0)
-            });
+            this.handle = device.create_image(&image_info, None)?;
+            let memory_requirements = device.get_image_memory_requirements(this.handle);
+            let bound =
+                alloc::vk_alloc(adapter, device, memory_requirements, memory_property_flags)
+                    .and_then(|memory| {
+                        this.memory = memory;
+                        device.bind_image_memory(this.handle, memory, 0)
+                    });
             if let Err(err) = bound {
-                this.destroy(logical_device);
+                this.destroy(device);
                 return Err(err);
             }
             Ok(this)
@@ -58,10 +54,10 @@ impl Image {
     /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     #[inline]
-    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
-            logical_device.free_memory(self.memory, None);
-            logical_device.destroy_image(self.handle, None);
+            device.free_memory(self.memory, None);
+            device.destroy_image(self.handle, None);
         }
     }
 }
@@ -84,7 +80,7 @@ impl StorageImage {
     /// `extent` texels of `format`, usable for `usage` too.
     pub fn new(
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         extent: vk::Extent2D,
         format: vk::Format,
         usage: vk::ImageUsageFlags,
@@ -100,14 +96,9 @@ impl StorageImage {
             .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = Image::new(
-            adapter,
-            logical_device,
-            info,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?;
+        let image = Image::new(adapter, device, info, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
         let view = create_image_view(
-            logical_device,
+            device,
             image.handle,
             format,
             vk::ComponentMapping::default(),
@@ -116,7 +107,7 @@ impl StorageImage {
         match view {
             Ok(view) => Ok(Self { image, view }),
             Err(err) => {
-                unsafe { image.destroy(logical_device) };
+                unsafe { image.destroy(device) };
                 Err(err)
             }
         }
@@ -126,10 +117,10 @@ impl StorageImage {
     ///
     /// # Safety
     /// The device must be done with it.
-    pub unsafe fn destroy(&mut self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
-            logical_device.destroy_image_view(self.view, None);
-            self.image.destroy(logical_device);
+            device.destroy_image_view(self.view, None);
+            self.image.destroy(device);
         }
         *self = Self::null();
     }
@@ -137,7 +128,7 @@ impl StorageImage {
 
 #[inline]
 pub fn create_image_view(
-    logical_device: &ash::Device,
+    device: &ash::Device,
     image: vk::Image,
     format: vk::Format,
     components: vk::ComponentMapping,
@@ -155,13 +146,13 @@ pub fn create_image_view(
                 .layer_count(1),
         );
 
-    unsafe { logical_device.create_image_view(&info, None) }
+    unsafe { device.create_image_view(&info, None) }
 }
 
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn transition_layout(
-    render_device: &ash::Device,
+    device: &ash::Device,
     image: vk::Image,
     cmd_buffer: vk::CommandBuffer,
     old_layout: vk::ImageLayout,
@@ -191,6 +182,6 @@ pub fn transition_layout(
         vk::DependencyInfo::default().image_memory_barriers(slice::from_ref(&image_memory_barrier));
 
     unsafe {
-        render_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
+        device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
     }
 }

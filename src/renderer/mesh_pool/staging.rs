@@ -31,13 +31,13 @@ impl UploadStaging {
     pub fn create(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         frames_in_flight: usize,
     ) -> VkResult<()> {
         for _ in 0..frames_in_flight {
             self.frame_buffers.push(DynamicBuffer::new(
                 adapter,
-                logical_device,
+                device,
                 vk::BufferUsageFlags::TRANSFER_SRC,
                 INITIAL_BYTES,
             )?);
@@ -63,7 +63,7 @@ impl UploadStaging {
     pub unsafe fn push(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         frame: usize,
         pieces: &[&[u8]],
     ) -> VkResult<vk::DeviceSize> {
@@ -75,7 +75,7 @@ impl UploadStaging {
         let len: usize = pieces.iter().map(|piece| piece.len()).sum();
         let end = start + len as vk::DeviceSize;
         let buffer = &mut self.frame_buffers[frame];
-        unsafe { buffer.reserve_preserving(adapter, logical_device, end, start)? };
+        unsafe { buffer.reserve_preserving(adapter, device, end, start)? };
         let mut offset = start;
         for piece in pieces {
             buffer.buffer.mem_write_at(offset, piece);
@@ -99,9 +99,9 @@ impl UploadStaging {
 
     /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
-    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&self, device: &ash::Device) {
         for buffer in self.frame_buffers.iter() {
-            unsafe { buffer.destroy(logical_device) };
+            unsafe { buffer.destroy(device) };
         }
     }
 }

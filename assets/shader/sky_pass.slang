@@ -21,8 +21,8 @@ SkyOutput skyVert(uint vertexIndex: SV_VertexID) {
 float4 skyFrag(SkyOutput input) : SV_Target {
     // Two points along the pixel's ray, neither at the far plane, which an infinite
     // projection puts at infinity.
-    float4 near = mul(ubo.shadow.inverseViewProj, float4(input.clip, 0.0, 1.0));
-    float4 beyond = mul(ubo.shadow.inverseViewProj, float4(input.clip, 0.5, 1.0));
+    float4 near = mul(uniforms.inverseViewProj, float4(input.clip, 0.0, 1.0));
+    float4 beyond = mul(uniforms.inverseViewProj, float4(input.clip, 0.5, 1.0));
     float3 direction = normalize(beyond.xyz / beyond.w - near.xyz / near.w);
     return float4(toDisplay(skyRadiance(direction, true)), 1.0);
 }

@@ -13,12 +13,12 @@ pub(super) struct FrameData {
     pub view_proj: Mat4,
     /// Whether the light probes are updated and sampled.
     pub probes: bool,
-    /// Whether the frame's depth is drawn first, for the shadow pass, see
-    /// `Renderer::uses_shadow_pass`.
-    pub shadow_pass: bool,
+    /// Whether the frame's depth is drawn first, for the trace pass, see
+    /// `Renderer::uses_trace_pass`.
+    pub trace_pass: bool,
     /// Whether the light probes are drawn over the frame, see `DebugView::Probes`.
-    pub draw_probes: bool,
-    /// Whether color is drawn with the light from everywhere but the sun the shadow pass lit.
+    pub probe_overlay: bool,
+    /// Whether color is drawn with the light from everywhere but the sun the trace pass lit.
     pub upscaled_indirect: bool,
     /// Whether the `Lighting::sky` is drawn behind the meshes.
     pub sky: bool,
@@ -33,24 +33,24 @@ impl FrameData {
 
 impl Renderer {
     /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces, its
-    /// palette, shadow table, changed chunks and lights, which growing replaces, and the depth
-    /// buffer and the shadow pass's images and tiles, which resizing replaces. The uniforms
+    /// palette, chunk table, changed chunks and lights, which growing replaces, and the depth
+    /// buffer and the trace pass's images and tiles, which resizing replaces. The uniforms
     /// and light probes never move.
     ///
     /// # Safety
     /// The device must not be using `frame`'s descriptor set.
     unsafe fn write_frame_descriptors(&self, frame: usize) {
         let buffers = [
-            (bindings::VERTICES, self.mesh_pool.vertex_buffer.handle),
+            (bindings::VERTEX_WORDS, self.mesh_pool.vertex_buffer.handle),
             (bindings::MESHES, self.mesh_pool.info_buffer.handle),
-            (bindings::TYPES, self.mesh_pool.type_buffer.handle),
+            (bindings::CHUNK_WORDS, self.mesh_pool.chunk_buffer.handle),
             (
                 bindings::PALETTE,
                 self.frame_palette_buffers[frame].buffer.handle,
             ),
             (
-                bindings::SHADOW_TABLE,
-                self.frame_shadow_tables[frame].buffer.handle,
+                bindings::CHUNK_TABLE,
+                self.frame_chunk_tables[frame].buffer.handle,
             ),
             (
                 bindings::CHANGED_CHUNKS,
@@ -60,7 +60,7 @@ impl Renderer {
                 bindings::LIGHTS,
                 self.frame_light_buffers[frame].buffer.handle,
             ),
-            (bindings::TILE_LIGHTS, self.shadow_pass.tiles.handle),
+            (bindings::LIGHT_TILES, self.trace_pass.tiles.handle),
         ]
         .map(|(binding, buffer)| {
             let info = vk::DescriptorBufferInfo::default()
@@ -68,7 +68,7 @@ impl Renderer {
                 .range(vk::WHOLE_SIZE);
             (binding, info)
         });
-        let pass = &self.shadow_pass;
+        let pass = &self.trace_pass;
         let general = |view| {
             vk::DescriptorImageInfo::default()
                 .image_view(view)
@@ -80,7 +80,7 @@ impl Renderer {
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         let images = [
             (bindings::SHADOWS_STORAGE, general(pass.shadows.view)),
-            (bindings::DEPTH, depth),
+            (bindings::DEPTH_BUFFER, depth),
             (
                 bindings::SHADOWS,
                 general(pass.shadows.view).sampler(pass.sampler),
@@ -113,18 +113,18 @@ impl Renderer {
                     .map(|(binding, info)| write(*binding).image_info(slice::from_ref(info))),
             )
             .collect();
-        unsafe { self.render_device.update_descriptor_sets(&writes, &[]) };
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 
     /// Waits for the device to finish `frame`'s last use, freeing up what it used.
     pub(super) fn wait_for_frame(&mut self, frame: usize) -> VkResult<()> {
         unsafe {
-            self.render_device
+            self.device
                 .wait_for_fences(&[self.in_flight_frames[frame]], true, u64::MAX)?;
         }
         self.mesh_pool.release_frame(frame);
         let timings = self.frame_timestamps[frame].read(
-            &self.render_device,
+            &self.device,
             self.adapter.properties.limits.timestamp_period,
             self.graphics_queue_family.properties.timestamp_valid_bits,
         );
@@ -146,7 +146,7 @@ impl Renderer {
         let frame_in_flight = self.in_flight_frames[frame];
         self.wait_for_frame(frame)?;
         if self.is_headless() {
-            unsafe { self.render_device.reset_fences(&[frame_in_flight])? };
+            unsafe { self.device.reset_fences(&[frame_in_flight])? };
             return Ok(Some(frame as u32));
         }
         unsafe {
@@ -170,7 +170,7 @@ impl Renderer {
             };
 
             // Only reset once work that signals the fence is certain to be submitted.
-            self.render_device.reset_fences(&[frame_in_flight])?;
+            self.device.reset_fences(&[frame_in_flight])?;
             Ok(Some(image_index))
         }
     }
@@ -189,12 +189,19 @@ impl Renderer {
             lighting
         };
 
+        let frame_size = self.swapchain.extent;
         let uniforms = FrameUniforms {
             view: draws.view,
             proj: draws.proj,
+            inverse_view_proj: (draws.proj * draws.view).inverse(),
+            camera_position: draws.view.inverse().w_axis.truncate().to_array(),
+            padding: 0.0,
+            frame_size: [frame_size.width, frame_size.height],
+            uses_trace_pass: self.uses_trace_pass() as u32,
+            traced_indirect: self.trace_pass_finds_indirect() as u32,
             lighting,
             probe_volume: self.probe_uniforms(draws.view),
-            shadow: self.shadow_uniforms(draws.proj * draws.view),
+            trace: self.trace_uniforms(),
         };
         self.uniform_buffers[frame].mem_write(slice::from_ref(&uniforms));
 
@@ -206,11 +213,11 @@ impl Renderer {
                 .collect(),
             view_proj: draws.proj * draws.view,
             probes: self.probes_enabled(),
-            shadow_pass: self.uses_shadow_pass(),
-            draw_probes: self.lighting.debug_view == super::DebugView::Probes
+            trace_pass: self.uses_trace_pass(),
+            probe_overlay: self.lighting.debug_view == super::DebugView::Probes
                 && self.probes_enabled(),
             // The ambient occlusion's own view needs each pixel's.
-            upscaled_indirect: self.lights_indirect_in_shadow_pass()
+            upscaled_indirect: self.trace_pass_finds_indirect()
                 && self.lighting.debug_view != super::DebugView::AmbientOcclusion,
             sky: self.lighting.sky.is_some(),
         })
@@ -224,7 +231,7 @@ impl Renderer {
             let submit_info = vk::SubmitInfo2::default()
                 .command_buffer_infos(slice::from_ref(&cmd_buffer_submit_info));
             return unsafe {
-                self.render_device.queue_submit2(
+                self.device.queue_submit2(
                     self.graphics_queue.handle,
                     slice::from_ref(&submit_info),
                     self.in_flight_frames[frame],
@@ -251,7 +258,7 @@ impl Renderer {
             .image_indices(slice::from_ref(&image_index));
 
         unsafe {
-            self.render_device.queue_submit2(
+            self.device.queue_submit2(
                 self.graphics_queue.handle,
                 slice::from_ref(&submit_info),
                 self.in_flight_frames[frame],

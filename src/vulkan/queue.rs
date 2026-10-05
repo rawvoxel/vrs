@@ -35,9 +35,9 @@ impl Queue {
         self.index
     }
 
-    pub fn new(queue_family: &QueueFamily, logical_device: &ash::Device, queue_index: u32) -> Self {
+    pub fn new(queue_family: &QueueFamily, device: &ash::Device, queue_index: u32) -> Self {
         unsafe {
-            let queue = logical_device.get_device_queue(queue_family.index, queue_index);
+            let queue = device.get_device_queue(queue_family.index, queue_index);
             Self {
                 handle: queue,
                 index: queue_index,

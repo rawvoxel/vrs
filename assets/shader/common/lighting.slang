@@ -4,7 +4,7 @@
 // The light from everywhere but the sun reaching a surface facing `normal` where no probe
 // covers it: the sky's and the ground's, blended by how far it faces up.
 float3 ambientLight(float3 normal) {
-    return lerp(ubo.lighting.groundColor.rgb, ubo.lighting.skyColor.rgb, normal.y * 0.5 + 0.5);
+    return lerp(uniforms.lighting.groundColor, uniforms.lighting.skyColor, normal.y * 0.5 + 0.5);
 }
 
 // The light from everywhere but the sun reaching a surface at `gridPosition`, in the shadow
@@ -18,7 +18,7 @@ float3 ambientLight(float3 normal) {
 // frames to fade.
 float3 indirectLight(float3 gridPosition, float3 normal, float3 toViewer, bool probeRay) {
     float3 ambient = ambientLight(normal);
-    if (ubo.probeVolume.volumeMins[0].w == 0) {
+    if (uniforms.probeVolume.enabled == 0) {
         return ambient;
     }
     // Probes the probes' rays sample must have been updated once before, so the rays don't
@@ -28,7 +28,7 @@ float3 indirectLight(float3 gridPosition, float3 normal, float3 toViewer, bool p
     // How much is left for coarser cascades, and how much of that none of the probes lit.
     float remaining = 1.0;
     float unlit = 0.0;
-    for (int cascade = 0; cascade < int(ubo.probeVolume.frame.z) && remaining > 0.0; cascade++) {
+    for (int cascade = 0; cascade < int(uniforms.probeVolume.cascades) && remaining > 0.0; cascade++) {
         float coverage;
         bool found;
         float3 light = sampleIrradiance(cascade, gridPosition, normal, toViewer, minUpdates, coverage, found);
@@ -48,18 +48,18 @@ float3 indirectLight(float3 gridPosition, float3 normal, float3 toViewer, bool p
 // much of the sun reaches it, tinted by any see-through voxels in the way, when already known,
 // or negative for a shadow ray to find out.
 float3 sunLight(float3 worldPosition, float3 normal, float3 faceNormal, float3 sunVisible) {
-    LightingUniforms lighting = ubo.lighting;
-    float facing = dot(normal, lighting.sunDirection.xyz);
+    LightingUniforms lighting = uniforms.lighting;
+    float facing = dot(normal, lighting.sunDirection);
     if (facing <= 0.0) {
         return float3(0.0);
     }
     float3 visible = sunVisible;
     if (visible.x < 0.0) {
-        visible = lighting.shadowTable.w > 0
-            ? sunVisibility(toGrid(worldPosition) + faceNormal * SHADOW_RAY_OFFSET, lighting.sunDirection.xyz)
+        visible = lighting.gridLevels > 0
+            ? sunVisibility(toGrid(worldPosition) + faceNormal * SHADOW_RAY_OFFSET, lighting.sunDirection)
             : float3(1.0);
     }
-    return lighting.sunColor.rgb * facing * visible;
+    return lighting.sunColor * facing * visible;
 }
 
 // The light reaching a surface, straight from the sun and the lights, and from everywhere else.
@@ -68,9 +68,9 @@ struct SurfaceLight {
     float3 indirect;
 };
 
-// All the light from the sun and everywhere else reaching a surface, see `sunLight` and
-// `indirectLight`.
-float3 lightAt(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay, float3 sunVisible) {
+// The light from the sun and from everywhere else reaching a surface, see `sunLight` and
+// `indirectLight`, but not the lights', see `lightsAtHit`.
+float3 sunAndIndirectLightAt(float3 worldPosition, float3 normal, float3 faceNormal, float3 toViewer, bool probeRay, float3 sunVisible) {
     return sunLight(worldPosition, normal, faceNormal, sunVisible)
         + indirectLight(toGrid(worldPosition), normal, toViewer, probeRay);
 }

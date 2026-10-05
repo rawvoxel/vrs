@@ -4,7 +4,7 @@ use super::PROBE_CELL;
 use crate::mesh::chunk::VoxelTypes;
 
 /// Set in a cell's baked word when it has room for a probe. Matches `CELL_PLACED` in
-/// `probes.slang`.
+/// `probe_update.slang`.
 const CELL_PLACED: u32 = 1 << 31;
 
 /// Where each probe cell of a chunk puts its probe, and which cells have voxels, for chunks a

@@ -13,29 +13,29 @@ pub(crate) mod shader;
 pub(crate) mod timings;
 
 pub use config::RendererConfig;
-pub use debug::{Capture, FrameStats, MeshPoolStats};
+pub use debug::{Capture, FrameStats};
 pub use draw_list::DrawList;
 pub(crate) use lighting::LightingUniforms;
 pub use lighting::{
-    DebugView, Light, Lighting, MAX_CASCADES, MAX_LIGHTS, MAX_SHADOW_LEVELS, MAX_SHADOWED_LIGHTS,
-    ProbeConfig, ProbeTuning, ShadowGrid, ShadowResolution, Sky, Spot, Tonemapping,
+    DebugView, Light, Lighting, MAX_CASCADES, MAX_GRID_LEVELS, MAX_LIGHTS, MAX_SHADOWED_LIGHTS,
+    ProbeConfig, ProbeTuning, Sky, Spot, Tonemapping, TraceResolution, VoxelGrid,
 };
 pub use material::Material;
-pub use mesh_pool::MeshCapacity;
+pub use mesh_pool::{MeshCapacity, MeshKind, MeshPoolStats, MeshRecord};
 pub use timings::{GpuStage, GpuTimings};
 
 use crate::{
     mesh::MeshId,
     renderer::{
         culling::{Culler, depth_pyramid::DepthPyramid},
-        lighting::{lights::GpuLight, probes::ProbeVolume, shadows::ShadowPass},
+        lighting::{lights::GpuLight, probes::ProbeVolume, trace::TracePass},
         mesh_pool::MeshPool,
         timings::FrameTimestamps,
     },
     vulkan::{
         adapter::Adapter,
         buffer::{Buffer, DynamicBuffer},
-        commands::record_submit_commandbuffer,
+        commands::record_submit_command_buffer,
         queue::{Queue, QueueFamily},
         surface::Surface,
         swapchain::Swapchain,
@@ -64,7 +64,7 @@ pub struct Renderer {
     pub lighting: Lighting,
     /// The point and spot lights lighting chunk meshes, and the light probes, the first
     /// `MAX_LIGHTS` of them. Each pixel's brightest `Lighting::shadowed_lights` are shadowed,
-    /// in the `Lighting::shadow_grid`, at the `Lighting::shadow_resolution`. With any, frames
+    /// in the `Lighting::voxel_grid`, at the `Lighting::trace_resolution`. With any, frames
     /// draw their depth first, as with shadows. Changes take effect next frame.
     pub lights: Vec<Light>,
 
@@ -76,8 +76,8 @@ pub struct Renderer {
     /// The light probes, a single unused one when there's no `RendererConfig::global_illumination`.
     probe_volume: ProbeVolume,
     /// Traces shadows and reflections, and finds the light from everywhere but the sun, from
-    /// each frame's depth, see `uses_shadow_pass`.
-    shadow_pass: ShadowPass,
+    /// each frame's depth, see `uses_trace_pass`.
+    trace_pass: TracePass,
     /// Whether there's a `RendererConfig::global_illumination`.
     probes_configured: bool,
     /// Frames submitted, which seeds each frame's probe rays.
@@ -86,7 +86,7 @@ pub struct Renderer {
     last_frame: Option<debug::LastFrame>,
     /// Timestamps between each frame in flight's stages, null pools when the queue has none.
     frame_timestamps: Vec<FrameTimestamps>,
-    /// The last finished frame's, see `debug_gpu_timings`.
+    /// The last finished frame's, see `gpu_timings`.
     gpu_timings: Option<GpuTimings>,
     /// Whether the next frame is copied into `capture_buffers`.
     capture_requested: bool,
@@ -120,16 +120,16 @@ pub struct Renderer {
     /// Materials by voxel type, see `set_materials`.
     palette: Vec<material::GpuMaterial>,
     palette_version: u64,
-    /// Whether any material is glossy, for the shadow pass to trace reflections.
+    /// Whether any material is glossy, for the trace pass to trace reflections.
     glossy_palette: bool,
     frame_palette_buffers: Vec<DynamicBuffer>,
     /// The palette version each frame's buffer holds.
     frame_palette_versions: Vec<u64>,
     /// Which chunk is where around the camera, for shadow rays, see `write_lighting`.
-    frame_shadow_tables: Vec<DynamicBuffer>,
-    /// Reused to build each frame's shadow table in.
-    shadow_table: Vec<u32>,
-    /// Which shadow table entries' chunks changed since last frame, a bit each, see
+    frame_chunk_tables: Vec<DynamicBuffer>,
+    /// Reused to build each frame's chunk table in.
+    chunk_table: Vec<u32>,
+    /// Which chunk table entries' chunks changed since last frame, a bit each, see
     /// `write_lighting`.
     frame_changed_chunks: Vec<DynamicBuffer>,
     /// Reused to build each frame's changed chunks in.
@@ -138,9 +138,9 @@ pub struct Renderer {
     frame_light_buffers: Vec<DynamicBuffer>,
     /// Reused to build each frame's lights in.
     gpu_lights: Vec<GpuLight>,
-    /// The serial of each chunk in last frame's shadow table, by chunk coordinate, then level.
+    /// The serial of each chunk in last frame's chunk table, by chunk coordinate, then level.
     chunk_serials: HashMap<IVec4, u64>,
-    /// This frame's, built while the shadow table is.
+    /// This frame's, built while the chunk table is.
     chunk_serials_next: HashMap<IVec4, u64>,
     /// Last frame's lighting, to notice changes in it.
     previous_lighting: Option<Lighting>,
@@ -151,20 +151,20 @@ pub struct Renderer {
 
     /// Draws the mesh pool's meshes, pulling their vertices.
     mesh_pipeline: vk::Pipeline,
-    /// Draws the mesh pool's meshes' depth alone, for the shadow pass.
+    /// Draws the mesh pool's meshes' depth alone, for the trace pass.
     mesh_depth_pipeline: vk::Pipeline,
     /// Draws the mesh pool's meshes' color over their depth already drawn.
     mesh_over_depth_pipeline: vk::Pipeline,
-    /// The same, when the shadow pass lit the light from everywhere but the sun.
+    /// The same, when the trace pass lit the light from everywhere but the sun.
     mesh_upscaled_indirect_pipeline: vk::Pipeline,
     /// Draws the light probes, for `DebugView::Probes`.
-    probes_pipeline: vk::Pipeline,
+    probe_overlay_pipeline: vk::Pipeline,
     /// Draws the `Lighting::sky` where no mesh is.
     sky_pipeline: vk::Pipeline,
     graphics_pipeline_layout: vk::PipelineLayout,
     graphics_queue: Queue,
     graphics_queue_family: QueueFamily,
-    render_device: ash::Device,
+    device: ash::Device,
 
     surface: Surface,
     surface_instance: khr::surface::Instance,
@@ -220,7 +220,7 @@ impl Renderer {
         if self.swapchain_outdated || self.swapchain.extent != surface_extent {
             self.rebuild_swapchain(surface_extent)?;
         }
-        self.prepare_shadow_pass()?;
+        self.prepare_trace_pass()?;
         self.track_lighting_changes();
 
         // Every visible mesh is drawn by one counted indirect call.
@@ -247,14 +247,14 @@ impl Renderer {
 
     fn rebuild_swapchain(&mut self, extent: vk::Extent2D) -> VkResult<()> {
         unsafe {
-            self.render_device.device_wait_idle()?;
+            self.device.device_wait_idle()?;
 
             self.swapchain.rebuild(
                 &self.adapter,
                 &self.surface,
                 extent,
                 &self.graphics_queue_family,
-                &self.render_device,
+                &self.device,
                 &self.swapchain_device,
             )?;
             self.swapchain_outdated = false;
@@ -266,17 +266,17 @@ impl Renderer {
             };
             if self.rendered_images.len() != image_count {
                 for semaphore in self.rendered_images.drain(..) {
-                    self.render_device.destroy_semaphore(semaphore, None);
+                    self.device.destroy_semaphore(semaphore, None);
                 }
                 for _ in 0..image_count {
-                    let semaphore = create_semaphore(&self.render_device)?;
+                    let semaphore = create_semaphore(&self.device)?;
                     self.rendered_images.push(semaphore);
                 }
             }
 
             self.depth_pyramid.resize(
                 &self.adapter,
-                &self.render_device,
+                &self.device,
                 self.swapchain.depth_image_view,
                 self.swapchain.extent,
             )?;
@@ -287,29 +287,28 @@ impl Renderer {
     /// Readies a new depth pyramid, waiting for the device.
     fn init_depth_pyramid_layout(&self) -> VkResult<()> {
         self.run_init_commands(|cmd_buffer| unsafe {
-            self.depth_pyramid
-                .cmd_init_layout(&self.render_device, cmd_buffer)
+            self.depth_pyramid.cmd_init_layout(&self.device, cmd_buffer)
         })
     }
 
-    /// Readies new shadow pass images, waiting for the device.
-    fn init_shadow_pass(&self) -> VkResult<()> {
+    /// Readies new trace pass images, waiting for the device.
+    fn init_trace_pass(&self) -> VkResult<()> {
         self.run_init_commands(|cmd_buffer| unsafe {
-            self.shadow_pass.cmd_init(&self.render_device, cmd_buffer)
+            self.trace_pass.cmd_init(&self.device, cmd_buffer)
         })
     }
 
     /// Readies the light probes, waiting for the device.
     fn init_probe_volume(&self) -> VkResult<()> {
         self.run_init_commands(|cmd_buffer| unsafe {
-            self.probe_volume.cmd_init(&self.render_device, cmd_buffer)
+            self.probe_volume.cmd_init(&self.device, cmd_buffer)
         })
     }
 
     /// Records `record` into the init command buffer, submits it and waits for it to finish.
     fn run_init_commands(&self, record: impl FnOnce(vk::CommandBuffer)) -> VkResult<()> {
-        record_submit_commandbuffer(
-            &self.render_device,
+        record_submit_command_buffer(
+            &self.device,
             self.init_cmd_buffer,
             self.init_cmd_fence,
             self.graphics_queue.handle,
@@ -319,7 +318,7 @@ impl Renderer {
             record,
         )?;
         unsafe {
-            self.render_device
+            self.device
                 .wait_for_fences(&[self.init_cmd_fence], true, u64::MAX)
         }
     }
@@ -329,7 +328,7 @@ impl Renderer {
 /// Anything `create` didn't get to is still null, which Vulkan destroys as a no-op.
 impl Drop for Renderer {
     fn drop(&mut self) {
-        let device = &self.render_device;
+        let device = &self.device;
         unsafe {
             // NOTE: Nothing can be done about a lost device here, so destroy regardless.
             let _ = device.device_wait_idle();
@@ -338,12 +337,12 @@ impl Drop for Renderer {
             self.culler.destroy(device);
             self.depth_pyramid.destroy(device);
             self.probe_volume.destroy(device);
-            self.shadow_pass.destroy(device);
+            self.trace_pass.destroy(device);
             for buffer in self
                 .capture_buffers
                 .iter()
                 .chain(&self.frame_palette_buffers)
-                .chain(&self.frame_shadow_tables)
+                .chain(&self.frame_chunk_tables)
                 .chain(&self.frame_changed_chunks)
                 .chain(&self.frame_light_buffers)
             {
@@ -378,7 +377,7 @@ impl Drop for Renderer {
             device.destroy_pipeline(self.mesh_depth_pipeline, None);
             device.destroy_pipeline(self.mesh_over_depth_pipeline, None);
             device.destroy_pipeline(self.mesh_upscaled_indirect_pipeline, None);
-            device.destroy_pipeline(self.probes_pipeline, None);
+            device.destroy_pipeline(self.probe_overlay_pipeline, None);
             device.destroy_pipeline(self.sky_pipeline, None);
             device.destroy_pipeline_layout(self.graphics_pipeline_layout, None);
             device.destroy_device(None);

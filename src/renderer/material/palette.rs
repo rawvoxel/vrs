@@ -18,8 +18,8 @@ impl Renderer {
     }
 
     /// Matte, opaque materials of linear `colors`, indexed by voxel type, see `set_materials`.
-    pub fn set_palette(&mut self, colors: &[[f32; 3]]) {
-        let materials: Vec<Material> = colors.iter().map(|&color| Material::color(color)).collect();
+    pub fn set_matte_colors(&mut self, colors: &[[f32; 3]]) {
+        let materials: Vec<Material> = colors.iter().map(|&color| Material::matte(color)).collect();
         self.set_materials(&materials);
     }
 
@@ -33,17 +33,13 @@ impl Renderer {
             return Ok(());
         }
         // An empty buffer can't be bound, a placeholder entry makes every type magenta.
-        let magenta = [GpuMaterial::from(&Material::color([1.0, 0.0, 1.0]))];
+        let magenta = [GpuMaterial::from(&Material::matte([1.0, 0.0, 1.0]))];
         let materials = match self.palette.is_empty() {
             true => &magenta[..],
             false => &self.palette[..],
         };
         unsafe {
-            self.frame_palette_buffers[frame].write(
-                &self.adapter,
-                &self.render_device,
-                materials,
-            )?;
+            self.frame_palette_buffers[frame].write(&self.adapter, &self.device, materials)?;
         }
         self.frame_palette_versions[frame] = self.palette_version;
         Ok(())

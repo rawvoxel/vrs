@@ -23,7 +23,7 @@ bool isSeeThrough(Material material) {
 }
 
 // Whether voxel type `id` is see-through.
-bool seeThrough(uint id) {
+bool typeIsSeeThrough(uint id) {
     return isSeeThrough(materialOf(id));
 }
 

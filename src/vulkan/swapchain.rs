@@ -42,7 +42,7 @@ impl Swapchain {
         surface: &Surface,
         extent: vk::Extent2D,
         queue_family: &QueueFamily,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         swapchain_device: &khr::swapchain::Device,
         old_swapchain: Option<vk::SwapchainKHR>,
     ) -> VkResult<Self> {
@@ -52,12 +52,12 @@ impl Swapchain {
             adapter,
             surface,
             queue_family,
-            logical_device,
+            device,
             swapchain_device,
             old_swapchain,
         );
         if let Err(err) = created {
-            unsafe { this.destroy(logical_device, swapchain_device) };
+            unsafe { this.destroy(device, swapchain_device) };
             return Err(err);
         }
         Ok(this)
@@ -94,13 +94,13 @@ impl Swapchain {
         adapter: &Adapter,
         surface: &Surface,
         queue_family: &QueueFamily,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         swapchain_device: &khr::swapchain::Device,
         old_swapchain: Option<vk::SwapchainKHR>,
     ) -> VkResult<()> {
         unsafe {
             match surface.is_offscreen() {
-                true => self.create_offscreen_images(adapter, surface, logical_device)?,
+                true => self.create_offscreen_images(adapter, surface, device)?,
                 false => {
                     let swapchain_info = vk::SwapchainCreateInfoKHR::default()
                         .surface(surface.handle)
@@ -123,7 +123,7 @@ impl Swapchain {
             }
             for &image in self.present_images.iter() {
                 let view = create_image_view(
-                    logical_device,
+                    device,
                     image,
                     surface.format,
                     vk::ComponentMapping::default(),
@@ -145,12 +145,12 @@ impl Swapchain {
                 .sharing_mode(vk::SharingMode::EXCLUSIVE);
             self.depth_image = Image::new(
                 adapter,
-                logical_device,
+                device,
                 depth_image_info,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )?;
             self.depth_image_view = create_image_view(
-                logical_device,
+                device,
                 self.depth_image.handle,
                 depth_image_info.format,
                 vk::ComponentMapping::default(),
@@ -165,7 +165,7 @@ impl Swapchain {
         &mut self,
         adapter: &Adapter,
         surface: &Surface,
-        logical_device: &ash::Device,
+        device: &ash::Device,
     ) -> VkResult<()> {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -180,7 +180,7 @@ impl Swapchain {
         for _ in 0..surface.image_count {
             let image = Image::new(
                 adapter,
-                logical_device,
+                device,
                 image_info,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             )?;
@@ -196,11 +196,11 @@ impl Swapchain {
         surface: &Surface,
         surface_extent: vk::Extent2D,
         queue_family: &QueueFamily,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         swapchain_device: &khr::swapchain::Device,
     ) -> VkResult<()> {
         unsafe {
-            logical_device.device_wait_idle()?;
+            device.device_wait_idle()?;
 
             let old_swapchain = self.clone();
 
@@ -209,12 +209,12 @@ impl Swapchain {
                 surface,
                 surface_extent,
                 queue_family,
-                logical_device,
+                device,
                 swapchain_device,
                 Some(self.handle),
             )?;
 
-            old_swapchain.destroy(logical_device, swapchain_device);
+            old_swapchain.destroy(device, swapchain_device);
             Ok(())
         }
     }
@@ -222,19 +222,15 @@ impl Swapchain {
     /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     #[inline]
-    pub unsafe fn destroy(
-        &self,
-        logical_device: &ash::Device,
-        swapchain_device: &khr::swapchain::Device,
-    ) {
+    pub unsafe fn destroy(&self, device: &ash::Device, swapchain_device: &khr::swapchain::Device) {
         unsafe {
-            logical_device.destroy_image_view(self.depth_image_view, None);
-            self.depth_image.destroy(logical_device);
+            device.destroy_image_view(self.depth_image_view, None);
+            self.depth_image.destroy(device);
             for &image_view in self.present_image_views.iter() {
-                logical_device.destroy_image_view(image_view, None);
+                device.destroy_image_view(image_view, None);
             }
             for image in self.owned_images.iter() {
-                image.destroy(logical_device);
+                image.destroy(device);
             }
 
             // A headless device never loads the swapchain functions.

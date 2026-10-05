@@ -1,7 +1,7 @@
 //! Dynamic diffuse global illumination: cascades of light probes around the camera, each
 //! storing the light reaching it from every direction and how far away the nearest voxels
 //! are, those near voxels traced through them in turns and sampled when shading. See
-//! `probes.slang`.
+//! `probe_update.slang`.
 
 mod cells;
 mod convergence;
@@ -15,7 +15,7 @@ pub(in crate::renderer) use convergence::Convergence;
 pub(crate) use volume::ProbeVolume;
 
 /// Voxels along each edge of a probe's cell, and between neighboring probes, in the finest
-/// cascade. Matches `PROBE_CELL` in `common/probe_volume.slang`.
+/// cascade. Matches `PROBE_CELL` in `common/probes.slang`.
 pub const PROBE_CELL: u32 = 16;
 /// The most cascades of probes. Matches `MAX_CASCADES` in `common/layout.slang`.
 pub const MAX_CASCADES: u32 = 4;
@@ -24,11 +24,11 @@ pub const MAX_CASCADES: u32 = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeConfig {
     /// Probes along each axis of each cascade, which is centered on the camera with probes
-    /// 16 of the `ShadowGrid`'s finest voxels apart in the first, and twice as far apart in
+    /// 16 of the `VoxelGrid`'s finest voxels apart in the first, and twice as far apart in
     /// each next. Each probe takes about 2.9 KB.
     pub probe_counts: [u32; 3],
     /// Cascades of probes, from 1 to `MAX_CASCADES`. Each reaches twice as far as the last,
-    /// with probes twice as far apart, for chunks of coarser `ShadowGrid::levels`. Surfaces
+    /// with probes twice as far apart, for chunks of coarser `VoxelGrid::levels`. Surfaces
     /// are lit by the finest one around them.
     pub cascades: u32,
     /// Rays traced each frame, shared between every cascade's probes near voxels so the cost
@@ -53,27 +53,35 @@ impl Default for ProbeConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeUniforms {
-    /// Each cascade's probe cell at its low corner, in its own cells, w is 1 when the probes
-    /// light the frame.
+    /// Each cascade's probe cell at its low corner, in its own cells, w unused.
     pub volume_mins: [[i32; 4]; MAX_CASCADES as usize],
-    /// Probes along each axis of each cascade, w is probes per row of the atlases.
-    pub volume_counts: [u32; 4],
+    /// Probes along each axis of each cascade.
+    pub volume_counts: [u32; 3],
+    pub cascades: u32,
+    /// Probes per row of the atlases.
+    pub atlas_columns: u32,
+    pub frame_number: u32,
+    pub rays_per_frame: u32,
+    /// Frames between the finest cascade's probes' updates.
+    pub update_interval: u32,
     /// This frame's random rotation of the probes' rays, a quaternion.
     pub ray_rotation: [f32; 4],
-    /// The camera's world position, w unused.
-    pub camera_position: [f32; 4],
-    /// x is the frame's number, y the rays traced each frame, z how many cascades there are, w
-    /// the frames between the finest cascade's probes' updates.
-    pub frame: [u32; 4],
-    /// `ProbeTuning`'s hysteresis, depth hysteresis, depth sharpness and self-shadow bias.
-    pub tuning: [f32; 4],
-    /// `ProbeTuning`'s ray distance, then this frame's multipliers of the hysteresis for
-    /// light and for distances, below 1 while the probes converge faster after a change.
-    pub rays: [f32; 4],
+    /// `ProbeTuning`'s.
+    pub hysteresis: f32,
+    pub distance_hysteresis: f32,
+    pub distance_sharpness: f32,
+    pub self_shadow_bias: f32,
+    pub ray_distance: f32,
+    /// This frame's multipliers of the hysteresis for light and for distances, below 1 while
+    /// the probes converge faster after a change.
+    pub hysteresis_scale: f32,
+    pub distance_hysteresis_scale: f32,
+    /// 1 when the probes light the frame.
+    pub enabled: u32,
 }
 
 /// How the light probes blend what they see and are sampled, see `Lighting::probe_tuning`.
-/// The hysteresis, depth sharpness and self-shadow bias default to the papers' [Majercik et
+/// The hysteresis, distance sharpness and self-shadow bias default to the papers' [Majercik et
 /// al. 2019 and 2021].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProbeTuning {
@@ -81,14 +89,14 @@ pub struct ProbeTuning {
     /// slower to follow changes.
     pub hysteresis: f32,
     /// How much of a probe's distances each frame keeps, from 0 to 1.
-    pub depth_hysteresis: f32,
+    pub distance_hysteresis: f32,
     /// How narrowly each distance texel averages its rays. Higher follows voxels' edges more
     /// closely but is noisier.
-    pub depth_sharpness: f32,
+    pub distance_sharpness: f32,
     /// How far off a surface probes' visibility is tested, in probe spacings. Higher leaks
     /// less shadow into lit areas, too high leaks light through thin walls.
     pub self_shadow_bias: f32,
-    /// How far the finest cascade's probes' rays reach, in the `ShadowGrid`'s finest voxels,
+    /// How far the finest cascade's probes' rays reach, in the `VoxelGrid`'s finest voxels,
     /// twice as far in each coarser one. Further finds more distant light, at more cost.
     pub ray_distance: f32,
     /// Frames between each probe's updates in the finest cascade, rounded up to a power of
@@ -102,8 +110,8 @@ impl Default for ProbeTuning {
     fn default() -> Self {
         Self {
             hysteresis: 0.97,
-            depth_hysteresis: 0.97,
-            depth_sharpness: 50.0,
+            distance_hysteresis: 0.97,
+            distance_sharpness: 50.0,
             self_shadow_bias: 0.3,
             ray_distance: 512.0,
             update_interval: 4,
@@ -121,7 +129,7 @@ impl Renderer {
             && self.lighting.global_illumination
             && self
                 .lighting
-                .shadow_grid
+                .voxel_grid
                 .is_some_and(|grid| grid.voxels_per_edge.is_multiple_of(PROBE_CELL))
     }
 
@@ -132,45 +140,34 @@ impl Renderer {
         let cascades = self.probe_volume.cascades;
         let tuning = self.lighting.probe_tuning;
         let mut uniforms = ProbeUniforms {
-            volume_counts: [
-                counts[0],
-                counts[1],
-                counts[2],
-                self.probe_volume.atlas_columns,
-            ],
+            volume_counts: counts,
+            cascades,
+            atlas_columns: self.probe_volume.atlas_columns,
+            frame_number: self.frame_number as u32,
+            rays_per_frame: self.probe_volume.rays_per_frame,
+            update_interval: tuning
+                .update_interval
+                .clamp(1, MAX_UPDATE_INTERVAL)
+                .next_power_of_two(),
             ray_rotation: random_rotation(self.frame_number).to_array(),
-            camera_position: camera.extend(1.0).to_array(),
-            tuning: [
-                tuning.hysteresis.clamp(0.0, 1.0),
-                tuning.depth_hysteresis.clamp(0.0, 1.0),
-                tuning.depth_sharpness.max(1.0),
-                tuning.self_shadow_bias.max(0.0),
-            ],
-            rays: [
-                tuning.ray_distance.max(0.0),
-                self.hysteresis_scale[0],
-                self.hysteresis_scale[1],
-                0.0,
-            ],
-            frame: [
-                self.frame_number as u32,
-                self.probe_volume.rays_per_frame,
-                cascades,
-                tuning
-                    .update_interval
-                    .clamp(1, MAX_UPDATE_INTERVAL)
-                    .next_power_of_two(),
-            ],
+            hysteresis: tuning.hysteresis.clamp(0.0, 1.0),
+            distance_hysteresis: tuning.distance_hysteresis.clamp(0.0, 1.0),
+            distance_sharpness: tuning.distance_sharpness.max(1.0),
+            self_shadow_bias: tuning.self_shadow_bias.max(0.0),
+            ray_distance: tuning.ray_distance.max(0.0),
+            hysteresis_scale: self.hysteresis_scale[0],
+            distance_hysteresis_scale: self.hysteresis_scale[1],
             ..Default::default()
         };
         if self.probes_enabled()
-            && let Some(grid) = self.lighting.shadow_grid
+            && let Some(grid) = self.lighting.voxel_grid
         {
+            uniforms.enabled = 1;
             for cascade in 0..cascades {
                 let cell_size = grid.voxel_size * (PROBE_CELL << cascade) as f32;
                 let center = (camera / cell_size).floor().as_ivec3();
                 let half = IVec3::from_array(counts.map(|count| count as i32 / 2));
-                uniforms.volume_mins[cascade as usize] = (center - half).extend(1).to_array();
+                uniforms.volume_mins[cascade as usize] = (center - half).extend(0).to_array();
             }
         }
         uniforms

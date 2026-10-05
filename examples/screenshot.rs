@@ -8,8 +8,8 @@
 mod camera;
 #[path = "common/greedy.rs"]
 mod greedy;
-#[path = "common/terrain.rs"]
-mod terrain;
+#[path = "common/world.rs"]
+mod world;
 
 use anyhow::{Context, Result, bail};
 use ash::vk;
@@ -63,12 +63,12 @@ fn main() -> Result<()> {
         .application_name(c"vrs screenshot")
         .api_version(vk::API_VERSION_1_3);
     let app = App::headless(app_info)?;
-    let mut renderer = Renderer::with_config(&app, WIDTH, HEIGHT, terrain::config())?;
-    let chunks = terrain::create_world(&mut renderer)?;
+    let mut renderer = Renderer::with_config(&app, WIDTH, HEIGHT, world::config())?;
+    let chunks = world::create_world(&mut renderer)?;
 
-    let (view, proj) = terrain::view_proj(
-        terrain::START_POSITION,
-        terrain::forward(terrain::START_YAW, terrain::START_PITCH),
+    let (view, proj) = world::view_proj(
+        world::START_POSITION,
+        world::forward(world::START_YAW, world::START_PITCH),
         WIDTH as f32 / HEIGHT as f32,
     );
     let meshes: Vec<&MeshId> = chunks.iter().collect();

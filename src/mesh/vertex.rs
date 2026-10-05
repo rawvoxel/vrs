@@ -9,15 +9,15 @@
 use super::octahedral;
 use glam::Vec3;
 
-/// A vertex of a mesh in the world, see `Renderer::create_mesh`.
+/// A vertex of a mesh in the world, see `Renderer::create_colored_mesh`.
 #[derive(Clone, Debug, Copy, PartialEq)]
 pub struct Vertex {
     /// In the world.
-    pub pos: [f32; 3],
+    pub position: [f32; 3],
     /// Needn't be normalized.
     pub normal: [f32; 3],
     /// In linear color, from 0 to 1.
-    pub col: [f32; 3],
+    pub color: [f32; 3],
 }
 
 /// Every mesh's indices, relative to its first vertex.
@@ -28,9 +28,9 @@ impl Vertex {
     /// then its octahedral normal.
     pub(crate) fn words(&self) -> [u32; 5] {
         let [r, g, b] = self
-            .col
+            .color
             .map(|channel| (channel.clamp(0.0, 1.0) * 255.0).round() as u32);
-        let [x, y, z] = self.pos.map(f32::to_bits);
+        let [x, y, z] = self.position.map(f32::to_bits);
         let [u, v] = octahedral::encode(Vec3::from(self.normal).normalize_or(Vec3::Y));
         [
             x,

@@ -30,8 +30,8 @@ use vrs::{
     App,
     mesh::MeshId,
     renderer::{
-        DrawList, Light, Lighting, Material, ProbeConfig, Renderer, RendererConfig, ShadowGrid,
-        ShadowResolution,
+        DrawList, Light, Lighting, Material, ProbeConfig, Renderer, RendererConfig,
+        TraceResolution, VoxelGrid,
     },
 };
 use winit::{
@@ -83,7 +83,7 @@ const GLOW_ROW: i32 = 31;
 const GLOW: i32 = 2;
 const GLOW_BOTTOM: i32 = FLOOR_TOP + 2;
 
-/// The chunk's voxels' size. Its shadow grid's must be the same, for its voxels to cast
+/// The chunk's voxels' size. Its voxel grid's must be the same, for its voxels to cast
 /// shadows, light the probes and be reflected.
 const VOXEL_SIZE: f32 = 1.0;
 /// The middle of the chunk's floor, which the camera circles.
@@ -101,22 +101,22 @@ const LIGHT_RANGE: f32 = 24.0;
 
 /// Every voxel type's material, indexed by type.
 fn materials() -> Vec<Material> {
-    let mut materials = vec![Material::color([0.0; 3])];
+    let mut materials = vec![Material::matte([0.0; 3])];
     materials.extend([0.2, 0.06].map(|gray| Material {
         roughness: 0.3,
-        ..Material::color([gray; 3])
+        ..Material::matte([gray; 3])
     }));
     for (color, metalness) in [(LACQUER, 0.0), (GOLD, 1.0)] {
         materials.extend(ROUGHNESS.map(|roughness| Material {
             roughness,
             metalness,
-            ..Material::color(color)
+            ..Material::matte(color)
         }));
     }
     // Nearly black, so light falling on them doesn't wash out their own.
     materials.extend(GLOWS.map(|emission| Material {
         emission,
-        ..Material::color([0.02; 3])
+        ..Material::matte([0.02; 3])
     }));
     materials
 }
@@ -177,10 +177,10 @@ fn create_scene(renderer: &mut Renderer) -> Result<MeshId> {
         sun_color: [0.8, 0.5, 0.3],
         sky_color: [0.16, 0.2, 0.3],
         ground_color: [0.05, 0.05, 0.05],
-        shadow_grid: Some(ShadowGrid::new(VOXEL_SIZE, EDGE as u32)),
+        voxel_grid: Some(VoxelGrid::new(VOXEL_SIZE, EDGE as u32)),
         // Shadows, reflections and the probes' light found for each 2x2 pixels, which looks
         // nearly the same for a fraction of the cost.
-        shadow_resolution: ShadowResolution::Half,
+        trace_resolution: TraceResolution::Half,
         ..Lighting::default()
     };
     let solid = |x: i32, y: i32, z: i32| {
@@ -188,7 +188,7 @@ fn create_scene(renderer: &mut Renderer) -> Result<MeshId> {
         inside && voxel(x, y, z) != 0
     };
     let types = greedy::chunk_types(voxel);
-    // The shadow grid only holds chunks whose origin is a whole number of chunks from the
+    // The voxel grid only holds chunks whose origin is a whole number of chunks from the
     // world's origin on every axis. Elsewhere a chunk is lit, but casts no shadows, lights no
     // probes and isn't reflected.
     let origin = Vec3::ZERO;

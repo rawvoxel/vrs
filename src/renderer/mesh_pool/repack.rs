@@ -1,10 +1,10 @@
 //! Moving every mesh into new buffers, packed together, to defragment or grow a pool.
 
 use super::{
-    DRAW_AND_CULL_ACCESS, DRAW_AND_CULL_STAGES, INDEX_SIZE, Mesh, MeshCapacity, MeshInfo, MeshPool,
-    NewMesh, WORD_SIZE, create_pool_buffers, range_allocator::RangeAllocator,
+    DRAW_AND_CULL_ACCESS, DRAW_AND_CULL_STAGES, INDEX_SIZE, MeshCapacity, MeshInfo, MeshPool,
+    MeshRecord, NewMesh, WORD_SIZE, create_pool_buffers, range_allocator::RangeAllocator,
 };
-use crate::vulkan::{adapter::Adapter, buffer::Buffer, commands::record_submit_commandbuffer};
+use crate::vulkan::{adapter::Adapter, buffer::Buffer, commands::record_submit_command_buffer};
 use ash::{prelude::VkResult, vk};
 use std::{ops::Range, slice};
 
@@ -37,9 +37,9 @@ impl MeshPool {
                 new.indices.len() as u32,
             ),
             (
-                &mut capacity.type_words,
-                &self.type_ranges,
-                new.type_word_count(),
+                &mut capacity.chunk_words,
+                &self.chunk_ranges,
+                new.chunk_word_count(),
             ),
         ] {
             if ranges.can_alloc(len) {
@@ -69,7 +69,7 @@ impl MeshPool {
     pub unsafe fn repack(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         queue: vk::Queue,
         cmd_buffer: vk::CommandBuffer,
         cmd_fence: vk::Fence,
@@ -80,12 +80,12 @@ impl MeshPool {
         // Where each mesh goes, without touching the pool until the copies succeed.
         let mut vertex_ranges = RangeAllocator::new(capacity.vertex_words);
         let mut index_ranges = RangeAllocator::new(capacity.indices);
-        let mut type_ranges = RangeAllocator::new(capacity.type_words);
+        let mut chunk_ranges = RangeAllocator::new(capacity.chunk_words);
         let mut uploading = vec![false; self.meshes.len()];
         for upload in self.uploads.iter() {
             uploading[upload.slot] = true;
         }
-        let mut moved: Vec<Option<Mesh>> = Vec::with_capacity(self.meshes.len());
+        let mut moved: Vec<Option<MeshRecord>> = Vec::with_capacity(self.meshes.len());
         let mut regions: [Vec<vk::BufferCopy2>; 3] = Default::default();
         for (slot, mesh) in self.meshes.iter().enumerate() {
             let Some(mesh) = mesh else {
@@ -97,31 +97,33 @@ impl MeshPool {
                 .alloc(mesh.vertex_words.len() as u32)
                 .expect(fits);
             let indices = index_ranges.alloc(mesh.indices.len() as u32).expect(fits);
-            let type_words = type_ranges.alloc(mesh.type_words.len() as u32).expect(fits);
+            let chunk_words = chunk_ranges
+                .alloc(mesh.chunk_words.len() as u32)
+                .expect(fits);
             // Data still waiting to upload isn't in the old buffers yet.
             if !uploading[slot] {
-                let [vertex_regions, index_regions, type_regions] = &mut regions;
+                let [vertex_regions, index_regions, chunk_regions] = &mut regions;
                 push_copy(vertex_regions, &mesh.vertex_words, &vertex_words, WORD_SIZE);
                 push_copy(index_regions, &mesh.indices, &indices, INDEX_SIZE);
-                push_copy(type_regions, &mesh.type_words, &type_words, WORD_SIZE);
+                push_copy(chunk_regions, &mesh.chunk_words, &chunk_words, WORD_SIZE);
             }
-            moved.push(Some(Mesh {
+            moved.push(Some(MeshRecord {
                 vertex_words,
                 indices,
-                type_words,
+                chunk_words,
                 ..mesh.clone()
             }));
         }
         let infos: Vec<MeshInfo> = moved
             .iter()
-            .map(|mesh| mesh.as_ref().map_or(MeshInfo::EMPTY, Mesh::info))
+            .map(|mesh| mesh.as_ref().map_or(MeshInfo::EMPTY, MeshRecord::info))
             .collect();
 
-        let new_buffers = create_pool_buffers(adapter, logical_device, capacity)?;
+        let new_buffers = create_pool_buffers(adapter, device, capacity)?;
         let copied = unsafe {
             self.copy_into(
                 adapter,
-                logical_device,
+                device,
                 queue,
                 cmd_buffer,
                 cmd_fence,
@@ -132,7 +134,7 @@ impl MeshPool {
         };
         if let Err(err) = copied {
             for buffer in new_buffers.iter() {
-                unsafe { buffer.destroy(logical_device) };
+                unsafe { buffer.destroy(device) };
             }
             return Err(err);
         }
@@ -140,25 +142,25 @@ impl MeshPool {
         // Commit
         let grew = capacity.vertex_words > self.capacity.vertex_words
             || capacity.indices > self.capacity.indices
-            || capacity.type_words > self.capacity.type_words
+            || capacity.chunk_words > self.capacity.chunk_words
             || capacity.meshes > self.capacity.meshes;
         match grew {
             true => self.repacks.growths += 1,
             false => self.repacks.defrags += 1,
         }
         for buffer in self.buffers() {
-            unsafe { buffer.destroy(logical_device) };
+            unsafe { buffer.destroy(device) };
         }
         [
             self.vertex_buffer,
             self.index_buffer,
             self.info_buffer,
-            self.type_buffer,
+            self.chunk_buffer,
         ] = new_buffers;
         self.capacity = capacity;
         self.vertex_ranges = vertex_ranges;
         self.index_ranges = index_ranges;
-        self.type_ranges = type_ranges;
+        self.chunk_ranges = chunk_ranges;
         self.meshes = moved;
         for upload in self.uploads.iter_mut() {
             let mesh = self.meshes[upload.slot]
@@ -172,7 +174,7 @@ impl MeshPool {
                 copy.dst_offset = mesh.indices.start as vk::DeviceSize * INDEX_SIZE;
             }
             if let Some(copy) = type_copy {
-                copy.dst_offset = mesh.type_words.start as vk::DeviceSize * WORD_SIZE;
+                copy.dst_offset = mesh.chunk_words.start as vk::DeviceSize * WORD_SIZE;
             }
             // Already written with the rest.
             *info_copy = None;
@@ -187,7 +189,7 @@ impl MeshPool {
     unsafe fn copy_into(
         &self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         queue: vk::Queue,
         cmd_buffer: vk::CommandBuffer,
         cmd_fence: vk::Fence,
@@ -201,12 +203,12 @@ impl MeshPool {
             .usage(vk::BufferUsageFlags::TRANSFER_SRC)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let mut info_staging = Buffer::new(adapter, logical_device, info_staging_info, flags, 0)?;
+        let mut info_staging = Buffer::new(adapter, device, info_staging_info, flags, 0)?;
 
-        let copied = info_staging.mem_map(logical_device).and_then(|()| {
+        let copied = info_staging.mem_map(device).and_then(|()| {
             info_staging.mem_write(infos);
             let info_region = vk::BufferCopy2::default().size(info_bytes);
-            let [vertex_regions, index_regions, type_regions] = regions;
+            let [vertex_regions, index_regions, chunk_regions] = regions;
             let copies = [
                 (
                     self.vertex_buffer.handle,
@@ -227,13 +229,13 @@ impl MeshPool {
                     },
                 ),
                 (
-                    self.type_buffer.handle,
+                    self.chunk_buffer.handle,
                     new_buffers[3].handle,
-                    &type_regions[..],
+                    &chunk_regions[..],
                 ),
             ];
-            record_submit_commandbuffer(
-                logical_device,
+            record_submit_command_buffer(
+                device,
                 cmd_buffer,
                 cmd_fence,
                 queue,
@@ -249,7 +251,7 @@ impl MeshPool {
                             .src_buffer(src)
                             .dst_buffer(dst)
                             .regions(regions);
-                        logical_device.cmd_copy_buffer2(cmd_buffer, &copy_info);
+                        device.cmd_copy_buffer2(cmd_buffer, &copy_info);
                     }
 
                     // Every later frame draws, culls with and uploads into the new buffers.
@@ -260,13 +262,13 @@ impl MeshPool {
                         .dst_access_mask(DRAW_AND_CULL_ACCESS | vk::AccessFlags2::TRANSFER_WRITE);
                     let dependency_info =
                         vk::DependencyInfo::default().memory_barriers(slice::from_ref(&barrier));
-                    logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
+                    device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
                 },
             )?;
-            unsafe { logical_device.wait_for_fences(&[cmd_fence], true, u64::MAX) }
+            unsafe { device.wait_for_fences(&[cmd_fence], true, u64::MAX) }
         });
 
-        unsafe { info_staging.destroy(logical_device) };
+        unsafe { info_staging.destroy(device) };
         copied
     }
 }

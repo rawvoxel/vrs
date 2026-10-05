@@ -1,5 +1,7 @@
 //! What's drawn where nothing else is.
 
+use crate::renderer::LightingUniforms;
+
 /// A sky drawn behind everything, see `Lighting::sky`: a gradient from the horizon up, the
 /// `Lighting::ground_color` below it, and the sun's disc, in the `Lighting::sun_color`. Its
 /// colors are what's seen, while the `Lighting::sky_color` is the light it casts, so they
@@ -32,19 +34,13 @@ impl Default for Sky {
 }
 
 impl Sky {
-    /// As the shaders read it, see `LightingUniforms`.
-    pub(in crate::renderer) fn uniforms(&self) -> [[f32; 4]; 3] {
-        let [zr, zg, zb] = self.zenith;
-        let [hr, hg, hb] = self.horizon;
-        [
-            [zr, zg, zb, 0.0],
-            [hr, hg, hb, 0.0],
-            [
-                self.sun_radius.to_radians().cos(),
-                self.sun_brightness.max(0.0),
-                self.haze_distance.max(0.0),
-                1.0,
-            ],
-        ]
+    /// Fills in the sky's uniforms.
+    pub(in crate::renderer) fn write_uniforms(&self, uniforms: &mut LightingUniforms) {
+        uniforms.sky_zenith = self.zenith;
+        uniforms.sky_horizon = self.horizon;
+        uniforms.sun_disc_cosine = self.sun_radius.to_radians().cos();
+        uniforms.sun_brightness = self.sun_brightness.max(0.0);
+        uniforms.haze_distance = self.haze_distance.max(0.0);
+        uniforms.has_sky = 1;
     }
 }

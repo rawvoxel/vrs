@@ -2,25 +2,25 @@
 // and their shadows.
 
 // Pixels along each edge of a tile lights are culled for. Matches
-// `renderer::lighting::shadows::pass::LIGHT_TILE`.
+// `renderer::lighting::trace::pass::LIGHT_TILE`.
 static const uint LIGHT_TILE = 16;
 // The most lights a tile keeps, its brightest. Matches
-// `renderer::lighting::shadows::pass::TILE_LIGHTS`.
-static const uint TILE_LIGHTS = 63;
+// `renderer::lighting::trace::pass::MAX_TILE_LIGHTS`.
+static const uint MAX_TILE_LIGHTS = 63;
 // Words a tile's light list takes: its count, then its lights.
-static const uint TILE_WORDS = TILE_LIGHTS + 1;
+static const uint TILE_WORDS = MAX_TILE_LIGHTS + 1;
 // The most lights a frame has. Matches `renderer::lighting::lights::MAX_LIGHTS`.
 static const uint MAX_LIGHTS = 255;
 // The most of a pixel's lights that are shadowed. Matches `renderer::MAX_SHADOWED_LIGHTS`.
 static const uint MAX_SHADOWED_LIGHTS = 4;
 // No light, in 8 bits. Lights are numbered below `MAX_LIGHTS`, so it's never one.
 static const uint NO_LIGHT = 0xff;
-// A light shadow texel without shadowed lights: every 8 bits `NO_LIGHT`.
+// A light shadows texel without shadowed lights: every 8 bits `NO_LIGHT`.
 static const uint2 NO_SHADOWED_LIGHTS = uint2(0xffffffff, 0);
 
 // The tile of lights pixel `pixel` is in.
 uint tileOf(uint2 pixel) {
-    return (pixel.y / LIGHT_TILE) * ubo.shadow.lights.y + pixel.x / LIGHT_TILE;
+    return (pixel.y / LIGHT_TILE) * uniforms.trace.tilesAcross + pixel.x / LIGHT_TILE;
 }
 
 // How much of a light's brightness gets `distance` from it, with `range` its reach: with the
@@ -95,12 +95,12 @@ void keepBrightest(inout BrightestLights brightest, uint kept, uint light, float
     }
 }
 
-// How much of `light`'s light gets to `origin`, in the shadow grid's voxels: 0 behind solid
+// How much of `light`'s light gets to `origin`, in the voxel grid's voxels: 0 behind solid
 // voxels, dimmed by see-through ones. Traced from the light, past the solid voxels it starts
 // in, so a lamp set in a glowing block or a fixture isn't shadowed by it, to half a voxel
 // short of the surface, which a curved one could otherwise shadow itself in.
 float lightShadow(Light light, float3 origin) {
-    if (ubo.lighting.shadowTable.w == 0) {
+    if (uniforms.lighting.gridLevels == 0) {
         return 1.0;
     }
     float3 position = toGrid(light.positionRange.xyz);
@@ -123,7 +123,7 @@ float3 lightsAtHit(float3 worldPosition, float3 normal, uint shadowed) {
     float3 origin = toGrid(worldPosition) + normal * SHADOW_RAY_OFFSET;
     BrightestLights brightest = noBrightestLights();
     float3 total = float3(0.0);
-    for (uint i = 0; i < ubo.shadow.lights.x; i++) {
+    for (uint i = 0; i < uniforms.trace.lightCount; i++) {
         float3 toLight;
         float distance;
         float3 reaching = lightReaching(lights[i], worldPosition, normal, toLight, distance);

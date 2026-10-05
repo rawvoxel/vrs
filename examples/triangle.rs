@@ -28,9 +28,9 @@ const INDICES: [Index; 3] = [0, 2, 1];
 
 #[rustfmt::skip]
 const VERTICES: [Vertex; 3] = [
-    Vertex { pos: [ 0.0, -0.5, 0.0], normal: TOWARD_CAMERA, col: [1.0, 0.0, 0.0] },
-    Vertex { pos: [ 0.5,  0.5, 0.0], normal: TOWARD_CAMERA, col: [0.0, 1.0, 0.0] },
-    Vertex { pos: [-0.5,  0.5, 0.0], normal: TOWARD_CAMERA, col: [0.0, 0.0, 1.0] },
+    Vertex { position: [ 0.0, -0.5, 0.0], normal: TOWARD_CAMERA, color: [1.0, 0.0, 0.0] },
+    Vertex { position: [ 0.5,  0.5, 0.0], normal: TOWARD_CAMERA, color: [0.0, 1.0, 0.0] },
+    Vertex { position: [-0.5,  0.5, 0.0], normal: TOWARD_CAMERA, color: [0.0, 0.0, 1.0] },
 ];
 /// The default camera looks along +z.
 const TOWARD_CAMERA: [f32; 3] = [0.0, 0.0, -1.0];
@@ -57,7 +57,7 @@ impl Vulkan {
         // The sun behind the camera, lighting the triangle head on.
         renderer.lighting.sun_direction = TOWARD_CAMERA.into();
         // Uploaded once, then drawn every frame.
-        let triangle = renderer.create_mesh(&INDICES, &VERTICES)?;
+        let triangle = renderer.create_colored_mesh(&INDICES, &VERTICES)?;
 
         Ok(Self {
             triangle,

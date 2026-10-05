@@ -5,11 +5,11 @@ use ash::{prelude::VkResult, vk};
 use std::{ffi::CStr, slice};
 
 pub fn create_pipeline_layout(
-    render_device: &ash::Device,
+    device: &ash::Device,
     set_layouts: &[vk::DescriptorSetLayout],
 ) -> VkResult<vk::PipelineLayout> {
     let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(set_layouts);
-    unsafe { render_device.create_pipeline_layout(&layout_create_info, None) }
+    unsafe { device.create_pipeline_layout(&layout_create_info, None) }
 }
 
 /// The constant id of `PER_PIXEL_INDIRECT` in `mesh.slang`.
@@ -19,15 +19,15 @@ const PER_PIXEL_INDIRECT_ID: u32 = 0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PipelinePass {
     /// Color, and depth.
-    Shaded,
+    ColorAndDepth,
     /// Depth alone, without a fragment shader or color attachment.
     DepthOnly,
     /// Color over depth already drawn, testing against it without writing it.
-    ShadedOverDepth,
-    /// As `ShadedOverDepth`, for when the shadow pass lit the light from everywhere but the sun
+    ColorOverDepth,
+    /// As `ColorOverDepth`, for when the trace pass lit the light from everywhere but the sun
     /// for `mesh.slang` to upscale: without its code for each pixel to find its own, see
     /// `PER_PIXEL_INDIRECT` there.
-    ShadedOverUpscaledIndirect,
+    ColorOverUpscaledIndirect,
     /// Color behind what's drawn, where the depth is still cleared, without writing it.
     Behind,
 }
@@ -37,7 +37,7 @@ pub enum PipelinePass {
 /// buffer, the vertex shader pulls its own vertices, as triangle lists.
 pub fn create_graphics_pipeline(
     surface: &Surface,
-    render_device: &ash::Device,
+    device: &ash::Device,
     shader_module: vk::ShaderModule,
     entries: (&CStr, &CStr),
     pass: PipelinePass,
@@ -57,7 +57,7 @@ pub fn create_graphics_pipeline(
         .module(shader_module)
         .name(entries.1)
         .stage(vk::ShaderStageFlags::FRAGMENT);
-    if pass == PipelinePass::ShadedOverUpscaledIndirect {
+    if pass == PipelinePass::ColorOverUpscaledIndirect {
         fragment = fragment.specialization_info(&upscaled_indirect);
     }
     let all_stages = [
@@ -112,7 +112,7 @@ pub fn create_graphics_pipeline(
         .depth_test_enable(true)
         .depth_write_enable(matches!(
             pass,
-            PipelinePass::Shaded | PipelinePass::DepthOnly
+            PipelinePass::ColorAndDepth | PipelinePass::DepthOnly
         ))
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
         .front(noop_stencil_state)
@@ -143,7 +143,7 @@ pub fn create_graphics_pipeline(
         .layout(pipeline_layout);
 
     unsafe {
-        render_device
+        device
             .create_graphics_pipelines(
                 vk::PipelineCache::null(),
                 slice::from_ref(&graphics_pipeline_info),

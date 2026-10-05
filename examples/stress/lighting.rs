@@ -1,21 +1,21 @@
 //! Lighting checked against scenes with known answers, in the order they run:
 //!
 //! - A floor under a uniform white sky, without a sun, lit by its probes as by the sky alone,
-//!   at full and half shadow resolution, where the shadow pass lights faces with the probes'
+//!   at full and half trace resolution, where the trace pass lights faces with the probes'
 //!   light for shading to upscale.
 //! - A sealed hollow box under a bright sun and sky, seen from inside: no light may leak in,
-//!   at full and half shadow resolution, and with 4 cascades of probes blending.
+//!   at full and half trace resolution, and with 4 cascades of probes blending.
 //! - The same box with a hole in its roof: sunlight bouncing in lights all of it. With glass
 //!   over the hole, the glass dims it. A few frames after cutting the hole or the sun coming
 //!   out, the light inside has mostly caught up.
 //! - The sealed box in the dark with a glowing block inside, and then a point light: either
 //!   lights the walls, the light's bouncing off them too.
 //! - A point light behind a wall: the floor past the wall is in its shadow, at full and half
-//!   shadow resolution.
+//!   trace resolution.
 //! - A point light inside a glowing block over a floor: the block doesn't shadow it.
 //! - A spot light over a floor: it lights only a pool under it.
 //! - A glowing block high over a mirror floor, out of view: the floor shows it.
-//! - A point light behind a wall of coarser chunks: the wall shadows it once the shadow grid
+//! - A point light behind a wall of coarser chunks: the wall shadows it once the voxel grid
 //!   has their level.
 //! - The floor under a white sky, of coarser chunks only: lit as the fine one is. Then steps
 //!   of coarser chunks, whose sides aren't darker than fine ones' where probes touch them.
@@ -32,8 +32,8 @@ use vrs::{
     App,
     mesh::MeshId,
     renderer::{
-        Capture, DrawList, Light, Lighting, Material, ProbeConfig, Renderer, RendererConfig,
-        ShadowGrid, ShadowResolution, Spot,
+        Capture, DrawList, Light, Lighting, Material, ProbeConfig, Renderer, RendererConfig, Spot,
+        TraceResolution, VoxelGrid,
     },
 };
 
@@ -52,20 +52,20 @@ const GLASS: u16 = 3;
 const MIRROR: u16 = 4;
 const ALBEDO: f32 = 0.5;
 const MATERIALS: [Material; 5] = [
-    Material::color([0.0; 3]),
-    Material::color([ALBEDO; 3]),
+    Material::matte([0.0; 3]),
+    Material::matte([ALBEDO; 3]),
     Material {
         emission: [4.0; 3],
-        ..Material::color([1.0; 3])
+        ..Material::matte([1.0; 3])
     },
     Material {
         see_through: true,
-        ..Material::color([0.7; 3])
+        ..Material::matte([0.7; 3])
     },
     Material {
         roughness: 0.0,
         metalness: 1.0,
-        ..Material::color([0.9; 3])
+        ..Material::matte([0.9; 3])
     },
 ];
 
@@ -208,17 +208,17 @@ fn dark() -> Lighting {
 }
 
 /// No light at all but the lights', without probes.
-fn unlit() -> Lighting {
+fn lights_only() -> Lighting {
     Lighting {
         global_illumination: false,
         ..dark()
     }
 }
 
-/// `lighting` at half shadow resolution.
+/// `lighting` at half trace resolution.
 fn half(lighting: Lighting) -> Lighting {
     Lighting {
-        shadow_resolution: ShadowResolution::Half,
+        trace_resolution: TraceResolution::Half,
         ..lighting
     }
 }
@@ -229,7 +229,7 @@ struct Scene<'a> {
     voxels: Voxels<'a>,
     /// Chunks of the next level of detail, of voxels twice as big.
     coarse: Option<Voxels<'a>>,
-    /// The shadow grid's levels.
+    /// The voxel grid's levels.
     levels: u32,
     probes: ProbeConfig,
     lighting: Lighting,
@@ -255,7 +255,7 @@ impl<'a> Scene<'a> {
         Self { lights, ..self }
     }
 
-    /// With `coarse` chunks, and `levels` levels in the shadow grid.
+    /// With `coarse` chunks, and `levels` levels in the voxel grid.
     fn coarse(self, coarse: Voxels<'a>, levels: u32) -> Self {
         Self {
             coarse: Some(coarse),
@@ -326,9 +326,9 @@ fn render(app: &App, scene: Scene, view: View) -> VkResult<Option<Vec<f32>>> {
     let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, config)?;
     renderer.set_materials(&MATERIALS);
     renderer.lights = scene.lights.to_vec();
-    let grid = Some(ShadowGrid::new(1.0, EDGE as u32).with_levels(scene.levels));
+    let grid = Some(VoxelGrid::new(1.0, EDGE as u32).with_levels(scene.levels));
     let light = |lighting: Lighting| Lighting {
-        shadow_grid: grid,
+        voxel_grid: grid,
         ..lighting
     };
     renderer.lighting = light(scene.lighting);
@@ -401,7 +401,7 @@ fn sky_floor(checks: &mut Checks) -> VkResult<()> {
     Ok(())
 }
 
-/// No light leaks into a sealed box, at full and half shadow resolution, and with cascades.
+/// No light leaks into a sealed box, at full and half trace resolution, and with cascades.
 fn sealed_box(checks: &mut Checks) -> VkResult<()> {
     let four_cascades = ProbeConfig {
         cascades: 4,
@@ -508,7 +508,7 @@ fn lit_box(checks: &mut Checks) -> VkResult<()> {
         BOUNCED,
     );
     let glow_alone = fraction_over(
-        &checks.render(Scene::new(&lamp, unlit()), BOX_VIEW)?,
+        &checks.render(Scene::new(&lamp, lights_only()), BOX_VIEW)?,
         BOUNCED,
     );
     checks.expect(
@@ -523,8 +523,8 @@ fn lit_box(checks: &mut Checks) -> VkResult<()> {
 
     let bulb = [Light::point(Vec3::new(0.0, 20.0, 6.0), [400.0; 3], 60.0)];
     let with = checks.render(Scene::new(&shell, dark()).lights(&bulb), BOX_VIEW)?;
-    let direct = checks.render(Scene::new(&shell, unlit()).lights(&bulb), BOX_VIEW)?;
-    let none = checks.render(Scene::new(&shell, unlit()), BOX_VIEW)?;
+    let direct = checks.render(Scene::new(&shell, lights_only()).lights(&bulb), BOX_VIEW)?;
+    let none = checks.render(Scene::new(&shell, lights_only()), BOX_VIEW)?;
     let lit = fraction_over(&direct, BOUNCED);
     checks.expect(
         format!(
@@ -556,10 +556,10 @@ fn shadowed_light(checks: &mut Checks) -> VkResult<()> {
         eye: Vec3::new(9.0, 14.0, 0.5),
         target: Vec3::new(9.0, 8.0, 0.6),
     };
-    for resolution in [ShadowResolution::Full, ShadowResolution::Half] {
+    for resolution in [TraceResolution::Full, TraceResolution::Half] {
         let lighting = Lighting {
-            shadow_resolution: resolution,
-            ..unlit()
+            trace_resolution: resolution,
+            ..lights_only()
         };
         let open = mean(&checks.render(Scene::new(&floor, lighting).lights(&lamp_post), view)?);
         checks.expect(
@@ -592,7 +592,7 @@ fn lamp_in_block(checks: &mut Checks) -> VkResult<()> {
         eye: Vec3::new(1.0, 24.0, 1.5),
         target: Vec3::new(1.0, 8.0, 1.0),
     };
-    let lit = checks.render(Scene::new(&lamp_block, unlit()).lights(&inside), view)?;
+    let lit = checks.render(Scene::new(&lamp_block, lights_only()).lights(&inside), view)?;
     let reached = fraction_over(&lit, BOUNCED);
     checks.expect(
         format!(
@@ -618,7 +618,7 @@ fn spot_light(checks: &mut Checks) -> VkResult<()> {
         target: Vec3::new(9.0, 8.0, 0.6),
     };
     let lit = |light: Light| -> VkResult<f32> {
-        let frame = checks.render(Scene::new(&floor, unlit()).lights(&[light]), view)?;
+        let frame = checks.render(Scene::new(&floor, lights_only()).lights(&[light]), view)?;
         Ok(fraction_over(&frame, BOUNCED))
     };
     let (lit_spot, lit_point) = (lit(spot)?, lit(point)?);
@@ -660,7 +660,7 @@ fn mirror(checks: &mut Checks) -> VkResult<()> {
     };
     // Pixels as bright as the block's reflection, which only a mirror shows.
     let showing = |floor_type| -> VkResult<f32> {
-        let frame = checks.render(Scene::new(&over(floor_type), unlit()), view)?;
+        let frame = checks.render(Scene::new(&over(floor_type), lights_only()), view)?;
         Ok(fraction_over(&frame, 0.5))
     };
     let (mirror, matte) = (showing(MIRROR)?, showing(GRAY)?);
@@ -676,7 +676,7 @@ fn mirror(checks: &mut Checks) -> VkResult<()> {
     Ok(())
 }
 
-/// A wall of coarser chunks shadows a point light once the shadow grid has their level.
+/// A wall of coarser chunks shadows a point light once the voxel grid has their level.
 fn coarse_wall(checks: &mut Checks) -> VkResult<()> {
     // Fine chunks' floor, then past them, coarser chunks' floor and wall, with a point light
     // on the fine side, looking down at the coarse floor behind the wall.
@@ -692,7 +692,7 @@ fn coarse_wall(checks: &mut Checks) -> VkResult<()> {
         target: Vec3::new(75.0, 8.0, 0.6),
     };
     let lit = |coarse: Voxels, levels| -> VkResult<f32> {
-        let scene = Scene::new(&fine_floor, unlit())
+        let scene = Scene::new(&fine_floor, lights_only())
             .lights(&lamp)
             .coarse(coarse, levels);
         Ok(mean(&checks.render(scene, view)?))
@@ -715,7 +715,7 @@ fn coarse_wall(checks: &mut Checks) -> VkResult<()> {
     );
     checks.expect(
         format!(
-            "{} gets past the wall without its level in the shadow grid",
+            "{} gets past the wall without its level in the voxel grid",
             percent(unshadowed, 0)
         ),
         unshadowed >= MOST,

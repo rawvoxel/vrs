@@ -1,15 +1,15 @@
-//! The shadow pass: from the frame's depth, the sun's and the lights' shadows, glossy voxels'
+//! The trace pass: from the frame's depth, the sun's and the lights' shadows, glossy voxels'
 //! reflections, and below full resolution the light from everywhere but the sun, at a
-//! fraction of the frame's resolution, for shading to upscale. See `shadow.slang`,
-//! `Lighting::shadow_resolution`, `Renderer::lights` and `Material::roughness`.
+//! fraction of the frame's resolution, for shading to upscale. See `trace_pass.slang`,
+//! `Lighting::trace_resolution`, `Renderer::lights` and `Material::roughness`.
 //!
-//! Frames draw their depth first for it whenever there's a shadow grid or a light, see
-//! `Renderer::uses_shadow_pass`.
+//! Frames draw their depth first for it whenever there's a voxel grid or a light, see
+//! `Renderer::uses_trace_pass`.
 
 use crate::{
     renderer::{
         DebugView, Renderer,
-        lighting::shadows::MAX_SHADOWED_LIGHTS,
+        lighting::trace::MAX_SHADOWED_LIGHTS,
         timings::{FrameTimestamps, GpuStage},
     },
     vulkan::{
@@ -18,10 +18,9 @@ use crate::{
     },
 };
 use ash::{prelude::VkResult, vk};
-use glam::Mat4;
 use std::slice;
 
-const SHADOW_SPV: &[u8] = include_bytes!("../../../../assets/shader/shadow.spv");
+const TRACE_PASS_SPV: &[u8] = include_bytes!("../../../../assets/shader/trace_pass.spv");
 /// Each texel's sun visibility, tinted by see-through voxels, and its surface's distance from
 /// the camera, which upscaling compares. A base storage format every device supports.
 const SHADOW_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;
@@ -31,36 +30,37 @@ const LIGHT_SHADOW_FORMAT: vk::Format = vk::Format::R32G32_UINT;
 const REFLECTION_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 /// Each texel's light from everywhere but the sun, and which face it's of.
 const INDIRECT_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
-/// Matches `numthreads` of `traceShadows` in `shadow.slang`.
+/// Matches `numthreads` of `traceSurfaces` in `trace_pass.slang`.
 const WORKGROUP_SIZE: u32 = 8;
 /// Pixels along each edge of a tile lights are culled for. Matches `LIGHT_TILE` in
 /// `common/lights.slang`.
 const LIGHT_TILE: u32 = 16;
-/// The most lights a tile keeps. Matches `TILE_LIGHTS` in `common/lights.slang`.
-const TILE_LIGHTS: u32 = 63;
+/// The most lights a tile keeps. Matches `MAX_TILE_LIGHTS` in `common/lights.slang`.
+const MAX_TILE_LIGHTS: u32 = 63;
 /// Words a tile's light list takes: its count, then its lights.
-const TILE_WORDS: u32 = TILE_LIGHTS + 1;
+const TILE_WORDS: u32 = MAX_TILE_LIGHTS + 1;
 
-/// The shadow pass's uniforms. Matches `ShadowUniforms` in `common/layout.slang`.
+/// The trace pass's uniforms. Matches `TraceUniforms` in `common/layout.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct ShadowUniforms {
-    /// From clip space back to the world, to find each pixel's position from its depth.
-    pub inverse_view_proj: Mat4,
-    /// Frame pixels per shadow texel along each axis, then the shadow image's width and
-    /// height, then 1 when any material is glossy, for reflections to be traced.
-    pub params: [u32; 4],
-    /// The frame's width and height, then 1 when the shadow pass runs this frame, then 1 when
-    /// it also lights faces with the light from everywhere but the sun.
-    pub frame_size: [u32; 4],
-    /// How many lights there are, the light tiles across and down the frame, and how many of
-    /// each pixel's lights are shadowed.
-    pub lights: [u32; 4],
+pub struct TraceUniforms {
+    /// Frame pixels per trace texel along each axis.
+    pub pixels_per_texel: u32,
+    /// 1 when any material is glossy, for reflections to be traced.
+    pub trace_reflections: u32,
+    /// The trace images' width and height.
+    pub image_size: [u32; 2],
+    pub light_count: u32,
+    /// Light tiles across and down the frame.
+    pub tiles_across: u32,
+    pub tiles_down: u32,
+    /// How many of each pixel's lights are shadowed.
+    pub shadowed_lights: u32,
 }
 
-/// The shadow pass's images, the lights reaching each tile, and the pipelines making them.
+/// The trace pass's images, the lights reaching each tile, and the pipelines making them.
 /// The images stay in `GENERAL` layout, written as storage images and read by shading.
-pub(crate) struct ShadowPass {
+pub(crate) struct TracePass {
     pub shadows: StorageImage,
     pub light_shadows: StorageImage,
     pub reflections: StorageImage,
@@ -79,7 +79,7 @@ pub(crate) struct ShadowPass {
     pub pipeline: vk::Pipeline,
 }
 
-impl ShadowPass {
+impl TracePass {
     /// Owns nothing, destroying it does nothing.
     pub fn null() -> Self {
         Self {
@@ -101,7 +101,7 @@ impl ShadowPass {
     /// images for a 1x1 frame for the descriptors until `resize`. Needs `cmd_init` before use.
     pub fn new(
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         layout: vk::PipelineLayout,
     ) -> VkResult<Self> {
         let mut pass = Self::null();
@@ -110,10 +110,10 @@ impl ShadowPass {
             height: 1,
         };
         let created = pass
-            .create_pipelines(logical_device, layout)
-            .and_then(|()| pass.create_images(adapter, logical_device, one, 1));
+            .create_pipelines(device, layout)
+            .and_then(|()| pass.create_images(adapter, device, one, 1));
         if let Err(err) = created {
-            unsafe { pass.destroy(logical_device) };
+            unsafe { pass.destroy(device) };
             return Err(err);
         }
         Ok(pass)
@@ -121,7 +121,7 @@ impl ShadowPass {
 
     fn create_pipelines(
         &mut self,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         layout: vk::PipelineLayout,
     ) -> VkResult<()> {
         let sampler_info = vk::SamplerCreateInfo::default()
@@ -132,10 +132,10 @@ impl ShadowPass {
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .max_lod(0.0);
-        self.sampler = unsafe { logical_device.create_sampler(&sampler_info, None)? };
+        self.sampler = unsafe { device.create_sampler(&sampler_info, None)? };
 
-        let module = create_shader_module(logical_device, SHADOW_SPV)?;
-        let infos = [c"cullLights", c"traceShadows"].map(|entry| {
+        let module = create_shader_module(device, TRACE_PASS_SPV)?;
+        let infos = [c"cullLights", c"traceSurfaces"].map(|entry| {
             vk::ComputePipelineCreateInfo::default()
                 .stage(
                     vk::PipelineShaderStageCreateInfo::default()
@@ -145,10 +145,9 @@ impl ShadowPass {
                 )
                 .layout(layout)
         });
-        let created = unsafe {
-            logical_device.create_compute_pipelines(vk::PipelineCache::null(), &infos, None)
-        };
-        unsafe { logical_device.destroy_shader_module(module, None) };
+        let created =
+            unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), &infos, None) };
+        unsafe { device.destroy_shader_module(module, None) };
         match created {
             Ok(pipelines) => {
                 [self.cull_pipeline, self.pipeline] = [pipelines[0], pipelines[1]];
@@ -156,7 +155,7 @@ impl ShadowPass {
             }
             Err((pipelines, err)) => {
                 for pipeline in pipelines {
-                    unsafe { logical_device.destroy_pipeline(pipeline, None) };
+                    unsafe { device.destroy_pipeline(pipeline, None) };
                 }
                 Err(err)
             }
@@ -171,12 +170,12 @@ impl ShadowPass {
     pub unsafe fn resize(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         frame: vk::Extent2D,
         scale: u32,
     ) -> VkResult<()> {
-        unsafe { self.destroy_images(logical_device) };
-        self.create_images(adapter, logical_device, frame, scale)
+        unsafe { self.destroy_images(device) };
+        self.create_images(adapter, device, frame, scale)
     }
 
     fn images_mut(&mut self) -> [&mut StorageImage; 4] {
@@ -191,7 +190,7 @@ impl ShadowPass {
     fn create_images(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         frame: vk::Extent2D,
         scale: u32,
     ) -> VkResult<()> {
@@ -208,7 +207,7 @@ impl ShadowPass {
         for (image, format) in self.images_mut().into_iter().zip(formats) {
             *image = StorageImage::new(
                 adapter,
-                logical_device,
+                device,
                 extent,
                 format,
                 vk::ImageUsageFlags::empty(),
@@ -226,7 +225,7 @@ impl ShadowPass {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         self.tiles = Buffer::new(
             adapter,
-            logical_device,
+            device,
             tiles_info,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             0,
@@ -240,7 +239,7 @@ impl ShadowPass {
     ///
     /// # Safety
     /// Nothing may be using the images.
-    pub unsafe fn cmd_init(&self, logical_device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
+    pub unsafe fn cmd_init(&self, device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
         for image in [
             &self.shadows,
             &self.light_shadows,
@@ -248,7 +247,7 @@ impl ShadowPass {
             &self.indirect,
         ] {
             crate::vulkan::image::transition_layout(
-                logical_device,
+                device,
                 image.image.handle,
                 cmd_buffer,
                 vk::ImageLayout::UNDEFINED,
@@ -271,7 +270,7 @@ impl ShadowPass {
     /// The frame's uniforms and descriptors must be written.
     pub unsafe fn cmd_trace(
         &self,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         cmd_buffer: vk::CommandBuffer,
         set: vk::DescriptorSet,
         layout: vk::PipelineLayout,
@@ -279,17 +278,16 @@ impl ShadowPass {
     ) {
         let compute = vk::PipelineStageFlags2::COMPUTE_SHADER;
         let fragment = vk::PipelineStageFlags2::FRAGMENT_SHADER;
-        let barrier =
-            |src, dst| unsafe { cmd_memory_barrier(logical_device, cmd_buffer, src, dst) };
+        let barrier = |src, dst| unsafe { cmd_memory_barrier(device, cmd_buffer, src, dst) };
         let dispatch = |pipeline: vk::Pipeline, groups: [u32; 2]| unsafe {
-            logical_device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-            logical_device.cmd_dispatch(cmd_buffer, groups[0], groups[1], 1);
+            device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
+            device.cmd_dispatch(cmd_buffer, groups[0], groups[1], 1);
         };
         let write = vk::AccessFlags2::SHADER_STORAGE_WRITE;
         unsafe {
             // Last frame's shading is done reading the images and tiles.
             barrier((fragment, vk::AccessFlags2::empty()), (compute, write));
-            logical_device.cmd_bind_descriptor_sets(
+            device.cmd_bind_descriptor_sets(
                 cmd_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 layout,
@@ -298,7 +296,7 @@ impl ShadowPass {
                 &[],
             );
             dispatch(self.cull_pipeline, self.tile_counts);
-            timestamps.cmd_mark(logical_device, cmd_buffer, GpuStage::LightCulling);
+            timestamps.cmd_mark(device, cmd_buffer, GpuStage::LightCulling);
             barrier(
                 (compute, write),
                 (compute, vk::AccessFlags2::SHADER_STORAGE_READ),
@@ -306,7 +304,7 @@ impl ShadowPass {
             let groups = [self.extent.width, self.extent.height]
                 .map(|texels| texels.div_ceil(WORKGROUP_SIZE));
             dispatch(self.pipeline, groups);
-            timestamps.cmd_mark(logical_device, cmd_buffer, GpuStage::ShadowPass);
+            timestamps.cmd_mark(device, cmd_buffer, GpuStage::TracePass);
             barrier(
                 (compute, write),
                 (
@@ -319,98 +317,90 @@ impl ShadowPass {
 
     /// # Safety
     /// Nothing may be using the images or tiles.
-    unsafe fn destroy_images(&mut self, logical_device: &ash::Device) {
+    unsafe fn destroy_images(&mut self, device: &ash::Device) {
         unsafe {
             for image in self.images_mut() {
-                image.destroy(logical_device);
+                image.destroy(device);
             }
-            self.tiles.destroy(logical_device);
+            self.tiles.destroy(device);
         }
         self.tiles = Buffer::null();
     }
 
     /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
-    pub unsafe fn destroy(&mut self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
-            self.destroy_images(logical_device);
-            logical_device.destroy_pipeline(self.cull_pipeline, None);
-            logical_device.destroy_pipeline(self.pipeline, None);
-            logical_device.destroy_sampler(self.sampler, None);
+            self.destroy_images(device);
+            device.destroy_pipeline(self.cull_pipeline, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_sampler(self.sampler, None);
         }
     }
 }
 
 impl Renderer {
     /// Frame pixels along each axis that share a shadow ray, 1 without shadows.
-    pub(in crate::renderer) fn shadow_scale(&self) -> u32 {
-        match self.lighting.shadow_grid {
-            Some(_) => self.lighting.shadow_resolution.pixels_per_ray(),
+    pub(in crate::renderer) fn trace_scale(&self) -> u32 {
+        match self.lighting.voxel_grid {
+            Some(_) => self.lighting.trace_resolution.pixels_per_ray(),
             None => 1,
         }
     }
 
-    /// Whether frames draw their depth first, for the shadow pass to trace shadows and cull
+    /// Whether frames draw their depth first, for the trace pass to trace shadows and cull
     /// lights from, then their color over it. Even at full resolution, that's faster than
     /// tracing shadows as pixels are shaded, which wastes rays on pixels drawn over.
-    pub(in crate::renderer) fn uses_shadow_pass(&self) -> bool {
-        self.lighting.shadow_grid.is_some() || !self.lights.is_empty()
+    pub(in crate::renderer) fn uses_trace_pass(&self) -> bool {
+        self.lighting.voxel_grid.is_some() || !self.lights.is_empty()
     }
 
-    /// Makes the shadow images fit the frame and `shadow_scale`, waiting for the device to go
+    /// Makes the trace images fit the frame and `trace_scale`, waiting for the device to go
     /// idle when they have to be replaced.
-    pub(in crate::renderer) fn prepare_shadow_pass(&mut self) -> VkResult<()> {
-        let scale = self.shadow_scale();
+    pub(in crate::renderer) fn prepare_trace_pass(&mut self) -> VkResult<()> {
+        let scale = self.trace_scale();
         let frame = self.swapchain.extent;
-        let fits = self.shadow_pass.scale == scale
-            && self.shadow_pass.extent.width == frame.width.div_ceil(scale)
-            && self.shadow_pass.extent.height == frame.height.div_ceil(scale);
-        if !self.uses_shadow_pass() || fits {
+        let fits = self.trace_pass.scale == scale
+            && self.trace_pass.extent.width == frame.width.div_ceil(scale)
+            && self.trace_pass.extent.height == frame.height.div_ceil(scale);
+        if !self.uses_trace_pass() || fits {
             return Ok(());
         }
         unsafe {
-            self.render_device.device_wait_idle()?;
-            self.shadow_pass
-                .resize(&self.adapter, &self.render_device, frame, scale)?;
+            self.device.device_wait_idle()?;
+            self.trace_pass
+                .resize(&self.adapter, &self.device, frame, scale)?;
         }
-        self.init_shadow_pass()
+        self.init_trace_pass()
     }
 
-    /// The shadow pass's uniforms for a frame seen through `view_proj`.
-    pub(in crate::renderer) fn shadow_uniforms(&self, view_proj: Mat4) -> ShadowUniforms {
-        let extent = self.shadow_pass.extent;
-        let frame = self.swapchain.extent;
-        let shadowed = match self.lighting.shadow_grid {
+    /// The trace pass's uniforms for a frame seen through `view_proj`.
+    pub(in crate::renderer) fn trace_uniforms(&self) -> TraceUniforms {
+        let extent = self.trace_pass.extent;
+        let shadowed = match self.lighting.voxel_grid {
             Some(_) => self.lighting.shadowed_lights.min(MAX_SHADOWED_LIGHTS),
             None => 0,
         };
-        let [tiles_x, tiles_y] = self.shadow_pass.tile_counts;
-        ShadowUniforms {
-            inverse_view_proj: view_proj.inverse(),
-            params: [
-                self.shadow_scale(),
-                extent.width,
-                extent.height,
-                self.glossy_palette as u32,
-            ],
-            frame_size: [
-                frame.width,
-                frame.height,
-                self.uses_shadow_pass() as u32,
-                self.lights_indirect_in_shadow_pass() as u32,
-            ],
-            lights: [self.light_count(), tiles_x, tiles_y, shadowed],
+        let [tiles_across, tiles_down] = self.trace_pass.tile_counts;
+        TraceUniforms {
+            pixels_per_texel: self.trace_scale(),
+            trace_reflections: self.glossy_palette as u32,
+            image_size: [extent.width, extent.height],
+            light_count: self.light_count(),
+            tiles_across,
+            tiles_down,
+            shadowed_lights: shadowed,
         }
     }
 
-    /// Whether the shadow pass lights faces with the light from everywhere but the sun,
+    /// Whether the trace pass lights faces with the light from everywhere but the sun,
     /// probes and ambient occlusion, for shading to upscale, which below full resolution is
     /// cheaper than every pixel finding it. Not for `DebugView::AmbientOcclusion`, which shows
     /// each pixel's.
-    pub(in crate::renderer) fn lights_indirect_in_shadow_pass(&self) -> bool {
+    pub(in crate::renderer) fn trace_pass_finds_indirect(&self) -> bool {
         let indirect_work = self.probes_enabled() || self.lighting.ambient_occlusion > 0.0;
-        self.uses_shadow_pass()
-            && self.shadow_scale() > 1
+        self.uses_trace_pass()
+            && self.trace_scale() > 1
             && indirect_work
             && self.lighting.debug_view != DebugView::AmbientOcclusion
     }

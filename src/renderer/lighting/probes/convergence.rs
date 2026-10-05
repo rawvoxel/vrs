@@ -7,9 +7,9 @@ use glam::Vec3;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::renderer) struct Convergence {
     /// What the probes' hysteresis for light is multiplied by.
-    pub scale: f32,
+    pub hysteresis_scale: f32,
     /// What their hysteresis for distances is multiplied by.
-    pub depth_scale: f32,
+    pub distance_hysteresis_scale: f32,
     /// Frames left.
     pub frames: u32,
 }
@@ -17,26 +17,26 @@ pub(in crate::renderer) struct Convergence {
 impl Convergence {
     /// None, the probes' usual hysteresis.
     pub const NONE: Self = Self {
-        scale: 1.0,
-        depth_scale: 1.0,
+        hysteresis_scale: 1.0,
+        distance_hysteresis_scale: 1.0,
         frames: 0,
     };
     /// After a small change in the light, such as the sun moving a little.
     const SMALL: Self = Self {
-        scale: 0.85,
-        depth_scale: 1.0,
+        hysteresis_scale: 0.85,
+        distance_hysteresis_scale: 1.0,
         frames: 4,
     };
     /// After a big change in the light, such as a sudden time of day.
     const LARGE: Self = Self {
-        scale: 0.5,
-        depth_scale: 1.0,
+        hysteresis_scale: 0.5,
+        distance_hysteresis_scale: 1.0,
         frames: 10,
     };
     /// After a big change in everything, see `Renderer::converge_lighting`.
     const LARGE_WITH_DISTANCES: Self = Self {
-        scale: 0.5,
-        depth_scale: 0.5,
+        hysteresis_scale: 0.5,
+        distance_hysteresis_scale: 0.5,
         frames: 10,
     };
 }
@@ -70,7 +70,8 @@ impl Renderer {
             let large = angle > 10.0 || change > 0.25;
             let small = angle > 0.25 || change > 0.005;
             let stronger = |candidate: Convergence| {
-                candidate.scale < self.convergence.scale || self.convergence.frames == 0
+                candidate.hysteresis_scale < self.convergence.hysteresis_scale
+                    || self.convergence.frames == 0
             };
             if large && stronger(Convergence::LARGE) {
                 self.convergence = Convergence::LARGE;
@@ -83,7 +84,10 @@ impl Renderer {
             0 => [1.0, 1.0],
             _ => {
                 self.convergence.frames -= 1;
-                [self.convergence.scale, self.convergence.depth_scale]
+                [
+                    self.convergence.hysteresis_scale,
+                    self.convergence.distance_hysteresis_scale,
+                ]
             }
         };
     }

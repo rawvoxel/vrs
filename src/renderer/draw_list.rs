@@ -6,7 +6,8 @@ use glam::Mat4;
 /// Everything drawn by one `Renderer::submit`.
 #[derive(Clone, Copy, Default)]
 pub struct DrawList<'a> {
-    /// Meshes added with `Renderer::create_mesh`. References, so ids can stay
+    /// Meshes added with `Renderer::create_colored_mesh` or `Renderer::create_chunk_mesh`.
+    /// References, so ids can stay
     /// wherever they're kept, such as a map of chunks.
     pub meshes: &'a [&'a MeshId],
     /// Meshes outside this camera's frustum, or hidden behind others, are culled on the device.

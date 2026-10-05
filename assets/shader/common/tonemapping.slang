@@ -6,8 +6,8 @@ static const uint TONEMAP_ACES = 2;
 
 // A shaded color as it's displayed: exposed, then tonemapped.
 float3 toDisplay(float3 color) {
-    color *= ubo.lighting.options.z;
-    switch (uint(ubo.lighting.options.w)) {
+    color *= uniforms.lighting.exposure;
+    switch (uniforms.lighting.tonemapping) {
     case TONEMAP_REINHARD:
         return color / (1.0 + dot(color, LUMINANCE));
     case TONEMAP_ACES:

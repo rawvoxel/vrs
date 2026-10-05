@@ -26,9 +26,9 @@ float3 radianceAlong(float3 origin, float3 direction, float maxDistance) {
     if (hit.distance <= 0.0) {
         return float3(0.0);
     }
-    float3 worldPosition = (origin + direction * hit.distance) * ubo.lighting.shadowGrid.x;
-    uint shadowed = min(ubo.shadow.lights.w, REFLECTION_SHADOWED_LIGHTS);
-    float3 light = lightAt(worldPosition, hit.normal, hit.normal, -direction, false, float3(-1.0))
+    float3 worldPosition = (origin + direction * hit.distance) * uniforms.lighting.gridVoxelSize;
+    uint shadowed = min(uniforms.trace.shadowedLights, REFLECTION_SHADOWED_LIGHTS);
+    float3 light = sunAndIndirectLightAt(worldPosition, hit.normal, hit.normal, -direction, false, float3(-1.0))
         + lightsAtHit(worldPosition, hit.normal, shadowed);
     Material material = materialOf(hit.id);
     return (material.colorRoughness.rgb * light + material.emissionMetalness.rgb) * hit.transmittance;

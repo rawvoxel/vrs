@@ -14,10 +14,10 @@
 mod camera;
 #[path = "common/greedy.rs"]
 mod greedy;
-#[path = "common/terrain.rs"]
-mod terrain;
 #[path = "common/title.rs"]
 mod title;
+#[path = "common/world.rs"]
+mod world;
 
 use anyhow::Result;
 use ash::vk;
@@ -67,7 +67,7 @@ impl Camera {
     }
 
     fn fly(&mut self, keys: &HashSet<KeyCode>, seconds: f32) {
-        let forward = terrain::forward(self.yaw, 0.0);
+        let forward = world::forward(self.yaw, 0.0);
         let right = forward.cross(Vec3::Y);
         let mut direction = Vec3::ZERO;
         for (key, step) in [
@@ -108,9 +108,9 @@ impl Vulkan {
             window.window_handle()?.as_raw(),
             app_info,
         )?;
-        let mut renderer = Renderer::with_config(&app, size.width, size.height, terrain::config())?;
+        let mut renderer = Renderer::with_config(&app, size.width, size.height, world::config())?;
         let started = Instant::now();
-        let chunks = terrain::create_world(&mut renderer)?;
+        let chunks = world::create_world(&mut renderer)?;
         println!(
             "Meshed {} chunks in {:.1?}.",
             chunks.len(),
@@ -140,9 +140,9 @@ impl Terrain {
     fn new() -> Self {
         Self {
             camera: Camera {
-                position: terrain::START_POSITION,
-                yaw: terrain::START_YAW,
-                pitch: terrain::START_PITCH,
+                position: world::START_POSITION,
+                yaw: world::START_YAW,
+                pitch: world::START_PITCH,
             },
             keys: HashSet::new(),
             mouse_captured: false,
@@ -199,9 +199,9 @@ impl Terrain {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let (view, proj) = terrain::view_proj(
+        let (view, proj) = world::view_proj(
             self.camera.position,
-            terrain::forward(self.camera.yaw, self.camera.pitch),
+            world::forward(self.camera.yaw, self.camera.pitch),
             size.width as f32 / size.height as f32,
         );
         let meshes: Vec<&MeshId> = vulkan.chunks.iter().collect();

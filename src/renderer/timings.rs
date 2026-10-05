@@ -1,4 +1,4 @@
-//! GPU timestamps between the stages of each frame, see `Renderer::debug_gpu_timings`.
+//! GPU timestamps between the stages of each frame, see `Renderer::gpu_timings`.
 
 use ash::{prelude::VkResult, vk};
 
@@ -15,18 +15,19 @@ pub enum GpuStage {
     ProbeRays,
     /// Blending the rays into the probes.
     ProbeUpdates,
-    /// Culling the meshes visible last frame against the view.
+    /// Readying the frame's meshes for culling, then culling them against the view: those
+    /// visible last frame with occlusion culling, else all of them.
     Culling,
-    /// Drawing what culling found, only depth with the shadow pass.
+    /// Drawing what culling found, only depth with the trace pass.
     FirstPass,
     /// Building the depth pyramid, culling the rest against it, and drawing what was newly
     /// visible.
     OcclusionPass,
-    /// Readying the depth for the shadow pass, and listing the lights reaching each tile.
+    /// Readying the depth for the trace pass, and listing the lights reaching each tile.
     LightCulling,
     /// Tracing shadows and reflections, and finding the light from everywhere but the sun.
-    ShadowPass,
-    /// Drawing color over the depth, after the shadow pass.
+    TracePass,
+    /// Drawing color over the depth, after the trace pass.
     ColorPass,
     /// Drawing the light probes, for `DebugView::Probes`.
     ProbeOverlay,
@@ -43,7 +44,7 @@ impl GpuStage {
         GpuStage::FirstPass,
         GpuStage::OcclusionPass,
         GpuStage::LightCulling,
-        GpuStage::ShadowPass,
+        GpuStage::TracePass,
         GpuStage::ColorPass,
         GpuStage::ProbeOverlay,
     ];
@@ -53,8 +54,8 @@ impl GpuStage {
         GpuStage::ProbeRays,
         GpuStage::ProbeUpdates,
     ];
-    /// Those tracing shadows and reflections.
-    pub const SHADOWS: [GpuStage; 2] = [GpuStage::LightCulling, GpuStage::ShadowPass];
+    /// The trace pass's: listing the lights reaching each tile, then tracing.
+    pub const TRACE_PASS: [GpuStage; 2] = [GpuStage::LightCulling, GpuStage::TracePass];
 
     /// For people.
     pub fn name(self) -> &'static str {
@@ -67,7 +68,7 @@ impl GpuStage {
             GpuStage::FirstPass => "first pass",
             GpuStage::OcclusionPass => "occlusion pass",
             GpuStage::LightCulling => "light culling",
-            GpuStage::ShadowPass => "shadow pass",
+            GpuStage::TracePass => "trace pass",
             GpuStage::ColorPass => "color pass",
             GpuStage::ProbeOverlay => "probe overlay",
         }
@@ -130,12 +131,12 @@ impl FrameTimestamps {
         }
     }
 
-    pub fn new(logical_device: &ash::Device) -> VkResult<Self> {
+    pub fn new(device: &ash::Device) -> VkResult<Self> {
         let info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(QUERIES);
         Ok(Self {
-            pool: unsafe { logical_device.create_query_pool(&info, None)? },
+            pool: unsafe { device.create_query_pool(&info, None)? },
             used: false,
         })
     }
@@ -144,18 +145,14 @@ impl FrameTimestamps {
     ///
     /// # Safety
     /// Outside any rendering.
-    pub unsafe fn cmd_start(
-        &mut self,
-        logical_device: &ash::Device,
-        cmd_buffer: vk::CommandBuffer,
-    ) {
+    pub unsafe fn cmd_start(&mut self, device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
         if self.pool == vk::QueryPool::null() {
             return;
         }
         self.used = true;
         unsafe {
-            logical_device.cmd_reset_query_pool(cmd_buffer, self.pool, 0, QUERIES);
-            self.cmd_write(logical_device, cmd_buffer, 0);
+            device.cmd_reset_query_pool(cmd_buffer, self.pool, 0, QUERIES);
+            self.cmd_write(device, cmd_buffer, 0);
         }
     }
 
@@ -165,24 +162,19 @@ impl FrameTimestamps {
     /// After `cmd_start` in the same command buffer.
     pub unsafe fn cmd_mark(
         &self,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         cmd_buffer: vk::CommandBuffer,
         stage: GpuStage,
     ) {
-        unsafe { self.cmd_write(logical_device, cmd_buffer, stage.query()) };
+        unsafe { self.cmd_write(device, cmd_buffer, stage.query()) };
     }
 
-    unsafe fn cmd_write(
-        &self,
-        logical_device: &ash::Device,
-        cmd_buffer: vk::CommandBuffer,
-        query: u32,
-    ) {
+    unsafe fn cmd_write(&self, device: &ash::Device, cmd_buffer: vk::CommandBuffer, query: u32) {
         if self.pool == vk::QueryPool::null() {
             return;
         }
         unsafe {
-            logical_device.cmd_write_timestamp2(
+            device.cmd_write_timestamp2(
                 cmd_buffer,
                 vk::PipelineStageFlags2::ALL_COMMANDS,
                 self.pool,
@@ -193,12 +185,7 @@ impl FrameTimestamps {
 
     /// The last frame's timings, once the device is done with it, with `period` nanoseconds a
     /// tick and `valid_bits` bits of each timestamp meaningful.
-    pub fn read(
-        &self,
-        logical_device: &ash::Device,
-        period: f32,
-        valid_bits: u32,
-    ) -> Option<GpuTimings> {
+    pub fn read(&self, device: &ash::Device, period: f32, valid_bits: u32) -> Option<GpuTimings> {
         if !self.used {
             return None;
         }
@@ -207,7 +194,7 @@ impl FrameTimestamps {
         // Stages the frame skipped were never written, which makes it not ready, but every
         // result is filled in with whether it was.
         let read = unsafe {
-            logical_device.get_query_pool_results(
+            device.get_query_pool_results(
                 self.pool,
                 0,
                 &mut results,
@@ -240,7 +227,16 @@ impl FrameTimestamps {
 
     /// # Safety
     /// The device must be done with the pool.
-    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
-        unsafe { logical_device.destroy_query_pool(self.pool, None) };
+    pub unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe { device.destroy_query_pool(self.pool, None) };
+    }
+}
+
+impl super::Renderer {
+    /// How long each stage of the last frame the device finished took, `None` before one has
+    /// or when its queue can't time them. Without stalling: it's the frame from as many frames
+    /// ago as are in flight.
+    pub fn gpu_timings(&self) -> Option<&GpuTimings> {
+        self.gpu_timings.as_ref()
     }
 }

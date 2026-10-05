@@ -1,33 +1,33 @@
 use std::{path::Path, process::Command};
 
 fn main() {
-    // Included by `mesh.slang`, `probes.slang`, `shadow.slang`, `probe_overlay.slang` and
-    // `sky.slang`, and including each of `common/`.
+    // Included by `mesh.slang`, `probe_update.slang`, `trace_pass.slang`, `probe_overlay.slang` and
+    // `sky_pass.slang`, and including each of `common/`.
     println!("cargo:rerun-if-changed=assets/shader/common.slang");
     println!("cargo:rerun-if-changed=assets/shader/common");
-    compile_slang_spv("cull.slang", "cull.spv", &["cullMain"]);
-    compile_slang_spv("hiz.slang", "hiz.spv", &["reduceMain"]);
+    compile_slang_spv("cull.slang", "cull.spv", &["cullMeshes"]);
+    compile_slang_spv("depth_pyramid.slang", "depth_pyramid.spv", &["reduceDepth"]);
     compile_slang_spv("mesh.slang", "mesh.spv", &["meshVert", "meshFrag"]);
     compile_slang_spv(
-        "shadow.slang",
-        "shadow.spv",
-        &["cullLights", "traceShadows"],
+        "trace_pass.slang",
+        "trace_pass.spv",
+        &["cullLights", "traceSurfaces"],
     );
     compile_slang_spv(
         "probe_overlay.slang",
         "probe_overlay.spv",
         &["probeVert", "probeFrag"],
     );
-    compile_slang_spv("sky.slang", "sky.spv", &["skyVert", "skyFrag"]);
+    compile_slang_spv("sky_pass.slang", "sky_pass.spv", &["skyVert", "skyFrag"]);
     compile_slang_spv(
-        "probes.slang",
-        "probes.spv",
+        "probe_update.slang",
+        "probe_update.spv",
         &[
             "classifyProbes",
             "planRays",
             "traceProbeRays",
             "updateIrradiance",
-            "updateDepth",
+            "updateDistances",
         ],
     );
 }

@@ -54,7 +54,7 @@ impl Buffer {
 
     pub fn new(
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         buffer_info: vk::BufferCreateInfo,
         memory_property_flags: vk::MemoryPropertyFlags,
         buffer_offset: u64,
@@ -62,20 +62,15 @@ impl Buffer {
         unsafe {
             let mut this = Self::null();
             this.size = buffer_info.size;
-            this.handle = logical_device.create_buffer(&buffer_info, None)?;
-            this.memory_req = logical_device.get_buffer_memory_requirements(this.handle);
-            let bound = alloc::vk_alloc(
-                adapter,
-                logical_device,
-                this.memory_req,
-                memory_property_flags,
-            )
-            .and_then(|memory| {
-                this.memory = memory;
-                logical_device.bind_buffer_memory(this.handle, memory, buffer_offset)
-            });
+            this.handle = device.create_buffer(&buffer_info, None)?;
+            this.memory_req = device.get_buffer_memory_requirements(this.handle);
+            let bound = alloc::vk_alloc(adapter, device, this.memory_req, memory_property_flags)
+                .and_then(|memory| {
+                    this.memory = memory;
+                    device.bind_buffer_memory(this.handle, memory, buffer_offset)
+                });
             if let Err(err) = bound {
-                this.destroy(logical_device);
+                this.destroy(device);
                 return Err(err);
             }
             Ok(this)
@@ -83,18 +78,13 @@ impl Buffer {
     }
 
     /// Persistently maps the whole buffer, which must be in `HOST_VISIBLE` memory.
-    pub fn mem_map(&mut self, logical_device: &ash::Device) -> VkResult<()> {
+    pub fn mem_map(&mut self, device: &ash::Device) -> VkResult<()> {
         if self.mapped.is_some() {
             return Ok(());
         }
 
         let ptr = unsafe {
-            logical_device.map_memory(
-                self.memory,
-                0,
-                vk::WHOLE_SIZE,
-                vk::MemoryMapFlags::empty(),
-            )?
+            device.map_memory(self.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
         };
         self.mapped = NonNull::new(ptr);
         Ok(())
@@ -171,9 +161,9 @@ impl Buffer {
         }
     }
 
-    pub fn mem_unmap(&mut self, logical_device: &ash::Device) {
+    pub fn mem_unmap(&mut self, device: &ash::Device) {
         if self.mapped.take().is_some() {
-            unsafe { logical_device.unmap_memory(self.memory) }
+            unsafe { device.unmap_memory(self.memory) }
         }
     }
 
@@ -181,16 +171,16 @@ impl Buffer {
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
     /// Freeing the memory also unmaps it.
     #[inline]
-    pub unsafe fn destroy(&self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&self, device: &ash::Device) {
         unsafe {
-            logical_device.free_memory(self.memory, None);
-            logical_device.destroy_buffer(self.handle, None);
+            device.free_memory(self.memory, None);
+            device.destroy_buffer(self.handle, None);
         }
     }
 }
 #[inline]
 pub fn create_buffer_view(
-    logical_device: &ash::Device,
+    device: &ash::Device,
     buffer: vk::Buffer,
     format: vk::Format,
     offset: vk::DeviceSize,
@@ -202,14 +192,14 @@ pub fn create_buffer_view(
         .offset(offset)
         .range(range);
 
-    unsafe { logical_device.create_buffer_view(&info, None) }
+    unsafe { device.create_buffer_view(&info, None) }
 }
 
 /// A `DEVICE_LOCAL` buffer that copies can fill.
 #[inline]
 pub fn create_device_local_buffer(
     adapter: &Adapter,
-    logical_device: &ash::Device,
+    device: &ash::Device,
     usage: vk::BufferUsageFlags,
     size: vk::DeviceSize,
 ) -> VkResult<Buffer> {
@@ -220,7 +210,7 @@ pub fn create_device_local_buffer(
 
     Buffer::new(
         adapter,
-        logical_device,
+        device,
         info,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
         0,

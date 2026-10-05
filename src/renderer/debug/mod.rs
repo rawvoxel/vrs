@@ -6,10 +6,7 @@ pub use capture::Capture;
 pub(super) use capture::RecordedCapture;
 
 use super::Renderer;
-use crate::{
-    renderer::mesh_pool::MeshCapacity,
-    vulkan::{buffer::Buffer, commands::record_submit_commandbuffer},
-};
+use crate::vulkan::{buffer::Buffer, commands::record_submit_command_buffer};
 use ash::{prelude::VkResult, vk};
 
 /// The last submitted frame, for `Renderer::debug_frame_stats`.
@@ -26,18 +23,6 @@ pub struct FrameStats {
     /// Meshes each pass drew: what was visible last frame, then what occlusion culling
     /// found newly visible. Without occlusion culling there's only the first pass.
     pub drawn: [u32; 2],
-}
-
-/// The mesh pool's size and how often it's been repacked.
-#[derive(Clone, Copy, Debug)]
-pub struct MeshPoolStats {
-    pub capacity: MeshCapacity,
-    /// Meshes with an id, uploaded or not.
-    pub meshes: u32,
-    /// Repacked at the same capacity, to join scattered free space.
-    pub defrags: u32,
-    /// Repacked into a larger capacity.
-    pub growths: u32,
 }
 
 impl FrameStats {
@@ -71,13 +56,13 @@ impl Renderer {
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         let flags = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
-        let mut readback = Buffer::new(&self.adapter, &self.render_device, info, flags, 0)?;
+        let mut readback = Buffer::new(&self.adapter, &self.device, info, flags, 0)?;
 
-        let read = readback.mem_map(&self.render_device).and_then(|()| unsafe {
-            self.render_device.device_wait_idle()?;
+        let read = readback.mem_map(&self.device).and_then(|()| unsafe {
+            self.device.device_wait_idle()?;
             let count_buffer = self.culler.frame_count_buffers[frame].handle;
-            record_submit_commandbuffer(
-                &self.render_device,
+            record_submit_command_buffer(
+                &self.device,
                 self.init_cmd_buffer,
                 self.init_cmd_fence,
                 self.graphics_queue.handle,
@@ -86,7 +71,7 @@ impl Renderer {
                 &[],
                 |cmd_buffer| {
                     let region = vk::BufferCopy::default().size(size);
-                    self.render_device.cmd_copy_buffer(
+                    self.device.cmd_copy_buffer(
                         cmd_buffer,
                         count_buffer,
                         readback.handle,
@@ -94,36 +79,18 @@ impl Renderer {
                     );
                 },
             )?;
-            self.render_device
+            self.device
                 .wait_for_fences(&[self.init_cmd_fence], true, u64::MAX)?;
 
             let mut drawn = [0u32; 2];
             readback.mem_read_at(0, &mut drawn);
             Ok(drawn)
         });
-        unsafe { readback.destroy(&self.render_device) };
+        unsafe { readback.destroy(&self.device) };
 
         Ok(Some(FrameStats {
             meshes,
             drawn: read?,
         }))
-    }
-
-    /// How long each stage of the last frame the device finished took, `None` before one has
-    /// or when its queue can't time them. Without stalling: it's the frame from as many frames
-    /// ago as are in flight.
-    pub fn debug_gpu_timings(&self) -> Option<&super::GpuTimings> {
-        self.gpu_timings.as_ref()
-    }
-
-    /// For tests and tools, without stalling.
-    pub fn debug_mesh_pool_stats(&self) -> MeshPoolStats {
-        let repacks = self.mesh_pool.repack_counts();
-        MeshPoolStats {
-            capacity: self.mesh_pool.capacity,
-            meshes: self.mesh_pool.mesh_count(),
-            defrags: repacks.defrags,
-            growths: repacks.growths,
-        }
     }
 }

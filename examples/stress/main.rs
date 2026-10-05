@@ -25,8 +25,8 @@
 mod camera;
 #[path = "../common/greedy.rs"]
 mod greedy;
+mod lighting;
 mod pixels;
-mod probes;
 mod scenarios;
 mod scene;
 mod target;
@@ -43,7 +43,7 @@ use target::{START_SIZE, Target};
 use vrs::{
     App,
     renderer::{DrawList, MeshCapacity, MeshPoolStats, Renderer, RendererConfig},
-    vulkan::debug,
+    vulkan::validation,
 };
 use winit::{
     application::ApplicationHandler,
@@ -75,7 +75,7 @@ struct Stress {
     out_of_room: u32,
     started: Option<Instant>,
     pool_at_start: Option<MeshPoolStats>,
-    messages_at_start: debug::MessageCounts,
+    messages_at_start: validation::MessageCounts,
     failures: Vec<String>,
 }
 
@@ -87,7 +87,7 @@ impl Stress {
     }
 
     fn check_messages(&mut self, what: &str) {
-        let counts = debug::message_counts();
+        let counts = validation::message_counts();
         let errors = counts.errors - self.messages_at_start.errors;
         let warnings = counts.warnings - self.messages_at_start.warnings;
         if errors > 0 || warnings > 0 {
@@ -104,9 +104,9 @@ impl Stress {
             println!("Validation is off, only draws and pixels are checked.");
         }
         let size = target.size();
-        self.messages_at_start = debug::message_counts();
+        self.messages_at_start = validation::message_counts();
         self.check_failed_construction(&app, size);
-        self.check_global_illumination(&app);
+        self.check_lighting(&app);
 
         // Only the growth scenario grows the pool, the rest keep it nearly full.
         let config = RendererConfig {
@@ -164,9 +164,9 @@ impl Stress {
     }
 
     /// The light probes' lighting of scenes with known answers, see `probes`.
-    fn check_global_illumination(&mut self, app: &App) {
-        println!("global illumination");
-        match probes::check(app) {
+    fn check_lighting(&mut self, app: &App) {
+        println!("lighting");
+        match lighting::check(app) {
             Ok(Some(failures)) => {
                 for failure in failures {
                     self.fail(format!("global illumination: {failure}"));
@@ -175,7 +175,7 @@ impl Stress {
             Ok(None) => println!("  frames can't be captured, so it isn't checked"),
             Err(err) => self.fail(format!("global illumination failed with {err}")),
         }
-        self.check_messages("global illumination");
+        self.check_messages("lighting");
     }
 
     fn start_scenario(&mut self) {
@@ -185,7 +185,7 @@ impl Stress {
         scene.clear();
         scene.renderer.occlusion_culling = scenario.occlusion;
         scene.renderer.grow_mesh_pool = scenario.pool == PoolTest::Grow;
-        self.pool_at_start = Some(scene.renderer.debug_mesh_pool_stats());
+        self.pool_at_start = Some(scene.renderer.mesh_pool_stats());
         self.target.as_mut().unwrap().resize(START_SIZE);
         self.frame = 0;
         self.out_of_room = 0;
@@ -229,7 +229,7 @@ impl Stress {
     fn test_pool(&mut self) {
         let scenario = &SCENARIOS[self.scenario];
         let scene = self.scene.as_mut().unwrap();
-        let capacity = scene.renderer.debug_mesh_pool_stats().capacity.vertex_words;
+        let capacity = scene.renderer.mesh_pool_stats().capacity.vertex_words;
         let ballast = match scenario.pool {
             PoolTest::None => return,
             PoolTest::Defragment => {
@@ -336,12 +336,7 @@ impl Stress {
             self.fail(format!("{}: {failure}", scenario.name));
         }
         let before = self.pool_at_start.unwrap();
-        let after = self
-            .scene
-            .as_ref()
-            .unwrap()
-            .renderer
-            .debug_mesh_pool_stats();
+        let after = self.scene.as_ref().unwrap().renderer.mesh_pool_stats();
         let defrags = after.defrags - before.defrags;
         let growths = after.growths - before.growths;
         if defrags > 0 || growths > 0 {

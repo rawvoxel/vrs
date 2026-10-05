@@ -1,13 +1,11 @@
 //! Building a `Renderer`.
 
-use super::{
-    Lighting, Renderer, RendererConfig, device::create_render_device, material::GpuMaterial,
-};
+use super::{Lighting, Renderer, RendererConfig, device::create_device, material::GpuMaterial};
 use crate::{
     App,
     renderer::{
         culling::{Culler, depth_pyramid::DepthPyramid},
-        lighting::{lights::GpuLight, probes::ProbeVolume, shadows::ShadowPass},
+        lighting::{lights::GpuLight, probes::ProbeVolume, trace::TracePass},
         mesh_pool::MeshPool,
         shader::{
             bindings,
@@ -36,7 +34,7 @@ use std::slice;
 
 const MESH_SPV: &[u8] = include_bytes!("../../assets/shader/mesh.spv");
 const PROBE_OVERLAY_SPV: &[u8] = include_bytes!("../../assets/shader/probe_overlay.spv");
-const SKY_SPV: &[u8] = include_bytes!("../../assets/shader/sky.spv");
+const SKY_PASS_SPV: &[u8] = include_bytes!("../../assets/shader/sky_pass.spv");
 pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
 /// Materials each frame's palette buffer starts with room for, it grows to fit.
 const INITIAL_MATERIALS: vk::DeviceSize = 1024;
@@ -68,7 +66,7 @@ impl Renderer {
             surface.extent(window_width, window_height, &adapter, &surface_instance)?;
 
         // Render Device
-        let render_device = create_render_device(
+        let device = create_device(
             app,
             &adapter,
             &graphics_queue_family,
@@ -89,7 +87,7 @@ impl Renderer {
             culler: Culler::null(),
             depth_pyramid: DepthPyramid::null(),
             probe_volume: ProbeVolume::null(),
-            shadow_pass: ShadowPass::null(),
+            trace_pass: TracePass::null(),
             probes_configured: config.global_illumination.is_some(),
             frame_number: 0,
             last_frame: None,
@@ -111,7 +109,7 @@ impl Renderer {
             init_cmd_pool: vk::CommandPool::null(),
 
             swapchain: Swapchain::null(),
-            swapchain_device: khr::swapchain::Device::new(&app.instance, &render_device),
+            swapchain_device: khr::swapchain::Device::new(&app.instance, &device),
             swapchain_outdated: false,
 
             frame_desc_pool: vk::DescriptorPool::null(),
@@ -123,8 +121,8 @@ impl Renderer {
             glossy_palette: false,
             frame_palette_buffers: Vec::new(),
             frame_palette_versions: Vec::new(),
-            frame_shadow_tables: Vec::new(),
-            shadow_table: Vec::new(),
+            frame_chunk_tables: Vec::new(),
+            chunk_table: Vec::new(),
             frame_changed_chunks: Vec::new(),
             changed_chunks: Vec::new(),
             frame_light_buffers: Vec::new(),
@@ -139,12 +137,12 @@ impl Renderer {
             mesh_depth_pipeline: vk::Pipeline::null(),
             mesh_over_depth_pipeline: vk::Pipeline::null(),
             mesh_upscaled_indirect_pipeline: vk::Pipeline::null(),
-            probes_pipeline: vk::Pipeline::null(),
+            probe_overlay_pipeline: vk::Pipeline::null(),
             sky_pipeline: vk::Pipeline::null(),
             graphics_pipeline_layout: vk::PipelineLayout::null(),
-            graphics_queue: Queue::new(&graphics_queue_family, &render_device, 0),
+            graphics_queue: Queue::new(&graphics_queue_family, &device, 0),
             graphics_queue_family,
-            render_device,
+            device,
 
             surface,
             surface_instance,
@@ -156,7 +154,7 @@ impl Renderer {
 
     /// Fills in everything the device makes, leaving it for `Drop` if it fails.
     fn create(&mut self, surface_extent: vk::Extent2D, config: RendererConfig) -> VkResult<()> {
-        let device = self.render_device.clone();
+        let device = self.device.clone();
         let adapter = self.adapter.clone();
 
         // Frame Descriptors, see `bindings`.
@@ -203,7 +201,7 @@ impl Renderer {
                 &mut self.mesh_pipeline,
                 MESH_SPV,
                 mesh_entries,
-                PipelinePass::Shaded,
+                PipelinePass::ColorAndDepth,
             ),
             (
                 &mut self.mesh_depth_pipeline,
@@ -215,23 +213,23 @@ impl Renderer {
                 &mut self.mesh_over_depth_pipeline,
                 MESH_SPV,
                 mesh_entries,
-                PipelinePass::ShadedOverDepth,
+                PipelinePass::ColorOverDepth,
             ),
             (
                 &mut self.mesh_upscaled_indirect_pipeline,
                 MESH_SPV,
                 mesh_entries,
-                PipelinePass::ShadedOverUpscaledIndirect,
+                PipelinePass::ColorOverUpscaledIndirect,
             ),
             (
-                &mut self.probes_pipeline,
+                &mut self.probe_overlay_pipeline,
                 PROBE_OVERLAY_SPV,
                 (c"probeVert", c"probeFrag"),
-                PipelinePass::Shaded,
+                PipelinePass::ColorAndDepth,
             ),
             (
                 &mut self.sky_pipeline,
-                SKY_SPV,
+                SKY_PASS_SPV,
                 (c"skyVert", c"skyFrag"),
                 PipelinePass::Behind,
             ),
@@ -302,9 +300,9 @@ impl Renderer {
             .write_descriptors(&device, &self.frame_desc_sets);
         self.init_probe_volume()?;
 
-        // The shadow pass, with the graphics pipelines' layout too.
-        self.shadow_pass = ShadowPass::new(&adapter, &device, self.graphics_pipeline_layout)?;
-        self.init_shadow_pass()?;
+        // The trace pass, with the graphics pipelines' layout too.
+        self.trace_pass = TracePass::new(&adapter, &device, self.graphics_pipeline_layout)?;
+        self.init_trace_pass()?;
 
         // Meshes
         self.mesh_pool = MeshPool::new(
@@ -347,7 +345,7 @@ impl Renderer {
             )?);
             // Written by the first frame.
             self.frame_palette_versions.push(u64::MAX);
-            self.frame_shadow_tables.push(storage_buffer(4)?);
+            self.frame_chunk_tables.push(storage_buffer(4)?);
             self.frame_changed_chunks.push(storage_buffer(4)?);
             self.frame_light_buffers
                 .push(storage_buffer(size_of::<GpuLight>())?);

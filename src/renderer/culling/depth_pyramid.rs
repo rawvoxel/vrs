@@ -8,12 +8,12 @@ use crate::vulkan::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-const HIZ_SPV: &[u8] = include_bytes!("../../../assets/shader/hiz.spv");
-/// Matches `numthreads` in `hiz.slang`.
+const DEPTH_PYRAMID_SPV: &[u8] = include_bytes!("../../../assets/shader/depth_pyramid.spv");
+/// Matches `numthreads` in `depth_pyramid.slang`.
 const WORKGROUP_SIZE: u32 = 8;
 const PYRAMID_FORMAT: vk::Format = vk::Format::R32_SFLOAT;
 
-/// Matches `ReduceParams` in `hiz.slang`.
+/// Matches `ReduceParams` in `depth_pyramid.slang`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ReduceParams {
@@ -47,16 +47,16 @@ impl DepthPyramid {
     /// Built from `depth_view`, which must be sampled in `SHADER_READ_ONLY_OPTIMAL` layout.
     pub fn new(
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         depth_view: vk::ImageView,
         depth_extent: vk::Extent2D,
     ) -> VkResult<Self> {
         let mut pyramid = Self::null();
-        let created = pyramid.create_pipeline(logical_device).and_then(|()| {
-            pyramid.create_levels(adapter, logical_device, depth_view, depth_extent)
-        });
+        let created = pyramid
+            .create_pipeline(device)
+            .and_then(|()| pyramid.create_levels(adapter, device, depth_view, depth_extent));
         if let Err(err) = created {
-            unsafe { pyramid.destroy(logical_device) };
+            unsafe { pyramid.destroy(device) };
             return Err(err);
         }
         Ok(pyramid)
@@ -86,21 +86,21 @@ impl DepthPyramid {
     pub unsafe fn resize(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         depth_view: vk::ImageView,
         depth_extent: vk::Extent2D,
     ) -> VkResult<()> {
-        unsafe { self.destroy_levels(logical_device) };
-        let created = self.create_levels(adapter, logical_device, depth_view, depth_extent);
+        unsafe { self.destroy_levels(device) };
+        let created = self.create_levels(adapter, device, depth_view, depth_extent);
         if created.is_err() {
-            unsafe { self.destroy_levels(logical_device) };
+            unsafe { self.destroy_levels(device) };
         }
         created
     }
 
-    fn create_pipeline(&mut self, logical_device: &ash::Device) -> VkResult<()> {
+    fn create_pipeline(&mut self, device: &ash::Device) -> VkResult<()> {
         self.desc_set_layout = create_descriptor_set_layout(
-            logical_device,
+            device,
             &[
                 vk::DescriptorType::SAMPLED_IMAGE,
                 vk::DescriptorType::STORAGE_IMAGE,
@@ -108,9 +108,9 @@ impl DepthPyramid {
             vk::ShaderStageFlags::COMPUTE,
         )?;
         (self.pipeline, self.pipeline_layout) = create_compute_pipeline(
-            logical_device,
-            HIZ_SPV,
-            c"reduceMain",
+            device,
+            DEPTH_PYRAMID_SPV,
+            c"reduceDepth",
             self.desc_set_layout,
             size_of::<ReduceParams>() as u32,
         )?;
@@ -121,7 +121,7 @@ impl DepthPyramid {
     fn create_levels(
         &mut self,
         adapter: &Adapter,
-        logical_device: &ash::Device,
+        device: &ash::Device,
         depth_view: vk::ImageView,
         depth_extent: vk::Extent2D,
     ) -> VkResult<()> {
@@ -152,13 +152,13 @@ impl DepthPyramid {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         self.image = Image::new(
             adapter,
-            logical_device,
+            device,
             image_info,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        self.view = create_view(logical_device, self.image.handle, 0, levels)?;
+        self.view = create_view(device, self.image.handle, 0, levels)?;
         for level in 0..levels {
-            let view = create_view(logical_device, self.image.handle, level, 1)?;
+            let view = create_view(device, self.image.handle, level, 1)?;
             self.level_views.push(view);
         }
 
@@ -170,9 +170,9 @@ impl DepthPyramid {
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(levels),
         ];
-        self.desc_pool = create_descriptor_pool(logical_device, &pool_sizes, levels)?;
+        self.desc_pool = create_descriptor_pool(device, &pool_sizes, levels)?;
         self.level_desc_sets =
-            allocate_descriptor_sets(logical_device, self.desc_pool, self.desc_set_layout, levels)?;
+            allocate_descriptor_sets(device, self.desc_pool, self.desc_set_layout, levels)?;
 
         for (level, &desc_set) in self.level_desc_sets.iter().enumerate() {
             let src_info = match level {
@@ -198,7 +198,7 @@ impl DepthPyramid {
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(slice::from_ref(&dst_info)),
             ];
-            unsafe { logical_device.update_descriptor_sets(&writes, &[]) };
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
 
         Ok(())
@@ -209,11 +209,7 @@ impl DepthPyramid {
     ///
     /// # Safety
     /// The device must not be using the pyramid.
-    pub unsafe fn cmd_init_layout(
-        &self,
-        logical_device: &ash::Device,
-        cmd_buffer: vk::CommandBuffer,
-    ) {
+    pub unsafe fn cmd_init_layout(&self, device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
         let image_barrier = vk::ImageMemoryBarrier2::default()
             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
             .old_layout(vk::ImageLayout::UNDEFINED)
@@ -222,7 +218,7 @@ impl DepthPyramid {
             .subresource_range(color_range(0, self.levels));
         let dependency_info =
             vk::DependencyInfo::default().image_memory_barriers(slice::from_ref(&image_barrier));
-        unsafe { logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info) };
+        unsafe { device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info) };
     }
 
     /// Records building every level from the depth buffer, after which the pyramid is
@@ -230,7 +226,7 @@ impl DepthPyramid {
     ///
     /// # Safety
     /// The depth buffer must be in `SHADER_READ_ONLY_OPTIMAL` and visible to compute reads.
-    pub unsafe fn cmd_build(&self, logical_device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
+    pub unsafe fn cmd_build(&self, device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
         unsafe {
             // Every level is rebuilt, but last frame's culling may still be reading them.
             let image_barrier = vk::ImageMemoryBarrier2::default()
@@ -243,13 +239,9 @@ impl DepthPyramid {
                 .subresource_range(color_range(0, self.levels));
             let dependency_info = vk::DependencyInfo::default()
                 .image_memory_barriers(slice::from_ref(&image_barrier));
-            logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
+            device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
 
-            logical_device.cmd_bind_pipeline(
-                cmd_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.pipeline,
-            );
+            device.cmd_bind_pipeline(cmd_buffer, vk::PipelineBindPoint::COMPUTE, self.pipeline);
 
             let mut src_extent = self.depth_extent;
             let mut dst_extent = self.extent;
@@ -258,7 +250,7 @@ impl DepthPyramid {
                     src_size: [src_extent.width, src_extent.height],
                     dst_size: [dst_extent.width, dst_extent.height],
                 };
-                logical_device.cmd_bind_descriptor_sets(
+                device.cmd_bind_descriptor_sets(
                     cmd_buffer,
                     vk::PipelineBindPoint::COMPUTE,
                     self.pipeline_layout,
@@ -266,14 +258,14 @@ impl DepthPyramid {
                     slice::from_ref(&desc_set),
                     &[],
                 );
-                logical_device.cmd_push_constants(
+                device.cmd_push_constants(
                     cmd_buffer,
                     self.pipeline_layout,
                     vk::ShaderStageFlags::COMPUTE,
                     0,
                     as_bytes(&params),
                 );
-                logical_device.cmd_dispatch(
+                device.cmd_dispatch(
                     cmd_buffer,
                     dst_extent.width.div_ceil(WORKGROUP_SIZE),
                     dst_extent.height.div_ceil(WORKGROUP_SIZE),
@@ -292,7 +284,7 @@ impl DepthPyramid {
                     .subresource_range(color_range(level as u32, 1));
                 let dependency_info = vk::DependencyInfo::default()
                     .image_memory_barriers(slice::from_ref(&level_barrier));
-                logical_device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
+                device.cmd_pipeline_barrier2(cmd_buffer, &dependency_info);
 
                 src_extent = dst_extent;
                 dst_extent = half_extent(dst_extent);
@@ -301,14 +293,14 @@ impl DepthPyramid {
     }
 
     /// Leaves the levels null, so destroying them again does nothing.
-    unsafe fn destroy_levels(&mut self, logical_device: &ash::Device) {
+    unsafe fn destroy_levels(&mut self, device: &ash::Device) {
         unsafe {
-            logical_device.destroy_descriptor_pool(self.desc_pool, None);
+            device.destroy_descriptor_pool(self.desc_pool, None);
             for view in self.level_views.drain(..) {
-                logical_device.destroy_image_view(view, None);
+                device.destroy_image_view(view, None);
             }
-            logical_device.destroy_image_view(self.view, None);
-            self.image.destroy(logical_device);
+            device.destroy_image_view(self.view, None);
+            self.image.destroy(device);
         }
         self.desc_pool = vk::DescriptorPool::null();
         self.level_desc_sets.clear();
@@ -319,12 +311,12 @@ impl DepthPyramid {
 
     /// # Safety
     /// Before freeing an object, an application must ensure the object is no longer in use by the device.
-    pub unsafe fn destroy(&mut self, logical_device: &ash::Device) {
+    pub unsafe fn destroy(&mut self, device: &ash::Device) {
         unsafe {
-            self.destroy_levels(logical_device);
-            logical_device.destroy_descriptor_set_layout(self.desc_set_layout, None);
-            logical_device.destroy_pipeline(self.pipeline, None);
-            logical_device.destroy_pipeline_layout(self.pipeline_layout, None);
+            self.destroy_levels(device);
+            device.destroy_descriptor_set_layout(self.desc_set_layout, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
         }
     }
 }
@@ -348,7 +340,7 @@ fn color_range(base_level: u32, level_count: u32) -> vk::ImageSubresourceRange {
 
 #[inline]
 fn create_view(
-    logical_device: &ash::Device,
+    device: &ash::Device,
     image: vk::Image,
     base_level: u32,
     level_count: u32,
@@ -359,5 +351,5 @@ fn create_view(
         .view_type(vk::ImageViewType::TYPE_2D)
         .subresource_range(color_range(base_level, level_count));
 
-    unsafe { logical_device.create_image_view(&info, None) }
+    unsafe { device.create_image_view(&info, None) }
 }

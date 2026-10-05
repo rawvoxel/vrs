@@ -14,15 +14,15 @@ struct GpuTime {
     total: f64,
     /// Updating the light probes.
     probes: f64,
-    /// Tracing shadows and reflections.
-    shadows: f64,
+    /// The trace pass: shadows, reflections and indirect light.
+    tracing: f64,
 }
 
 impl GpuTime {
     fn add(&mut self, timings: &GpuTimings) {
         self.total += timings.total();
         self.probes += timings.sum(&GpuStage::PROBES);
-        self.shadows += timings.sum(&GpuStage::SHADOWS);
+        self.tracing += timings.sum(&GpuStage::TRACE_PASS);
     }
 }
 
@@ -58,7 +58,7 @@ impl FrameTitle {
     ) {
         self.frames += 1;
         // Without stalling, a frame from as many ago as are in flight.
-        if let Some(timings) = renderer.debug_gpu_timings() {
+        if let Some(timings) = renderer.gpu_timings() {
             self.gpu.add(timings);
             self.timed += 1;
         }
@@ -74,19 +74,19 @@ impl FrameTitle {
         ));
         if self.timed > 0 {
             let frames = self.timed as f64;
-            let (total, probes, shadows) = (
+            let (total, probes, tracing) = (
                 self.gpu.total / frames,
                 self.gpu.probes / frames,
-                self.gpu.shadows / frames,
+                self.gpu.tracing / frames,
             );
             // Only what the frames did.
             let mut stages = Vec::new();
-            for (name, time) in [("probes", probes), ("shadows", shadows)] {
+            for (name, time) in [("probes", probes), ("tracing", tracing)] {
                 if time > 0.0 {
                     stages.push(format!("{name} {time:.2}"));
                 }
             }
-            stages.push(format!("drawing {:.2}", total - probes - shadows));
+            stages.push(format!("drawing {:.2}", total - probes - tracing));
             parts.push(format!("GPU {total:.2} ms: {}", stages.join(", ")));
         }
         window.set_title(&format!("vrs - {}: {}", self.name, parts.join(", ")));

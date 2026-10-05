@@ -61,7 +61,7 @@ impl Renderer {
         let Some(RecordedCapture { frame, extent }) = self.recorded_capture.take() else {
             return Ok(None);
         };
-        unsafe { self.render_device.device_wait_idle()? };
+        unsafe { self.device.device_wait_idle()? };
 
         let mut pixels = vec![0u8; 4 * extent.width as usize * extent.height as usize];
         // SAFETY: Any byte is a valid `u8`.
@@ -90,11 +90,11 @@ impl Renderer {
         let byte_count = 4 * extent.width as vk::DeviceSize * extent.height as vk::DeviceSize;
         // NOTE: The fence wait at the start of the frame freed up this frame's buffer.
         unsafe {
-            self.capture_buffers[frame].reserve(&self.adapter, &self.render_device, byte_count)?;
+            self.capture_buffers[frame].reserve(&self.adapter, &self.device, byte_count)?;
         }
 
         image::transition_layout(
-            &self.render_device,
+            &self.device,
             image,
             cmd_buffer,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -113,7 +113,7 @@ impl Renderer {
             )
             .image_extent(extent.into());
         unsafe {
-            self.render_device.cmd_copy_image_to_buffer(
+            self.device.cmd_copy_image_to_buffer(
                 cmd_buffer,
                 image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,

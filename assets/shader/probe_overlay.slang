@@ -4,7 +4,7 @@
 
 #include "common.slang"
 
-// How wide a probe's cube is, in the shadow grid's finest voxels, for the finest cascade.
+// How wide a probe's cube is, in the voxel grid's finest voxels, for the finest cascade.
 static const float PROBE_CUBE = 1.5;
 
 struct ProbeOutput {
@@ -42,8 +42,8 @@ ProbeOutput probeVert(uint vertexIndex: SV_VertexID, uint slot: SV_InstanceID) {
         at.x = -at.x;
     }
     float3 local = (normal + u * at.x + v * at.y) * (PROBE_CUBE * 0.5 * float(1u << uint(cascadeOf(slot))));
-    float3 world = (probe.position + local) * ubo.lighting.shadowGrid.x;
-    output.position = mul(ubo.proj, mul(ubo.view, float4(world, 1.0)));
+    float3 world = (probe.position + local) * uniforms.lighting.gridVoxelSize;
+    output.position = mul(uniforms.proj, mul(uniforms.view, float4(world, 1.0)));
     output.normal = normal;
     return output;
 }

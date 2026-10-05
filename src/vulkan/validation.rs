@@ -16,7 +16,7 @@ pub struct MessageCounts {
 }
 
 /// For tests and tools, which can fail on validation messages instead of a person reading them.
-/// Always zero without validation, see `App::debug`.
+/// Always zero without validation, see `App::validation_enabled`.
 pub fn message_counts() -> MessageCounts {
     MessageCounts {
         errors: ERROR_COUNT.load(Ordering::Relaxed),
@@ -25,11 +25,11 @@ pub fn message_counts() -> MessageCounts {
 }
 
 #[derive(Clone, Copy)]
-pub struct Debug {
+pub struct Messenger {
     messenger: vk::DebugUtilsMessengerEXT,
 }
 
-impl Debug {
+impl Messenger {
     pub fn new(debug_utils_instance: &debug_utils::Instance) -> VkResult<Self> {
         let messenger = create_messenger(debug_utils_instance)?;
         Ok(Self { messenger })

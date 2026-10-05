@@ -14,7 +14,7 @@ struct ReduceParams {
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void reduceMain(uint3 threadId: SV_DispatchThreadID) {
+void reduceDepth(uint3 threadId: SV_DispatchThreadID) {
     uint2 texel = threadId.xy;
     if (any(texel >= params.dstSize)) {
         return;

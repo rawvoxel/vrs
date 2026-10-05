@@ -1,4 +1,4 @@
-// Tracing rays through the shadow grid's voxels.
+// Tracing rays through the voxel grid's voxels.
 
 // How far off a surface, in voxels, its shadow ray starts, so it starts in the cell in front.
 static const float SHADOW_RAY_OFFSET = 1.0 / 64.0;
@@ -34,7 +34,7 @@ struct VoxelHit {
     uint mesh;
 };
 
-// Whether a ray from `origin` along unit `direction`, both in the shadow grid's finest voxels,
+// Whether a ray from `origin` along unit `direction`, both in the voxel grid's finest voxels,
 // enters a solid voxel within `maxDistance`, and which. Rays leaving every level's shadow
 // table hit nothing, as do rays out of their budget of `MAX_RAY_CHUNKS` chunks and
 // `MAX_RAY_VOXELS` voxels, which only very long rays through busy chunks run out of.
@@ -54,7 +54,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
     hit.mesh = NO_CHUNK;
     // Whether the last voxel was see-through, so each pane tints the light once.
     bool inGlass = false;
-    int edge = int(ubo.lighting.shadowGrid.y);
+    int edge = int(uniforms.lighting.gridVoxelsPerEdge);
     int blocksPerEdge = occupancyBlocks(edge);
     // A ray along an axis would divide by zero.
     direction = select(abs(direction) < 1e-6, select(direction < 0.0, -1e-6, 1e-6), direction);
@@ -179,9 +179,9 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
 }
 
 // How much of the sun's light gets along a ray from `origin` along `direction`, both in the
-// shadow grid's voxels, to the shadow distance: none when a solid voxel is in the way, and
+// voxel grid's voxels, to the trace distance: none when a solid voxel is in the way, and
 // tinted by any see-through ones.
 float3 sunVisibility(float3 origin, float3 direction) {
     VoxelHit hit;
-    return traceVoxels(origin, direction, ubo.lighting.shadowGrid.z, true, false, hit) ? float3(0.0) : hit.transmittance;
+    return traceVoxels(origin, direction, uniforms.lighting.traceDistance, true, false, hit) ? float3(0.0) : hit.transmittance;
 }

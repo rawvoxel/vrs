@@ -24,69 +24,92 @@ static const uint KIND_COLORED = 0;
 static const uint KIND_AXIS_ALIGNED = 1;
 static const uint KIND_PACKED = 2;
 
-// The most levels of chunks the shadow grid has, each of voxels twice as big as the last.
-// Matches `renderer::MAX_SHADOW_LEVELS`.
-static const int MAX_SHADOW_LEVELS = 4;
+// The most levels of chunks the voxel grid has, each of voxels twice as big as the last.
+// Matches `renderer::MAX_GRID_LEVELS`.
+static const int MAX_GRID_LEVELS = 4;
 // The most cascades of light probes, each spaced twice as far apart as the last. Matches
 // `renderer::lighting::probes::MAX_CASCADES`.
 static const int MAX_CASCADES = 4;
 
+// Chunks along each side of each level's chunk table, centered on the camera. Matches
+// `renderer::lighting::voxel_grid::CHUNK_TABLE_SIDE`.
+static const int CHUNK_TABLE_SIDE = 32;
+
 // Matches `renderer::LightingUniforms`.
 struct LightingUniforms {
     // Normalized, toward the sun.
-    float4 sunDirection;
-    float4 sunColor;
-    float4 skyColor;
-    float4 groundColor;
-    // Chunks per side of each level's shadow table in w, 0 without shadows. The corners are
-    // in `shadowLevels`.
-    int4 shadowTable;
-    // The grid's voxel size, voxels per edge and the shadow distance in voxels, then how many
-    // levels of chunks it has.
-    float4 shadowGrid;
-    // How strong voxel ambient occlusion is, then the debug view, see `renderer::DebugView`,
-    // the exposure and the tonemapping, see `renderer::Tonemapping`.
-    float4 options;
-    // The chunk coordinate of each level's shadow table's corner, in that level's chunks.
-    int4 shadowLevels[MAX_SHADOW_LEVELS];
-    // The sky's zenith and horizon colors, then the cosine of the sun's radius, its
-    // brightness, the haze distance, and 1 when there's a sky, see `renderer::Sky`.
-    float4 sky[3];
+    float3 sunDirection;
+    // How strongly voxel ambient occlusion darkens corners, from 0 to 1.
+    float ambientOcclusion;
+    float3 sunColor;
+    // See `renderer::DebugView`.
+    uint debugView;
+    float3 skyColor;
+    float exposure;
+    float3 groundColor;
+    // See `renderer::Tonemapping`.
+    uint tonemapping;
+    // The voxel grid: its finest voxels' size, voxels along each chunk's edge, its levels, 0
+    // without a grid, and how far sun shadow and reflection rays reach, in the finest voxels.
+    float gridVoxelSize;
+    uint gridVoxelsPerEdge;
+    uint gridLevels;
+    float traceDistance;
+    // The chunk coordinate of each level's chunk table's low corner, in that level's chunks.
+    int4 chunkTableCorners[MAX_GRID_LEVELS];
+    // The sky, see `renderer::Sky`: its zenith and horizon colors, the cosine of the sun disc's
+    // radius, its brightness, the haze distance, and 1 when there's a sky.
+    float3 skyZenith;
+    float sunDiscCosine;
+    float3 skyHorizon;
+    float sunBrightness;
+    float hazeDistance;
+    uint hasSky;
+    float2 padding;
 };
 
 // Matches `renderer::lighting::probes::ProbeUniforms`.
 struct ProbeUniforms {
-    // Each cascade's probe cell at its low corner, in its own cells, w is 1 when the probes
-    // light the frame.
+    // Each cascade's probe cell at its low corner, in its own cells.
     int4 volumeMins[MAX_CASCADES];
-    // Probes along each axis of each cascade, w is probes per row of the atlases.
-    uint4 volumeCounts;
+    // Probes along each axis of each cascade, and how many cascades there are.
+    uint3 volumeCounts;
+    uint cascades;
+    // Probes per row of the atlases, the frame's number, the rays traced each frame, and the
+    // frames between the finest cascade's probes' updates.
+    uint atlasColumns;
+    uint frameNumber;
+    uint raysPerFrame;
+    uint updateInterval;
     // This frame's random rotation of the probes' rays, a quaternion.
     float4 rayRotation;
-    float4 cameraPosition;
-    // x is the frame's number, y the rays traced each frame, z how many cascades there are, w
-    // the frames between the finest cascade's probes' updates.
-    uint4 frame;
-    // `ProbeTuning`'s hysteresis, depth hysteresis, depth sharpness and self-shadow bias.
-    float4 tuning;
-    // `ProbeTuning`'s ray distance, then this frame's multipliers of the hysteresis for light
-    // and for distances, below 1 while the probes converge faster after a change.
-    float4 rays;
+    // `renderer::ProbeTuning`'s.
+    float hysteresis;
+    float distanceHysteresis;
+    float distanceSharpness;
+    float selfShadowBias;
+    float rayDistance;
+    // This frame's multipliers of the hysteresis for light and for distances, below 1 while
+    // the probes converge faster after a change.
+    float hysteresisScale;
+    float distanceHysteresisScale;
+    // 1 when the probes light the frame.
+    uint enabled;
 };
 
-// Matches `renderer::lighting::shadows::pass::ShadowUniforms`.
-struct ShadowUniforms {
-    // From clip space back to the world.
-    float4x4 inverseViewProj;
-    // Frame pixels per shadow texel along each axis, then the shadow images' width and
-    // height, then 1 when any material is glossy, for reflections to be traced.
-    uint4 params;
-    // The frame's width and height, then 1 when the shadow pass ran this frame, then 1 when it
-    // also lit faces with the light from everywhere but the sun.
-    uint4 frameSize;
+// Matches `renderer::lighting::trace::TraceUniforms`.
+struct TraceUniforms {
+    // Frame pixels per trace texel along each axis, then 1 when any material is glossy, for
+    // reflections to be traced, then the trace images' width and height.
+    uint pixelsPerTexel;
+    uint traceReflections;
+    uint2 imageSize;
     // How many lights there are, the light tiles across and down the frame, and how many of
     // each pixel's lights are shadowed.
-    uint4 lights;
+    uint lightCount;
+    uint tilesAcross;
+    uint tilesDown;
+    uint shadowedLights;
 };
 
 // A point or spot light. Matches `renderer::lighting::lights::GpuLight`.
@@ -113,13 +136,22 @@ struct Material {
 struct Uniforms {
     float4x4 view;
     float4x4 proj;
+    // From clip space back to the world, to find a pixel's position from its depth.
+    float4x4 inverseViewProj;
+    float3 cameraPosition;
+    float padding;
+    // The frame's width and height in pixels, then 1 when the trace pass ran, then 1 when it
+    // also found the light from everywhere but the sun, for shading to upscale.
+    uint2 frameSize;
+    uint usesTracePass;
+    uint tracedIndirect;
     LightingUniforms lighting;
     ProbeUniforms probeVolume;
-    ShadowUniforms shadow;
+    TraceUniforms trace;
 };
 
 // A light probe, matches `renderer::lighting::probes::volume::PROBE_SIZE`. Positions are in the
-// shadow grid's finest voxels, cells in its cascade's.
+// voxel grid's finest voxels, cells in its cascade's.
 struct Probe {
     // The probe cell the probe's slot holds.
     int3 cell;
