@@ -9,6 +9,11 @@
 
 #include "common.slang"
 
+// Match `DebugView::Trace` and `DebugView::Levels`, `DEBUG_TRACE` and `DEBUG_LEVELS` in
+// `mesh.slang`.
+static const uint DEBUG_TRACE_VIEW = 6;
+static const uint DEBUG_LEVELS_VIEW = 7;
+
 // Each texel's sun visibility, tinted by see-through voxels, and its surface's distance from
 // the camera.
 [[vk::binding(13, 0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> shadowsStorage;
@@ -64,9 +69,10 @@ void cullLights(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint in
                 (corner & 1) != 0 ? high.x : low.x,
                 (corner & 2) != 0 ? high.y : low.y,
                 asfloat((corner & 4) != 0 ? tileFarthest : tileNearest));
-            float4 world = mul(uniforms.inverseViewProj, float4(ndc, 1.0));
-            boxMin = min(boxMin, world.xyz / world.w);
-            boxMax = max(boxMax, world.xyz / world.w);
+            float4 offset = mul(uniforms.cameraOffsetFromClip, float4(ndc, 1.0));
+            float3 world = uniforms.cameraPosition + offset.xyz / offset.w;
+            boxMin = min(boxMin, world);
+            boxMax = max(boxMax, world);
         }
         for (uint i = index; i < uniforms.trace.lightCount; i += LIGHT_TILE * LIGHT_TILE) {
             Light light = lights[i];
@@ -125,11 +131,11 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
         indirectStorage[threadId.xy] = float4(0.0);
         return;
     }
-    float4 world = mul(uniforms.inverseViewProj, float4(uv * 2.0 - 1.0, depth, 1.0));
-    float3 position = world.xyz / world.w;
-    float3 camera = uniforms.cameraPosition;
-    float distance = length(position - camera);
-    float3 toCamera = (camera - position) / max(distance, 1e-6);
+    float4 offset = mul(uniforms.cameraOffsetFromClip, float4(uv * 2.0 - 1.0, depth, 1.0));
+    float3 fromCamera = offset.xyz / offset.w;
+    float3 position = uniforms.cameraPosition + fromCamera;
+    float distance = length(fromCamera);
+    float3 toCamera = -fromCamera / max(distance, 1e-6);
     float3 view = -toCamera;
     float3 onSurface = toGrid(position);
     bool hasGrid = uniforms.lighting.gridLevels > 0;
@@ -158,26 +164,26 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
         : onSurface + toCamera * SHADOW_RAY_OFFSET;
 
     float3 visible = float3(1.0);
+    uint sunTraceEnd = TRACE_LEFT_TABLES;
     if (hasGrid) {
         VoxelHit hit;
         bool blocked = traceVoxels(rayOrigin, uniforms.lighting.sunDirection, uniforms.lighting.traceDistance, !found, false, hit);
         visible = blocked ? float3(0.0) : hit.transmittance;
+        sunTraceEnd = traceEnd;
     }
     shadowsStorage[threadId.xy] = float4(visible, distance);
 
     // The light reaching the face from everywhere but the sun, and what it reflects when it's
-    // glossy. Without the face, the light reaching the surface as if facing the camera along
-    // the axis nearest, rather than shading falling back on the sky's, which indoors is far
-    // too bright.
+    // glossy. Without the face, as on grass and leaves, which aren't voxels, the light
+    // reaching the surface as if facing up, as they mostly do, rather than shading falling
+    // back on the sky's, which indoors is far too bright. Always up, so it's the same however
+    // the camera sees the surface.
     float4 reflection = float4(0.0);
     float4 indirect = float4(0.0);
     if (!found && hasGrid && uniforms.tracedIndirect != 0) {
-        float3 along = abs(toCamera);
-        float3 axis = along.x > along.y && along.x > along.z ? float3(1.0, 0.0, 0.0)
-            : along.y > along.z ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
-        float3 normal = axis * sign(dot(axis, toCamera));
-        float3 light = indirectLight(onSurface, normal, toCamera, false);
-        indirect = float4(light, float(faceNumber(normal)));
+        float3 up = float3(0.0, 1.0, 0.0);
+        float3 light = indirectLight(onSurface, up, toCamera, false);
+        indirect = float4(light, float(faceNumber(up)));
     }
     if (found) {
         float face = float(faceNumber(surface.normal));
@@ -196,6 +202,13 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
             float3 reflected = radianceAlong(rayOrigin, reflect(view, surface.normal), uniforms.lighting.traceDistance);
             reflection = float4(reflected, face);
         }
+    }
+    // For `DebugView::Trace` and `DebugView::Levels`: whether the face was found, how much
+    // sun reaches it, its level, and how the sun's ray ended, in place of the reflection.
+    uint debugView = uniforms.lighting.debugView;
+    if (debugView == DEBUG_TRACE_VIEW || debugView == DEBUG_LEVELS_VIEW) {
+        float level = found ? float(surface.level) : 0.0;
+        reflection = float4(found ? 1.0 : 0.0, dot(visible, LUMINANCE), level, float(sunTraceEnd));
     }
     reflectionsStorage[threadId.xy] = reflection;
     indirectStorage[threadId.xy] = indirect;

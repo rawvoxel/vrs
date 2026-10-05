@@ -193,7 +193,7 @@ impl Renderer {
         let uniforms = FrameUniforms {
             view: draws.view,
             proj: draws.proj,
-            inverse_view_proj: (draws.proj * draws.view).inverse(),
+            camera_offset_from_clip: (draws.proj * without_translation(draws.view)).inverse(),
             camera_position: draws.view.inverse().w_axis.truncate().to_array(),
             padding: 0.0,
             frame_size: [frame_size.width, frame_size.height],
@@ -273,5 +273,14 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+}
+
+/// `view` turning the world around the camera but not moving it, so the camera stays at the
+/// origin.
+fn without_translation(view: Mat4) -> Mat4 {
+    Mat4 {
+        w_axis: glam::Vec4::W,
+        ..view
     }
 }

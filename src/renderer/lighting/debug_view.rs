@@ -18,4 +18,14 @@ pub enum DebugView {
     /// As usual, with the light probes drawn as small cubes, each face colored with the
     /// light the probe holds from its direction.
     Probes,
+    /// How the trace pass found each pixel's surface, in green where it found the face the
+    /// pixel shows and in red where it didn't, bright where the sun reaches it and dark where
+    /// it doesn't. Where the sun's ray gave up rather than reaching the sky or a voxel, in
+    /// yellow past the trace distance, magenta out of voxel steps and cyan out of chunk steps.
+    /// Without the trace pass, black.
+    Trace,
+    /// The level of the voxel grid the trace pass found each pixel's face in: green for the
+    /// finest, then blue, yellow and magenta, and red where it found none. Without the trace
+    /// pass, black.
+    Levels,
 }

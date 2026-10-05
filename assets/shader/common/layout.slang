@@ -136,8 +136,10 @@ struct Material {
 struct Uniforms {
     float4x4 view;
     float4x4 proj;
-    // From clip space back to the world, to find a pixel's position from its depth.
-    float4x4 inverseViewProj;
+    // From clip space back to a point's offset from the camera, to find a pixel's position
+    // from its depth. Without the view's translation, which far from the world's origin would
+    // cost the position most of its precision.
+    float4x4 cameraOffsetFromClip;
     float3 cameraPosition;
     float padding;
     // The frame's width and height in pixels, then 1 when the trace pass ran, then 1 when it

@@ -23,6 +23,9 @@ static const float3 FACE_NORMALS[6] = {
 // How far axis aligned quads are pushed out past their edges, in pixels, so where one quad's corner
 // meets the middle of another's edge, rounding can't open a crack between them.
 static const float QUAD_OVERLAP_PIXELS = 0.25;
+// Marks an axis aligned vertex that isn't one of a quad's 4 corners in a row, in its flags.
+// Matches `mesh::LOOSE_FLAG`.
+static const uint LOOSE_FLAG = 16;
 // How much nearer or further, relative to its distance, a trace texel's surface can be than
 // a pixel's and still shadow it.
 static const float SHADOW_DEPTH_TOLERANCE = 0.08;
@@ -67,6 +70,8 @@ static const uint DEBUG_LIGHT = 1;
 static const uint DEBUG_DIRECT = 2;
 static const uint DEBUG_INDIRECT = 3;
 static const uint DEBUG_AMBIENT_OCCLUSION = 4;
+static const uint DEBUG_TRACE = 6;
+static const uint DEBUG_LEVELS = 7;
 
 // Matches `mesh::octahedral::decode`.
 float3 octahedralDecode(uint word) {
@@ -111,13 +116,15 @@ VSOutput meshVert(uint vertexIndex: SV_VertexID, uint meshIndex: SV_StartInstanc
         uint positionZFlags = vertexWords[word + 1];
         local = unpackPosition(vertexWords[word], positionZFlags, mesh.positionSteps);
         output.normal = FACE_NORMALS[min((positionZFlags >> 17) & 7, 5)];
-        // Axis aligned quads are 4 vertices in a row.
-        uint quad = mesh.vertexBase + (vertexIndex & ~3u) * 2;
-        float3 center = float3(0.0);
-        for (uint corner = 0; corner < 4; corner++) {
-            center += unpackPosition(vertexWords[quad + corner * 2], vertexWords[quad + corner * 2 + 1], mesh.positionSteps);
+        // Axis aligned quads are 4 vertices in a row, loose vertices stay put.
+        if (((positionZFlags >> 16) & LOOSE_FLAG) == 0) {
+            uint quad = mesh.vertexBase + (vertexIndex & ~3u) * 2;
+            float3 center = float3(0.0);
+            for (uint corner = 0; corner < 4; corner++) {
+                center += unpackPosition(vertexWords[quad + corner * 2], vertexWords[quad + corner * 2 + 1], mesh.positionSteps);
+            }
+            outward = sign(local - center * 0.25);
         }
-        outward = sign(local - center * 0.25);
     } else {
         word += vertexIndex * 3;
         local = unpackPosition(vertexWords[word], vertexWords[word + 1], mesh.positionSteps);
@@ -421,6 +428,27 @@ float4 meshFrag(VSOutput input) : SV_Target {
         return float4(light.indirect, 1.0);
     case DEBUG_AMBIENT_OCCLUSION:
         return float4(float3(openness), 1.0);
+    case DEBUG_TRACE:
+    case DEBUG_LEVELS: {
+        // The trace pass's texel for this pixel, see `traceSurfaces`.
+        float4 trace = shadowPass ? reflections.Load(int3(int2(input.position.xy) / int(uniforms.trace.pixelsPerTexel), 0)) : float4(0.0);
+        if (debugView == DEBUG_LEVELS) {
+            static const float3 LEVEL_COLORS[4] = {
+                float3(0.0, 1.0, 0.0), float3(0.0, 0.3, 1.0), float3(1.0, 1.0, 0.0), float3(1.0, 0.0, 1.0)
+            };
+            bool traced = shadowPass && trace.x > 0.5;
+            return float4(traced ? LEVEL_COLORS[min(uint(round(trace.z)), 3)] : float3(shadowPass ? 1.0 : 0.0, 0.0, 0.0), 1.0);
+        }
+        float brightness = 0.2 + 0.8 * trace.y;
+        // Rays that gave up rather than reaching the sky or a voxel stand out.
+        uint end = uint(round(trace.w));
+        float3 color = trace.x > 0.5 ? float3(0.0, 1.0, 0.0) : float3(1.0, 0.0, 0.0);
+        color = end == TRACE_PAST_DISTANCE ? float3(1.0, 1.0, 0.0)
+            : end == TRACE_OUT_OF_VOXELS ? float3(1.0, 0.0, 1.0)
+            : end == TRACE_OUT_OF_CHUNKS ? float3(0.0, 1.0, 1.0)
+            : color;
+        return float4(color * brightness, 1.0);
+    }
     default: {
         float3 shaded = shadeSurface(material, normal, toViewer, lit, reflection);
         return float4(toDisplay(hazed(shaded, fromCamera)), 1.0);

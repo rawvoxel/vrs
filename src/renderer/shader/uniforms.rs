@@ -17,8 +17,10 @@ pub struct FrameUniforms {
     /// From the world to the camera, and the camera to Vulkan's clip space.
     pub view: Mat4,
     pub proj: Mat4,
-    /// From clip space back to the world, to find a pixel's position from its depth.
-    pub inverse_view_proj: Mat4,
+    /// From clip space back to a point's offset from the camera, to find a pixel's position
+    /// from its depth. Without the view's translation, which far from the world's origin
+    /// would cost the position most of its precision.
+    pub camera_offset_from_clip: Mat4,
     pub camera_position: [f32; 3],
     pub padding: f32,
     /// The frame's width and height in pixels.

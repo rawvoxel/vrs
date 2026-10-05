@@ -34,10 +34,10 @@ use ash::{prelude::VkResult, vk};
 use glam::{Mat4, Vec3};
 use vrs::{
     App,
-    mesh::MeshId,
+    mesh::{MeshId, Vertex},
     renderer::{
-        Capture, DrawList, Light, Lighting, Material, ProbeConfig, Renderer, RendererConfig, Spot,
-        TraceResolution, VoxelGrid,
+        Capture, DebugView, DrawList, Light, Lighting, Material, ProbeConfig, Renderer,
+        RendererConfig, Spot, TraceResolution, VoxelGrid,
     },
 };
 
@@ -189,6 +189,10 @@ fn skylit_hall(x: i32, y: i32, z: i32) -> u16 {
     if skylight { 0 } else { hall(x, y, z) }
 }
 
+/// Far enough from the world's origin that a voxel's coordinates there are only exact to a
+/// few thousandths, as in a big world.
+const FAR: Vec3 = Vec3::new(4096.0, 2816.0, -4096.0);
+
 /// From one corner of the hall, across it to the far corner's floor.
 const HALL_VIEW: View = View {
     eye: Vec3::new(-55.0, 45.0, -55.0),
@@ -276,6 +280,10 @@ struct Scene<'a> {
     lights: &'a [Light],
     /// Then `CHANGE_FRAMES` frames of these voxels and this lighting.
     change: Option<(Voxels<'a>, Lighting)>,
+    /// Where in the world its voxel at the origin is, the camera and lights moved with it.
+    origin: Vec3,
+    /// Triangles of a colored mesh, outside the voxel grid.
+    colored: &'a [Vertex],
 }
 
 impl<'a> Scene<'a> {
@@ -288,7 +296,32 @@ impl<'a> Scene<'a> {
             lighting,
             lights: &[],
             change: None,
+            origin: Vec3::ZERO,
+            colored: &[],
         }
+    }
+
+    fn colored(self, colored: &'a [Vertex]) -> Self {
+        Self { colored, ..self }
+    }
+
+    /// Moved to `origin`, a whole number of coarse chunks from the world's origin.
+    fn at(self, origin: Vec3) -> Self {
+        Self { origin, ..self }
+    }
+
+    /// Its lights, moved with it.
+    fn placed_lights(&self) -> Vec<Light> {
+        let moved = |light: &Light| Light {
+            position: light.position + self.origin,
+            ..*light
+        };
+        self.lights.iter().map(moved).collect()
+    }
+
+    /// The view matrix of `view`, moved with it.
+    fn view_matrix(&self, view: View) -> Mat4 {
+        Mat4::look_at_rh(view.eye + self.origin, view.target + self.origin, Vec3::Y)
     }
 
     fn lights(self, lights: &'a [Light]) -> Self {
@@ -319,7 +352,12 @@ impl<'a> Scene<'a> {
 /// Each chunk of level `level` around the origin with any voxels, as meshes: 64 voxels wide,
 /// each `2^level` world voxels wide, of the type of the world voxel at its low corner. Scenes
 /// fit the 3 by 3 chunks around the origin's, one chunk high.
-fn create_chunks(renderer: &mut Renderer, voxels: Voxels, level: u32) -> VkResult<Vec<MeshId>> {
+fn create_chunks(
+    renderer: &mut Renderer,
+    voxels: Voxels,
+    level: u32,
+    origin: Vec3,
+) -> VkResult<Vec<MeshId>> {
     let scale = 1 << level;
     let mut ids = Vec::new();
     for chunk_x in -1..2 {
@@ -333,11 +371,10 @@ fn create_chunks(renderer: &mut Renderer, voxels: Voxels, level: u32) -> VkResul
                 )
             };
             let types = greedy::chunk_types(local);
-            let origin = Vec3::from(corner.map(|voxel| voxel as f32));
             let solid = |x: i32, y: i32, z: i32| local(x, y, z) != 0;
             ids.extend(greedy::create_chunk(
                 renderer,
-                origin,
+                origin + Vec3::from(corner.map(|voxel| voxel as f32)),
                 scale as f32,
                 &types,
                 solid,
@@ -349,9 +386,18 @@ fn create_chunks(renderer: &mut Renderer, voxels: Voxels, level: u32) -> VkResul
 
 /// Every chunk of `scene`'s voxels, `voxels` in place of its own.
 fn create_scene(renderer: &mut Renderer, scene: &Scene, voxels: Voxels) -> VkResult<Vec<MeshId>> {
-    let mut ids = create_chunks(renderer, voxels, 0)?;
+    let mut ids = create_chunks(renderer, voxels, 0, scene.origin)?;
     if let Some(coarse) = scene.coarse {
-        ids.extend(create_chunks(renderer, coarse, 1)?);
+        ids.extend(create_chunks(renderer, coarse, 1, scene.origin)?);
+    }
+    if !scene.colored.is_empty() {
+        let moved = |vertex: &Vertex| Vertex {
+            position: (Vec3::from(vertex.position) + scene.origin).to_array(),
+            ..*vertex
+        };
+        let vertices: Vec<Vertex> = scene.colored.iter().map(moved).collect();
+        let indices: Vec<u32> = (0..vertices.len() as u32).collect();
+        ids.push(renderer.create_colored_mesh(&indices, &vertices)?);
     }
     Ok(ids)
 }
@@ -365,14 +411,14 @@ fn render(app: &App, scene: Scene, view: View) -> VkResult<Option<Vec<f32>>> {
     };
     let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, config)?;
     renderer.set_materials(&MATERIALS);
-    renderer.lights = scene.lights.to_vec();
+    renderer.lights = scene.placed_lights();
     let grid = Some(VoxelGrid::new(1.0, EDGE as u32).with_levels(scene.levels));
     let light = |lighting: Lighting| Lighting {
         voxel_grid: grid,
         ..lighting
     };
     renderer.lighting = light(scene.lighting);
-    let view_matrix = Mat4::look_at_rh(view.eye, view.target, Vec3::Y);
+    let view_matrix = scene.view_matrix(view);
     let proj = camera::perspective(70.0, WIDTH as f32 / HEIGHT as f32, 0.1, 500.0);
     let frames = |renderer: &mut Renderer, ids: &[MeshId], count: u32| {
         let meshes: Vec<&MeshId> = ids.iter().collect();
@@ -411,7 +457,7 @@ fn render_frames(app: &App, scene: Scene, view: View, count: u32) -> VkResult<Ve
     };
     let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, config)?;
     renderer.set_materials(&MATERIALS);
-    renderer.lights = scene.lights.to_vec();
+    renderer.lights = scene.placed_lights();
     renderer.lighting = Lighting {
         voxel_grid: Some(VoxelGrid::new(1.0, EDGE as u32).with_levels(scene.levels)),
         ..scene.lighting
@@ -420,7 +466,7 @@ fn render_frames(app: &App, scene: Scene, view: View, count: u32) -> VkResult<Ve
     let meshes: Vec<&MeshId> = ids.iter().collect();
     let draws = DrawList {
         meshes: &meshes,
-        view: Mat4::look_at_rh(view.eye, view.target, Vec3::Y),
+        view: scene.view_matrix(view),
         proj: camera::perspective(70.0, WIDTH as f32 / HEIGHT as f32, 0.1, 500.0),
     };
     for _ in 0..FRAMES {
@@ -432,7 +478,11 @@ fn render_frames(app: &App, scene: Scene, view: View, count: u32) -> VkResult<Ve
             return Ok(Vec::new());
         }
         renderer.submit(WIDTH, HEIGHT, &draws)?;
-        match renderer.debug_read_capture()?.as_ref().and_then(linear_reds) {
+        match renderer
+            .debug_read_capture()?
+            .as_ref()
+            .and_then(linear_reds)
+        {
             Some(frame) => frames.push(frame),
             None => return Ok(Vec::new()),
         }
@@ -524,15 +574,76 @@ fn sealed_box(checks: &mut Checks) -> VkResult<()> {
 }
 
 /// No light leaks into a sealed hall, onto steps and into corners seen from far across it,
-/// where the depth buffer is least precise, at full and half trace resolution.
+/// where the depth buffer is least precise, at full and half trace resolution, and far from
+/// the world's origin, where positions are least precise.
 fn sealed_hall(checks: &mut Checks) -> VkResult<()> {
-    for (how, lighting) in [("", bright()), (" at half resolution", half(bright()))] {
-        let lit = fraction_over(&checks.render(Scene::new(&hall, lighting), HALL_VIEW)?, UNLIT);
+    for (how, scene) in [
+        ("", Scene::new(&hall, bright())),
+        (" at half resolution", Scene::new(&hall, half(bright()))),
+        (" far from the origin", Scene::new(&hall, bright()).at(FAR)),
+        (
+            " far from the origin at half resolution",
+            Scene::new(&hall, half(bright())).at(FAR),
+        ),
+    ] {
+        let lit = fraction_over(&checks.render(scene, HALL_VIEW)?, UNLIT);
         // No crack shows the sky, every surface seen is inside.
         checks.expect(
             format!("{} of a sealed hall's inside is lit{how}", percent(lit, 2)),
             lit == 0.0,
             "light leaks in along its steps and corners",
+        );
+    }
+    Ok(())
+}
+
+/// A floor drawn as a colored mesh, outside the voxel grid as grass and leaves are, under a
+/// sky brighter than the ground, gets the same light from everywhere all over, at full and
+/// half trace resolution: none of it, such as the square under the camera, differs.
+fn colored_floor(checks: &mut Checks) -> VkResult<()> {
+    let (y, reach) = (10.0, 400.0);
+    let corner = |x: f32, z: f32| Vertex {
+        position: [x, y, z],
+        normal: [0.0, 1.0, 0.0],
+        color: [1.0; 3],
+    };
+    let [a, b, c, d] = [
+        corner(-reach, -reach),
+        corner(-reach, reach),
+        corner(reach, reach),
+        corner(reach, -reach),
+    ];
+    // Both windings, so it's seen whichever way is its front.
+    let floor = [a, b, c, a, c, d, a, c, b, a, d, c];
+    let lighting = Lighting {
+        sun_color: [0.0; 3],
+        sky_color: [1.0; 3],
+        ground_color: [0.1; 3],
+        debug_view: DebugView::Indirect,
+        ..Lighting::default()
+    };
+    // Down past the camera's foot, to well beyond it.
+    let view = View {
+        eye: Vec3::new(0.0, 30.0, -10.0),
+        target: Vec3::new(0.0, 10.0, 5.0),
+    };
+    for (how, lighting) in [("", lighting), (" at half resolution", half(lighting))] {
+        let frame = checks.render(Scene::new(&|_, _, _| 0, lighting).colored(&floor), view)?;
+        let mut sorted = frame.clone();
+        sorted.sort_by(f32::total_cmp);
+        let median = sorted[sorted.len() / 2];
+        let off = frame
+            .iter()
+            .filter(|&&value| (value - median).abs() > median * 0.1)
+            .count() as f32
+            / frame.len() as f32;
+        checks.expect(
+            format!(
+                "{} of a colored floor's light from everywhere is off by over 10%{how}",
+                percent(off, 2)
+            ),
+            off < 0.001,
+            "it depends on where it is from the camera",
         );
     }
     Ok(())
@@ -544,8 +655,18 @@ fn sealed_hall(checks: &mut Checks) -> VkResult<()> {
 fn steady_light(checks: &mut Checks) -> VkResult<()> {
     let scenes: [(&str, Voxels, View, Lighting); 3] = [
         (" in a box", &holed, HOLE_VIEW, sun_only()),
-        (" in a box at half resolution", &holed, HOLE_VIEW, half(sun_only())),
-        (" in a busy hall at half resolution", &skylit_hall, HALL_VIEW, half(sun_only())),
+        (
+            " in a box at half resolution",
+            &holed,
+            HOLE_VIEW,
+            half(sun_only()),
+        ),
+        (
+            " in a busy hall at half resolution",
+            &skylit_hall,
+            HALL_VIEW,
+            half(sun_only()),
+        ),
     ];
     for (how, voxels, view, lighting) in scenes {
         let frames = render_frames(checks.app, Scene::new(voxels, lighting), view, 16)?;
@@ -903,9 +1024,52 @@ fn coarse_chunks(checks: &mut Checks) -> VkResult<()> {
     Ok(())
 }
 
+/// A floor of fine chunks on one side and coarser ones on the other, as around a camera
+/// whose fine chunks reach only so far, lit the same on either side of the seam as a floor
+/// all of fine chunks, under a sun and sky, with two cascades, at half trace resolution.
+fn level_seam(checks: &mut Checks) -> VkResult<()> {
+    let fine_half = |x: i32, y: i32, z: i32| if x < 0 { floor(x, y, z) } else { 0 };
+    let coarse_half = |x: i32, y: i32, z: i32| if x >= 0 { floor(x, y, z) } else { 0 };
+    let two = ProbeConfig {
+        cascades: 2,
+        ..ProbeConfig::default()
+    };
+    let view = View {
+        eye: Vec3::new(0.0, 30.0, -40.0),
+        target: Vec3::new(0.0, 8.0, 20.0),
+    };
+    let lighting = half(bright());
+    let mixed = checks.render(
+        Scene::new(&fine_half, lighting)
+            .coarse(&coarse_half, 2)
+            .probes(two),
+        view,
+    )?;
+    let fine = checks.render(Scene::new(&floor, lighting).probes(two), view)?;
+    let side_mean = |frame: &[f32], right: bool| {
+        let values: Vec<f32> = frame
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| ((index % WIDTH as usize) >= WIDTH as usize / 2) == right)
+            .map(|(_, value)| *value)
+            .collect();
+        mean(&values)
+    };
+    for (side, right) in [("fine", false), ("coarse", true)] {
+        let ratio = side_mean(&mixed, right) / side_mean(&fine, right).max(1e-6);
+        checks.expect(
+            format!("the {side} side of a floor where its chunks' level changes is {ratio:.3}x as bright as all fine"),
+            (ratio - 1.0).abs() <= 0.05,
+            "the seam between levels shows",
+        );
+    }
+    Ok(())
+}
+
 /// Coarser chunks and probe cascades, see `coarse_chunks` and `cascades`.
 fn coarse_chunks_and_cascades(checks: &mut Checks) -> VkResult<()> {
     coarse_chunks(checks)?;
+    level_seam(checks)?;
     cascades(checks)
 }
 
@@ -934,10 +1098,11 @@ fn cascades(checks: &mut Checks) -> VkResult<()> {
 }
 
 /// Every check, in the order they run.
-const CHECKS: [fn(&mut Checks) -> VkResult<()>; 12] = [
+const CHECKS: [fn(&mut Checks) -> VkResult<()>; 13] = [
     sky_floor,
     sealed_box,
     sealed_hall,
+    colored_floor,
     steady_light,
     holed_box,
     lit_box,

@@ -9,6 +9,14 @@ static const float RAY_EPSILON = 1.0 / 4096.0;
 static const uint MAX_RAY_CHUNKS = 256;
 static const uint MAX_RAY_VOXELS = 1024;
 
+// How the last `traceVoxels` ended, for `DebugView::Trace`.
+static const uint TRACE_HIT = 0;
+static const uint TRACE_LEFT_TABLES = 1;
+static const uint TRACE_PAST_DISTANCE = 2;
+static const uint TRACE_OUT_OF_VOXELS = 3;
+static const uint TRACE_OUT_OF_CHUNKS = 4;
+static uint traceEnd;
+
 // Where a ray from `origin` along `direction`, with `inverse` its reciprocal, leaves the box
 // from `boxMin` to `boxMax`, and across which `axis`. At least `t` plus a little, so the ray
 // always moves on.
@@ -16,6 +24,48 @@ float exitDistance(float3 origin, float3 direction, float3 inverse, float3 boxMi
     float3 exits = (select(direction > 0.0, boxMax, boxMin) - origin) * inverse;
     axis = exits.x < exits.y ? (exits.x < exits.z ? 0 : 2) : (exits.y < exits.z ? 1 : 2);
     return max(exits[axis], t + RAY_EPSILON);
+}
+
+// The float just below `x`, for a box's exclusive upper bound.
+float3 below(float3 x) {
+    return select(x > 0.0, asfloat(asuint(x) - 1), select(x < 0.0, asfloat(asuint(x) + 1), float3(-1e-30)));
+}
+
+// A box no position is outside, for `pastFace` and `inCell` to narrow.
+struct RayBounds {
+    float3 lowest;
+    float3 highest;
+};
+
+RayBounds unbounded() {
+    RayBounds bounds = { float3(-1e30), float3(1e30) };
+    return bounds;
+}
+
+// Past the face on `axis` of the box from `boxMin` to `boxMax` that a ray going `direction`
+// just left it through.
+RayBounds pastFace(float3 direction, int axis, float3 boxMin, float3 boxMax) {
+    RayBounds bounds = unbounded();
+    if (direction[axis] > 0.0) {
+        bounds.lowest[axis] = boxMax[axis];
+    } else {
+        bounds.highest[axis] = below(boxMin)[axis];
+    }
+    return bounds;
+}
+
+// In cell `cell` of cells `scale` wide.
+RayBounds inCell(int3 cell, float scale) {
+    RayBounds bounds = { float3(cell) * scale, below(float3(cell + 1) * scale) };
+    return bounds;
+}
+
+// Where a ray from `origin` along `direction` is `t` along it, a little further, in `bounds`.
+// Far from the origin, where a voxel's coordinates are only exact to a few thousandths, a
+// position just past a boundary can round back onto it or short of it, so the bounds of the
+// cell or region the ray is known to have entered keep it there, and it always moves on.
+float3 rayPosition(float3 origin, float3 direction, float t, RayBounds bounds) {
+    return clamp(origin + direction * (t + RAY_EPSILON), bounds.lowest, bounds.highest);
 }
 
 // The first solid voxel along a ray.
@@ -52,6 +102,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
     hit.transmittance = float3(1.0);
     hit.level = 0;
     hit.mesh = NO_CHUNK;
+    traceEnd = TRACE_HIT;
     // Whether the last voxel was see-through, so each pane tints the light once.
     bool inGlass = false;
     int edge = int(uniforms.lighting.gridVoxelsPerEdge);
@@ -66,17 +117,21 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
     int axis = -1;
     bool leftSurface = !skipStartSolid;
     uint voxelSteps = 0;
+    // Where the ray is known to be, past the last boundary it crossed.
+    RayBounds bounds = unbounded();
     for (uint chunkStep = 0; chunkStep < MAX_RAY_CHUNKS; chunkStep++) {
         if (t > maxDistance) {
+            traceEnd = TRACE_PAST_DISTANCE;
             return false;
         }
-        float3 position = origin + direction * (t + RAY_EPSILON);
+        float3 position = rayPosition(origin, direction, t, bounds);
         int level;
         int3 chunk;
         int coverLevel;
         int3 coverChunk;
         uint meshIndex = chunkAtPoint(position, level, chunk, coverLevel, coverChunk);
         if (coverLevel < 0) {
+            traceEnd = TRACE_LEFT_TABLES;
             return false;
         }
         // The ray crosses the finest table's chunk here before looking again, no finer chunk
@@ -86,6 +141,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
         if (meshIndex == NO_CHUNK) {
             // Nothing to hit, so straight to where the ray leaves it.
             t = exitDistance(origin, direction, inverse, regionMin, regionMin + coverSize, t, axis);
+            bounds = pastFace(direction, axis, regionMin, regionMin + coverSize);
             leftSurface = true;
             inGlass = false;
             continue;
@@ -103,10 +159,13 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
         float3 crossings = (float3(cell + select(direction > 0.0, int3(1), int3(0))) * scale - origin) * inverse;
         while (true) {
             if (any(cell < cellsMin) || any(cell >= cellsMax)) {
+                // On to the region of the cell it stepped into.
+                bounds = inCell(cell, scale);
                 break;
             }
             int3 local = cell - chunkMin;
             if (++voxelSteps > MAX_RAY_VOXELS) {
+                traceEnd = TRACE_OUT_OF_VOXELS;
                 return false;
             }
             int3 block = local / OCCUPANCY_BLOCK;
@@ -116,11 +175,13 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
                 int3 blockMax = min(blockMin + OCCUPANCY_BLOCK, chunkMin + edge);
                 t = exitDistance(origin, direction, inverse, float3(blockMin) * scale, float3(blockMax) * scale, t, axis);
                 if (t > maxDistance) {
+                    traceEnd = TRACE_PAST_DISTANCE;
                     return false;
                 }
                 leftSurface = true;
                 inGlass = false;
-                cell = int3(floor((origin + direction * (t + RAY_EPSILON)) / scale));
+                bounds = pastFace(direction, axis, float3(blockMin) * scale, float3(blockMax) * scale);
+                cell = int3(floor(rayPosition(origin, direction, t, bounds) / scale));
                 crossings = (float3(cell + select(direction > 0.0, int3(1), int3(0))) * scale - origin) * inverse;
                 continue;
             }
@@ -171,10 +232,12 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
                 crossings.z += delta.z;
             }
             if (t > maxDistance) {
+                traceEnd = TRACE_PAST_DISTANCE;
                 return false;
             }
         }
     }
+    traceEnd = TRACE_OUT_OF_CHUNKS;
     return false;
 }
 

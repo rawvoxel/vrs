@@ -49,6 +49,9 @@ pub const POSITION_BIAS: f32 = 16.0;
 pub const SEE_THROUGH_FLAG: u32 = 1;
 /// Where a `AxisAlignedVertex` keeps its `Face`, in its flags.
 const FACE_SHIFT: u32 = 1;
+/// The flag bit marking an `AxisAlignedVertex` that isn't one of a quad's 4 corners in a row,
+/// see `AxisAlignedVertex::loose`. Matches `LOOSE_FLAG` in `mesh.slang`.
+pub const LOOSE_FLAG: u32 = 1 << 4;
 
 /// Quantization steps per voxel for a chunk `voxels_per_edge` voxels wide: the largest power
 /// of two whose range still fits the interior plus a [`POSITION_BIAS`] margin on each side.
@@ -179,6 +182,22 @@ impl AxisAlignedVertex {
     pub fn face(&self) -> Face {
         Face::ALL[((self.position_z_flags >> (16 + FACE_SHIFT)) & 7) as usize]
     }
+
+    /// The same vertex, but not one of a quad's 4 corners in a row, such as a corner of a
+    /// skirt a mesher hangs from its quads' edges. The renderer leaves it where it is, rather
+    /// than pushing it out past its quad's edges, as it does quads' corners.
+    #[inline]
+    pub fn loose(self) -> Self {
+        Self {
+            position_z_flags: self.position_z_flags | (LOOSE_FLAG << 16),
+            ..self
+        }
+    }
+
+    #[inline]
+    pub fn is_loose(&self) -> bool {
+        (self.position_z_flags >> 16) & LOOSE_FLAG != 0
+    }
 }
 
 /// The two position words, with zeroed flags.
@@ -228,6 +247,26 @@ mod tests {
         }
         assert!(PackedVertex::new(Vec3::new(-16.5, 0.0, 0.0), Vec3::Y, 32).is_none());
         assert!(PackedVertex::new(Vec3::new(48.0, 0.0, 0.0), Vec3::Y, 32).is_none());
+    }
+
+    #[test]
+    fn loose_vertices_keep_position_face_and_see_through() {
+        let packed = PackedVertex::new(Vec3::new(1.0, 2.0, 3.0), Vec3::X, 32).unwrap();
+        let see_through = PackedVertex {
+            position_z_flags: packed.position_z_flags | (SEE_THROUGH_FLAG << 16),
+            ..packed
+        };
+        let aligned = AxisAlignedVertex::from_packed(see_through);
+        let loose = aligned.loose();
+        assert!(!aligned.is_loose());
+        assert!(loose.is_loose());
+        assert_eq!(loose.face(), Face::PosX);
+        assert_eq!(loose.position_xy, aligned.position_xy);
+        assert_eq!(
+            loose.position_z_flags & 0xffff,
+            aligned.position_z_flags & 0xffff
+        );
+        assert_ne!((loose.position_z_flags >> 16) & SEE_THROUGH_FLAG, 0);
     }
 
     #[test]

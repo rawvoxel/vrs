@@ -13,7 +13,8 @@ use glam::Vec3;
 pub enum ChunkVertices<'a> {
     /// Axis aligned faces only, such as from greedy meshing, 8 bytes a vertex. Each quad is 4
     /// vertices in a row, which the renderer overlaps a little with its neighbors so no
-    /// cracks open where one quad's corner meets the middle of another's edge.
+    /// cracks open where one quad's corner meets the middle of another's edge. Vertices that
+    /// aren't a quad's, such as a skirt's, are marked `AxisAlignedVertex::loose`.
     AxisAligned(&'a [AxisAlignedVertex]),
     /// Any surface, such as from surface nets or marching cubes, 12 bytes a vertex.
     Packed(&'a [PackedVertex]),
