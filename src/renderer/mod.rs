@@ -13,12 +13,12 @@ pub(crate) mod shader;
 pub(crate) mod timings;
 
 pub use config::RendererConfig;
-pub use debug::{Capture, FrameStats};
+pub use debug::{Capture, FrameStats, ProbeRecord};
 pub use draw_list::DrawList;
 pub(crate) use lighting::LightingUniforms;
 pub use lighting::{
     DebugView, Light, Lighting, MAX_CASCADES, MAX_GRID_LEVELS, MAX_LIGHTS, MAX_SHADOWED_LIGHTS,
-    ProbeConfig, ProbeTuning, Sky, Spot, Tonemapping, TraceResolution, VoxelGrid,
+    PROBE_CELL, ProbeConfig, ProbeTuning, Sky, Spot, Tonemapping, TraceResolution, VoxelGrid,
 };
 pub use material::Material;
 pub use mesh_pool::{MeshCapacity, MeshKind, MeshPoolStats, MeshRecord};
@@ -73,13 +73,13 @@ pub struct Renderer {
     culler: Culler,
     /// Built from each frame's depth between its two culling phases.
     depth_pyramid: DepthPyramid,
-    /// The light probes, a single unused one when there's no `RendererConfig::global_illumination`.
+    /// The light probes, a single unused one without a `probe_config`.
     probe_volume: ProbeVolume,
     /// Traces shadows and reflections, and finds the light from everywhere but the sun, from
     /// each frame's depth, see `uses_trace_pass`.
     trace_pass: TracePass,
-    /// Whether there's a `RendererConfig::global_illumination`.
-    probes_configured: bool,
+    /// The light probes', see `set_probe_config`.
+    probe_config: Option<lighting::ProbeConfig>,
     /// Frames submitted, which seeds each frame's probe rays.
     frame_number: u64,
     /// What `debug_frame_stats` reads back.
@@ -125,15 +125,16 @@ pub struct Renderer {
     frame_palette_buffers: Vec<DynamicBuffer>,
     /// The palette version each frame's buffer holds.
     frame_palette_versions: Vec<u64>,
-    /// Which chunk is where around the camera, for shadow rays, see `write_lighting`.
+    /// Where each of the voxel grid's chunks is, for rays, see `write_lighting`.
     frame_chunk_tables: Vec<DynamicBuffer>,
-    /// Reused to build each frame's chunk table in.
+    /// Reused to build each frame's chunk table in, and its chunks.
     chunk_table: Vec<u32>,
-    /// Which chunk table entries' chunks changed since last frame, a bit each, see
+    grid_chunks: Vec<lighting::voxel_grid::GridChunk>,
+    /// Which probes are next to chunks that changed since last frame, a bit each, see
     /// `write_lighting`.
-    frame_changed_chunks: Vec<DynamicBuffer>,
-    /// Reused to build each frame's changed chunks in.
-    changed_chunks: Vec<u32>,
+    frame_changed_probes: Vec<DynamicBuffer>,
+    /// Reused to build each frame's changed probes in.
+    changed_probes: Vec<u32>,
     /// Each frame's `lights`.
     frame_light_buffers: Vec<DynamicBuffer>,
     /// Reused to build each frame's lights in.
@@ -343,7 +344,7 @@ impl Drop for Renderer {
                 .iter()
                 .chain(&self.frame_palette_buffers)
                 .chain(&self.frame_chunk_tables)
-                .chain(&self.frame_changed_chunks)
+                .chain(&self.frame_changed_probes)
                 .chain(&self.frame_light_buffers)
             {
                 buffer.destroy(device);

@@ -1,6 +1,6 @@
 //! The probes' buffers, atlases and compute passes, updated each frame.
 
-use super::{MAX_CASCADES, ProbeConfig};
+use super::{MAX_CASCADES, PROBE_CELL, ProbeConfig};
 use crate::{
     renderer::{
         shader::bindings,
@@ -46,6 +46,9 @@ pub(crate) struct ProbeVolume {
     /// Probes along each axis of each cascade.
     pub counts: [u32; 3],
     pub cascades: u32,
+    /// The level of the voxel grid whose `PROBE_CELL` voxels the first cascade's cells are,
+    /// see `ProbeConfig::spacing`.
+    pub first_level: u32,
     pub rays_per_frame: u32,
     pub atlas_columns: u32,
     pub probe_buffer: Buffer,
@@ -68,6 +71,7 @@ impl ProbeVolume {
         Self {
             counts: [0; 3],
             cascades: 0,
+            first_level: 0,
             rays_per_frame: 0,
             atlas_columns: 0,
             probe_buffer: Buffer::null(),
@@ -95,6 +99,8 @@ impl ProbeVolume {
         let mut volume = Self::null();
         volume.counts = config.map_or([1; 3], |config| config.probe_counts.map(|n| n.max(1)));
         volume.cascades = config.map_or(1, |config| config.cascades.clamp(1, MAX_CASCADES));
+        volume.first_level =
+            config.map_or(0, |config| (config.spacing / PROBE_CELL).max(1).ilog2());
         volume.rays_per_frame = config.map_or(0, |config| config.rays_per_frame);
         if let Err(err) = volume.create(adapter, device, layout) {
             unsafe { volume.destroy(device) };
@@ -130,8 +136,11 @@ impl ProbeVolume {
                 0,
             )
         };
-        self.probe_buffer =
-            storage_buffer(probes * PROBE_SIZE, vk::BufferUsageFlags::TRANSFER_DST)?;
+        // Read back too, see `Renderer::debug_probes`.
+        self.probe_buffer = storage_buffer(
+            probes * PROBE_SIZE,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+        )?;
         // The budget, or the fewest rays each when there are more active probes than it covers.
         let rays = (self.rays_per_frame as vk::DeviceSize).max(probes * MIN_RAYS_PER_PROBE);
         self.ray_buffer = storage_buffer(

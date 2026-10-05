@@ -9,6 +9,13 @@ int3 floorDiv(int3 value, int divisor) {
     return int3(floor(float3(value) / float(divisor)));
 }
 
+// `value` modulo `divisor`, from 0 up to `divisor`, for negative values too. In place of `%`,
+// whose remainders of negative vectors measured as if they were unsigned, which is only right
+// for divisors that are powers of two.
+int3 floorMod(int3 value, int3 divisor) {
+    return value - divisor * int3(floor(float3(value) / float3(divisor)));
+}
+
 // Folds a unit direction onto the square from -1 to 1, +z at its center [Cigolle et al. 2014].
 float2 octahedralEncode(float3 direction) {
     float3 folded = direction / (abs(direction.x) + abs(direction.y) + abs(direction.z));

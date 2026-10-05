@@ -15,8 +15,8 @@ pub struct RendererConfig {
     pub occlusion_culling: bool,
     /// Whether triangles facing away are skipped, see `Renderer::backface_culling`.
     pub backface_culling: bool,
-    /// The light probes chunks are lit by, `None` for none. They follow the camera, so they
-    /// can't be resized later. See `Lighting::global_illumination`.
+    /// The light probes chunks are lit by, `None` for none, see `Renderer::set_probe_config`
+    /// and `Lighting::global_illumination`.
     pub global_illumination: Option<ProbeConfig>,
 }
 

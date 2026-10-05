@@ -88,7 +88,7 @@ impl Renderer {
             depth_pyramid: DepthPyramid::null(),
             probe_volume: ProbeVolume::null(),
             trace_pass: TracePass::null(),
-            probes_configured: config.global_illumination.is_some(),
+            probe_config: config.global_illumination,
             frame_number: 0,
             last_frame: None,
             frame_timestamps: Vec::new(),
@@ -123,8 +123,9 @@ impl Renderer {
             frame_palette_versions: Vec::new(),
             frame_chunk_tables: Vec::new(),
             chunk_table: Vec::new(),
-            frame_changed_chunks: Vec::new(),
-            changed_chunks: Vec::new(),
+            grid_chunks: Vec::new(),
+            frame_changed_probes: Vec::new(),
+            changed_probes: Vec::new(),
             frame_light_buffers: Vec::new(),
             gpu_lights: Vec::new(),
             chunk_serials: Default::default(),
@@ -346,7 +347,7 @@ impl Renderer {
             // Written by the first frame.
             self.frame_palette_versions.push(u64::MAX);
             self.frame_chunk_tables.push(storage_buffer(4)?);
-            self.frame_changed_chunks.push(storage_buffer(4)?);
+            self.frame_changed_probes.push(storage_buffer(4)?);
             self.frame_light_buffers
                 .push(storage_buffer(size_of::<GpuLight>())?);
         }

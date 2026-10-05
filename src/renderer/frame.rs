@@ -33,7 +33,7 @@ impl FrameData {
 
 impl Renderer {
     /// Points `frame`'s descriptors at the mesh pool's buffers, which repacking replaces, its
-    /// palette, chunk table, changed chunks and lights, which growing replaces, and the depth
+    /// palette, chunk table, changed probes and lights, which growing replaces, and the depth
     /// buffer and the trace pass's images and tiles, which resizing replaces. The uniforms
     /// and light probes never move.
     ///
@@ -53,8 +53,8 @@ impl Renderer {
                 self.frame_chunk_tables[frame].buffer.handle,
             ),
             (
-                bindings::CHANGED_CHUNKS,
-                self.frame_changed_chunks[frame].buffer.handle,
+                bindings::CHANGED_PROBES,
+                self.frame_changed_probes[frame].buffer.handle,
             ),
             (
                 bindings::LIGHTS,

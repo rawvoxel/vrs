@@ -31,10 +31,6 @@ static const int MAX_GRID_LEVELS = 4;
 // `renderer::lighting::probes::MAX_CASCADES`.
 static const int MAX_CASCADES = 4;
 
-// Chunks along each side of each level's chunk table, centered on the camera. Matches
-// `renderer::lighting::voxel_grid::CHUNK_TABLE_SIDE`.
-static const int CHUNK_TABLE_SIDE = 32;
-
 // Matches `renderer::LightingUniforms`.
 struct LightingUniforms {
     // Normalized, toward the sun.
@@ -55,8 +51,13 @@ struct LightingUniforms {
     uint gridVoxelsPerEdge;
     uint gridLevels;
     float traceDistance;
-    // The chunk coordinate of each level's chunk table's low corner, in that level's chunks.
+    // The chunk coordinate of each level's box's low corner, then chunks along each side of
+    // it, none for a level without chunks, in that level's chunks, see `renderer::VoxelGrid`.
     int4 chunkTableCorners[MAX_GRID_LEVELS];
+    int4 chunkTableSizes[MAX_GRID_LEVELS];
+    // The box around every level's, in the finest voxels, empty without chunks.
+    int4 gridBoxMin;
+    int4 gridBoxMax;
     // The sky, see `renderer::Sky`: its zenith and horizon colors, the cosine of the sun disc's
     // radius, its brightness, the haze distance, and 1 when there's a sky.
     float3 skyZenith;
@@ -65,12 +66,15 @@ struct LightingUniforms {
     float sunBrightness;
     float hazeDistance;
     uint hasSky;
-    float2 padding;
+    // Slots in the chunk table, less one: a power of two, less one.
+    uint chunkTableMask;
+    float padding;
 };
 
 // Matches `renderer::lighting::probes::ProbeUniforms`.
 struct ProbeUniforms {
-    // Each cascade's probe cell at its low corner, in its own cells.
+    // Each cascade's probe cell at its low corner, in its own cells, then the level of the
+    // voxel grid whose `PROBE_CELL` voxels its cells are, see `probeLevel`.
     int4 volumeMins[MAX_CASCADES];
     // Probes along each axis of each cascade, and how many cascades there are.
     uint3 volumeCounts;
@@ -165,6 +169,10 @@ struct Probe {
 };
 
 static const uint PROBE_PLACED = 1;
+// Set in a probe's state when more than a quarter of the voxels its rays hit were seen from
+// the back: it's inside voxels, and neither traced nor sampled until chunks near it change
+// [Majercik et al. 2021].
+static const uint PROBE_OFF = 2;
 // Where a probe's state counts down the frames it converges faster after nearby chunks
 // changed, 8 bits [Majercik et al. 2021].
 static const uint PROBE_FAST_SHIFT = 8;

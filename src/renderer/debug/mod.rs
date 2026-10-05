@@ -1,9 +1,11 @@
 //! Hooks for tests and tools. They stall the device, so keep them out of normal frames.
 
 mod capture;
+mod probes;
 
 pub use capture::Capture;
 pub(super) use capture::RecordedCapture;
+pub use probes::ProbeRecord;
 
 use super::Renderer;
 use crate::vulkan::{buffer::Buffer, commands::record_submit_command_buffer};
@@ -50,7 +52,21 @@ impl Renderer {
             }));
         }
 
-        let size = size_of::<[u32; 2]>() as vk::DeviceSize;
+        let words = self.debug_read_words(self.culler.frame_count_buffers[frame].handle, 2)?;
+        let drawn = [words[0], words[1]];
+        Ok(Some(FrameStats { meshes, drawn }))
+    }
+
+    /// Bytes the last frame's chunk table took, written every frame, see `VoxelGrid`.
+    pub fn debug_chunk_table_bytes(&self) -> usize {
+        size_of_val(self.chunk_table.as_slice())
+    }
+
+    /// The first `count` words of device buffer `buffer`.
+    ///
+    /// For tests and tools: waits for the device to go idle, then copies them back.
+    fn debug_read_words(&mut self, buffer: vk::Buffer, count: usize) -> VkResult<Vec<u32>> {
+        let size = (count * size_of::<u32>()) as vk::DeviceSize;
         let info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(vk::BufferUsageFlags::TRANSFER_DST)
@@ -60,7 +76,6 @@ impl Renderer {
 
         let read = readback.mem_map(&self.device).and_then(|()| unsafe {
             self.device.device_wait_idle()?;
-            let count_buffer = self.culler.frame_count_buffers[frame].handle;
             record_submit_command_buffer(
                 &self.device,
                 self.init_cmd_buffer,
@@ -71,26 +86,18 @@ impl Renderer {
                 &[],
                 |cmd_buffer| {
                     let region = vk::BufferCopy::default().size(size);
-                    self.device.cmd_copy_buffer(
-                        cmd_buffer,
-                        count_buffer,
-                        readback.handle,
-                        &[region],
-                    );
+                    self.device
+                        .cmd_copy_buffer(cmd_buffer, buffer, readback.handle, &[region]);
                 },
             )?;
             self.device
                 .wait_for_fences(&[self.init_cmd_fence], true, u64::MAX)?;
 
-            let mut drawn = [0u32; 2];
-            readback.mem_read_at(0, &mut drawn);
-            Ok(drawn)
+            let mut words = vec![0u32; count];
+            readback.mem_read_at(0, &mut words);
+            Ok(words)
         });
         unsafe { readback.destroy(&self.device) };
-
-        Ok(Some(FrameStats {
-            meshes,
-            drawn: read?,
-        }))
+        read
     }
 }

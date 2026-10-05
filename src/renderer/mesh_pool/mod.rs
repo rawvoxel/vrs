@@ -37,7 +37,8 @@ pub struct MeshCapacity {
     /// Chunks' packed voxel types, see `mesh::chunk::VoxelTypes`, each chunk's occupancy, one bit
     /// per block of `mesh::chunk::OCCUPANCY_BLOCK`³ voxels, and for chunks a multiple of 16 voxels
     /// wide, a word per 16³ voxels of where its light probe goes and a bit of whether it has
-    /// voxels.
+    /// voxels, then for axis aligned chunks a bit per voxel along each side of whether it has a
+    /// face out of it.
     pub chunk_words: u32,
     pub meshes: u32,
 }
@@ -70,6 +71,9 @@ pub(crate) struct NewMesh<'a> {
     pub occupancy: &'a [u32],
     /// Where the chunk's light probes go, stored after the occupancy. Empty but for chunks.
     pub probes: &'a [u32],
+    /// Which of an axis aligned chunk's voxels along its sides have faces out of it, stored
+    /// after the probe cells, see `mesh::chunk::boundary_faces`. Empty but for those.
+    pub boundary_faces: &'a [u32],
     pub origin: Vec3,
     pub scale: f32,
     /// Zero but for chunks.
@@ -79,10 +83,14 @@ pub(crate) struct NewMesh<'a> {
 }
 
 impl NewMesh<'_> {
-    /// Words the mesh takes in the type buffer, its types, occupancy and probe cells.
+    /// Words the mesh takes in the type buffer, its types, occupancy, probe cells and
+    /// boundary faces.
     #[inline]
     pub fn chunk_word_count(&self) -> u32 {
-        (self.type_words.len() + self.occupancy.len() + self.probes.len()) as u32
+        (self.type_words.len()
+            + self.occupancy.len()
+            + self.probes.len()
+            + self.boundary_faces.len()) as u32
     }
 }
 
@@ -258,6 +266,7 @@ impl MeshPool {
                 slice_as_bytes(new.type_words),
                 slice_as_bytes(new.occupancy),
                 slice_as_bytes(new.probes),
+                slice_as_bytes(new.boundary_faces),
             ],
             mesh.chunk_words.start as vk::DeviceSize * WORD_SIZE,
         );

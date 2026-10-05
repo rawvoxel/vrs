@@ -62,6 +62,28 @@ float3 sunLight(float3 worldPosition, float3 normal, float3 faceNormal, float3 s
     return lighting.sunColor * facing * visible;
 }
 
+// For `DebugView::Cascades`: which cascades light a surface where `indirectLight` would, each
+// cascade's color blended by its share, red for the share no probe lit and gray for the rest.
+float3 cascadeShares(float3 gridPosition, float3 normal, float3 toViewer) {
+    static const float3 CASCADE_COLORS[4] = {
+        float3(0.0, 1.0, 0.0), float3(0.0, 0.3, 1.0), float3(1.0, 1.0, 0.0), float3(1.0, 0.0, 1.0)
+    };
+    if (uniforms.probeVolume.enabled == 0) {
+        return float3(0.5);
+    }
+    float3 color = float3(0.0);
+    float remaining = 1.0;
+    for (int cascade = 0; cascade < int(uniforms.probeVolume.cascades) && remaining > 0.0; cascade++) {
+        float coverage;
+        bool found;
+        sampleIrradiance(cascade, gridPosition, normal, toViewer, 1, coverage, found);
+        float share = remaining * coverage;
+        color += share * (found ? CASCADE_COLORS[min(cascade, 3)] : float3(1.0, 0.0, 0.0));
+        remaining -= share;
+    }
+    return color + remaining * float3(0.5);
+}
+
 // The light reaching a surface, straight from the sun and the lights, and from everywhere else.
 struct SurfaceLight {
     float3 direct;

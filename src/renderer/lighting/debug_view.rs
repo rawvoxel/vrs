@@ -25,7 +25,12 @@ pub enum DebugView {
     /// Without the trace pass, black.
     Trace,
     /// The level of the voxel grid the trace pass found each pixel's face in: green for the
-    /// finest, then blue, yellow and magenta, and red where it found none. Without the trace
-    /// pass, black.
+    /// finest, then blue, yellow and magenta. Where it found none, red where its search met no
+    /// voxel and white where it started in one. Without the trace pass, black.
     Levels,
+    /// Which cascade of light probes lights each pixel, blended where they blend: green for
+    /// the finest, then blue, yellow and magenta. Red where a cascade covers it but none of its
+    /// probes count, so it gets the sky's and ground's light instead, and gray past every
+    /// cascade.
+    Cascades,
 }

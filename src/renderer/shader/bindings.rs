@@ -11,7 +11,7 @@ pub(crate) const MESHES: u32 = 2;
 pub(crate) const CHUNK_WORDS: u32 = 3;
 /// The materials, by voxel type.
 pub(crate) const PALETTE: u32 = 4;
-/// Which chunk is where around the camera, for rays.
+/// Where each of the voxel grid's chunks is, for rays.
 pub(crate) const CHUNK_TABLE: u32 = 5;
 /// The light probes, their atlases sampled, then written, their rays, and those tracing.
 pub(crate) const PROBES: u32 = 6;
@@ -25,8 +25,8 @@ pub(crate) const ACTIVE_PROBES: u32 = 12;
 pub(crate) const SHADOWS_STORAGE: u32 = 13;
 pub(crate) const DEPTH_BUFFER: u32 = 14;
 pub(crate) const SHADOWS: u32 = 15;
-/// Which chunk table entries' chunks changed since last frame.
-pub(crate) const CHANGED_CHUNKS: u32 = 16;
+/// Which probes are next to chunks that changed since last frame.
+pub(crate) const CHANGED_PROBES: u32 = 16;
 /// The lights, and those reaching each tile of pixels.
 pub(crate) const LIGHTS: u32 = 17;
 pub(crate) const LIGHT_TILES: u32 = 18;

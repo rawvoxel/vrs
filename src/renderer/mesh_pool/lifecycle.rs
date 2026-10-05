@@ -4,7 +4,7 @@ use super::{MeshKind, MeshRecord, NewMesh};
 use crate::{
     mesh::{
         Index, MeshId, Vertex,
-        chunk::{ChunkMesh, ChunkVertices},
+        chunk::{ChunkMesh, ChunkVertices, boundary_faces},
         unpack_position,
     },
     renderer::{Renderer, lighting::probes::bake_probe_cells},
@@ -35,6 +35,7 @@ impl Renderer {
             type_words: &[],
             occupancy: &[],
             probes: &[],
+            boundary_faces: &[],
             origin: Vec3::ZERO,
             scale: 1.0,
             voxels_per_edge: 0,
@@ -48,11 +49,17 @@ impl Renderer {
     /// See `add_mesh` for when this stalls or fails.
     pub fn create_chunk_mesh(&mut self, chunk: &ChunkMesh) -> VkResult<MeshId> {
         let edge = chunk.types.voxels_per_edge();
-        let (kind, vertex_words) = match chunk.vertices {
-            ChunkVertices::AxisAligned(vertices) => {
-                (MeshKind::AxisAligned, slice_as_words(vertices))
+        // Only axis aligned faces lie exactly in a chunk's sides, to tell which voxels have
+        // faces out of it.
+        let (kind, vertex_words, boundary_faces) = match chunk.vertices {
+            ChunkVertices::AxisAligned(vertices) => (
+                MeshKind::AxisAligned,
+                slice_as_words(vertices),
+                boundary_faces(edge, vertices, chunk.indices),
+            ),
+            ChunkVertices::Packed(vertices) => {
+                (MeshKind::Packed, slice_as_words(vertices), Vec::new())
             }
-            ChunkVertices::Packed(vertices) => (MeshKind::Packed, slice_as_words(vertices)),
         };
         let positions = vertex_words
             .chunks_exact(kind.words_per_vertex() as usize)
@@ -66,6 +73,7 @@ impl Renderer {
             type_words: chunk.types.words(),
             occupancy: &chunk.types.occupancy(),
             probes: &bake_probe_cells(chunk.types),
+            boundary_faces: &boundary_faces,
             origin: chunk.origin,
             scale: chunk.voxel_size,
             voxels_per_edge: edge,

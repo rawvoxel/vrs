@@ -6,7 +6,9 @@
 //! - A sealed hollow box under a bright sun and sky, seen from inside: no light may leak in,
 //!   at full and half trace resolution, and with 4 cascades of probes blending.
 //! - A sealed hall seen from far across it, where the depth buffer is least precise: no light
-//!   may leak onto its pyramids' steps or into its corners, at full and half trace resolution.
+//!   may leak onto its pyramids' steps or into its corners, at full and half trace resolution,
+//!   and among chunks spread 27 and 195 chunks wide at each of 4 levels, as far as levels of
+//!   detail spread them, whose chunk table takes as much memory either way.
 //! - The box with a hole in its roof, and the hall with skylights, in a still frame: their
 //!   bounced light holds steady from frame to frame.
 //! - The same box with a hole in its roof: sunlight bouncing in lights all of it. With glass
@@ -24,7 +26,8 @@
 //! - The floor under a white sky, of coarser chunks only: lit as the fine one is. Then steps
 //!   of coarser chunks, whose sides aren't darker than fine ones' where probes touch them.
 //! - The box with a hole in its roof, with too few probes to cover it: coarser cascades
-//!   bring bounced light to more of it.
+//!   bring bounced light to more of it. With its probes replaced by more, then by fewer, the
+//!   new ones light it.
 
 use crate::{
     camera,
@@ -36,8 +39,8 @@ use vrs::{
     App,
     mesh::{MeshId, Vertex},
     renderer::{
-        Capture, DebugView, DrawList, Light, Lighting, Material, ProbeConfig, Renderer,
-        RendererConfig, Spot, TraceResolution, VoxelGrid,
+        Capture, DebugView, DrawList, Light, Lighting, Material, PROBE_CELL, ProbeConfig,
+        ProbeRecord, Renderer, RendererConfig, Spot, TraceResolution, VoxelGrid,
     },
 };
 
@@ -182,6 +185,20 @@ fn hall(x: i32, y: i32, z: i32) -> u16 {
     0
 }
 
+/// Solid rock everywhere but a sealed room in it, its walls 4 thick. Every chunk but the
+/// room's is solid throughout, so left out, and rays cross them to the sky.
+fn buried_room(x: i32, y: i32, z: i32) -> u16 {
+    let inside = |v: i32, lo: i32, hi: i32| (lo..hi).contains(&v);
+    let room = inside(x, 4, 60) && inside(y, 24, 40) && inside(z, 4, 60);
+    if room { 0 } else { GRAY }
+}
+
+/// From inside the buried room, across it to a far corner.
+const BURIED_VIEW: View = View {
+    eye: Vec3::new(10.0, 34.0, 10.0),
+    target: Vec3::new(58.0, 26.0, 58.0),
+};
+
 /// The hall with a skylight in its roof over every other pyramid, the sun reaching some of
 /// it and its light bouncing around the rest.
 fn skylit_hall(x: i32, y: i32, z: i32) -> u16 {
@@ -275,7 +292,12 @@ struct Scene<'a> {
     coarse: Option<Voxels<'a>>,
     /// The voxel grid's levels.
     levels: u32,
+    /// Chunks this many of each level's chunks apart, a voxel in each, in pairs at opposite
+    /// corners around the origin at each of 4 levels, spreading each level's chunks that wide.
+    spread: Option<i32>,
     probes: ProbeConfig,
+    /// Then its probes replaced with these, and `FRAMES` frames more.
+    resized: Option<ProbeConfig>,
     lighting: Lighting,
     lights: &'a [Light],
     /// Then `CHANGE_FRAMES` frames of these voxels and this lighting.
@@ -292,7 +314,9 @@ impl<'a> Scene<'a> {
             voxels,
             coarse: None,
             levels: 1,
+            spread: None,
             probes: ProbeConfig::default(),
+            resized: None,
             lighting,
             lights: &[],
             change: None,
@@ -341,6 +365,37 @@ impl<'a> Scene<'a> {
         Self { probes, ..self }
     }
 
+    /// Among chunks `spread` chunks apart at each of 4 levels.
+    fn spread(self, spread: i32) -> Self {
+        Self {
+            spread: Some(spread),
+            levels: 4,
+            ..self
+        }
+    }
+
+    fn resized(self, probes: ProbeConfig) -> Self {
+        Self {
+            resized: Some(probes),
+            ..self
+        }
+    }
+
+    /// The voxel grid its chunks are in.
+    fn grid(&self) -> VoxelGrid {
+        VoxelGrid::new(1.0, EDGE as u32).with_levels(self.levels)
+    }
+
+    /// Replaces `renderer`'s probes with the `resized` ones, if any, then draws `FRAMES` frames
+    /// of `draws` more.
+    fn resize_probes(&self, renderer: &mut Renderer, draws: &DrawList) -> VkResult<()> {
+        let Some(probes) = self.resized else {
+            return Ok(());
+        };
+        renderer.set_probe_config(Some(probes))?;
+        (0..FRAMES).try_for_each(|_| renderer.submit(WIDTH, HEIGHT, draws))
+    }
+
     fn change(self, voxels: Voxels<'a>, lighting: Lighting) -> Self {
         Self {
             change: Some((voxels, lighting)),
@@ -351,7 +406,8 @@ impl<'a> Scene<'a> {
 
 /// Each chunk of level `level` around the origin with any voxels, as meshes: 64 voxels wide,
 /// each `2^level` world voxels wide, of the type of the world voxel at its low corner. Scenes
-/// fit the 3 by 3 chunks around the origin's, one chunk high.
+/// fit the 3 by 3 chunks around the origin's, one chunk high. Chunks solid throughout, every
+/// voxel around them solid too, are left out, as streaming worlds leave them out.
 fn create_chunks(
     renderer: &mut Renderer,
     voxels: Voxels,
@@ -370,6 +426,12 @@ fn create_chunks(
                     corner[2] + z * scale,
                 )
             };
+            let edge = EDGE as i32;
+            let solid_throughout =
+                (-1..=edge).all(|z| (-1..=edge).all(|y| (-1..=edge).all(|x| local(x, y, z) != 0)));
+            if solid_throughout {
+                continue;
+            }
             let types = greedy::chunk_types(local);
             let solid = |x: i32, y: i32, z: i32| local(x, y, z) != 0;
             ids.extend(greedy::create_chunk(
@@ -389,6 +451,23 @@ fn create_scene(renderer: &mut Renderer, scene: &Scene, voxels: Voxels) -> VkRes
     let mut ids = create_chunks(renderer, voxels, 0, scene.origin)?;
     if let Some(coarse) = scene.coarse {
         ids.extend(create_chunks(renderer, coarse, 1, scene.origin)?);
+    }
+    if let Some(spread) = scene.spread {
+        let corner = |x: i32, y: i32, z: i32| (x, y, z) == (0, 0, 0);
+        let types = greedy::chunk_types(|x, y, z| if corner(x, y, z) { GRAY } else { 0 });
+        for level in 0..4 {
+            let scale = 1 << level;
+            for chunk in [-spread / 2, spread - spread / 2] {
+                let origin = Vec3::splat((chunk * EDGE as i32 * scale) as f32);
+                ids.extend(greedy::create_chunk(
+                    renderer,
+                    scene.origin + origin,
+                    scale as f32,
+                    &types,
+                    corner,
+                )?);
+            }
+        }
     }
     if !scene.colored.is_empty() {
         let moved = |vertex: &Vertex| Vertex {
@@ -412,7 +491,7 @@ fn render(app: &App, scene: Scene, view: View) -> VkResult<Option<Vec<f32>>> {
     let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, config)?;
     renderer.set_materials(&MATERIALS);
     renderer.lights = scene.placed_lights();
-    let grid = Some(VoxelGrid::new(1.0, EDGE as u32).with_levels(scene.levels));
+    let grid = Some(scene.grid());
     let light = |lighting: Lighting| Lighting {
         voxel_grid: grid,
         ..lighting
@@ -440,12 +519,67 @@ fn render(app: &App, scene: Scene, view: View) -> VkResult<Option<Vec<f32>>> {
         renderer.lighting = light(lighting);
         frames(&mut renderer, &ids, CHANGE_FRAMES)?;
     }
+    if scene.resized.is_some() {
+        let meshes: Vec<&MeshId> = ids.iter().collect();
+        let draws = DrawList {
+            meshes: &meshes,
+            view: view_matrix,
+            proj,
+        };
+        scene.resize_probes(&mut renderer, &draws)?;
+    }
     if !renderer.debug_capture_next_frame() {
         return Ok(None);
     }
     frames(&mut renderer, &ids, 1)?;
     let capture = renderer.debug_read_capture()?;
     Ok(capture.as_ref().and_then(linear_reds))
+}
+
+/// The light probes after `scene`'s frames, seen from `view`.
+fn render_probes(app: &App, scene: Scene, view: View) -> VkResult<Vec<ProbeRecord>> {
+    let config = RendererConfig {
+        global_illumination: Some(scene.probes),
+        ..Default::default()
+    };
+    let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, config)?;
+    renderer.set_materials(&MATERIALS);
+    renderer.lights = scene.placed_lights();
+    renderer.lighting = Lighting {
+        voxel_grid: Some(scene.grid()),
+        ..scene.lighting
+    };
+    let ids = create_scene(&mut renderer, &scene, scene.voxels)?;
+    let meshes: Vec<&MeshId> = ids.iter().collect();
+    let draws = DrawList {
+        meshes: &meshes,
+        view: scene.view_matrix(view),
+        proj: camera::perspective(70.0, WIDTH as f32 / HEIGHT as f32, 0.1, 500.0),
+    };
+    for _ in 0..FRAMES {
+        renderer.submit(WIDTH, HEIGHT, &draws)?;
+    }
+    scene.resize_probes(&mut renderer, &draws)?;
+    renderer.debug_probes()
+}
+
+/// Bytes `scene`'s chunk table takes, see `Renderer::debug_chunk_table_bytes`.
+fn chunk_table_bytes(app: &App, scene: Scene, view: View) -> VkResult<usize> {
+    let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, RendererConfig::default())?;
+    renderer.set_materials(&MATERIALS);
+    renderer.lighting = Lighting {
+        voxel_grid: Some(scene.grid()),
+        ..scene.lighting
+    };
+    let ids = create_scene(&mut renderer, &scene, scene.voxels)?;
+    let meshes: Vec<&MeshId> = ids.iter().collect();
+    let draws = DrawList {
+        meshes: &meshes,
+        view: scene.view_matrix(view),
+        proj: camera::perspective(70.0, WIDTH as f32 / HEIGHT as f32, 0.1, 500.0),
+    };
+    renderer.submit(WIDTH, HEIGHT, &draws)?;
+    Ok(renderer.debug_chunk_table_bytes())
 }
 
 /// `count` consecutive frames after `scene`'s frames, seen from `view`, each pixel's
@@ -459,7 +593,7 @@ fn render_frames(app: &App, scene: Scene, view: View, count: u32) -> VkResult<Ve
     renderer.set_materials(&MATERIALS);
     renderer.lights = scene.placed_lights();
     renderer.lighting = Lighting {
-        voxel_grid: Some(VoxelGrid::new(1.0, EDGE as u32).with_levels(scene.levels)),
+        voxel_grid: Some(scene.grid()),
         ..scene.lighting
     };
     let ids = create_scene(&mut renderer, &scene, scene.voxels)?;
@@ -472,6 +606,7 @@ fn render_frames(app: &App, scene: Scene, view: View, count: u32) -> VkResult<Ve
     for _ in 0..FRAMES {
         renderer.submit(WIDTH, HEIGHT, &draws)?;
     }
+    scene.resize_probes(&mut renderer, &draws)?;
     let mut frames = Vec::new();
     for _ in 0..count {
         if !renderer.debug_capture_next_frame() {
@@ -549,7 +684,16 @@ fn sky_floor(checks: &mut Checks) -> VkResult<()> {
     Ok(())
 }
 
-/// No light leaks into a sealed box, at full and half trace resolution, and with cascades.
+/// Probes twice as far apart as usual.
+const SPARSE_PROBES: ProbeConfig = ProbeConfig {
+    spacing: 2 * PROBE_CELL,
+    probe_counts: [16, 8, 16],
+    cascades: 1,
+    rays_per_frame: 1 << 16,
+};
+
+/// No light leaks into a sealed box, at full and half trace resolution, with cascades, and
+/// with probes twice as far apart.
 fn sealed_box(checks: &mut Checks) -> VkResult<()> {
     let four_cascades = ProbeConfig {
         cascades: 4,
@@ -562,6 +706,10 @@ fn sealed_box(checks: &mut Checks) -> VkResult<()> {
             " with 4 cascades",
             Scene::new(&shell, bright()).probes(four_cascades),
         ),
+        (
+            " with probes twice as far apart",
+            Scene::new(&shell, bright()).probes(SPARSE_PROBES),
+        ),
     ] {
         let lit = fraction_over(&checks.render(scene, BOX_VIEW)?, UNLIT);
         checks.expect(
@@ -573,9 +721,44 @@ fn sealed_box(checks: &mut Checks) -> VkResult<()> {
     Ok(())
 }
 
+/// No light reaches a room sealed in solid rock under a bright sky, though the rock around it
+/// is left out for being solid throughout, which rays cross, and no light probe in that rock
+/// is in use: their rays see voxels' backs, so they're turned off [Majercik et al. 2021].
+fn buried_room_dark(checks: &mut Checks) -> VkResult<()> {
+    for (how, lighting) in [("", sky()), (" at half resolution", half(sky()))] {
+        let lit = fraction_over(
+            &checks.render(Scene::new(&buried_room, lighting), BURIED_VIEW)?,
+            UNLIT,
+        );
+        checks.expect(
+            format!("{} of a room buried in rock is lit{how}", percent(lit, 2)),
+            lit == 0.0,
+            "light reaches it through the rock left out around it",
+        );
+    }
+    let probes = render_probes(checks.app, Scene::new(&buried_room, sky()), BURIED_VIEW)?;
+    let in_rock = |probe: &&ProbeRecord| {
+        let voxel = probe.position.floor().as_ivec3();
+        buried_room(voxel.x, voxel.y, voxel.z) != 0
+    };
+    let in_use: Vec<&ProbeRecord> = probes.iter().filter(|probe| probe.in_use()).collect();
+    let in_rock = in_use.iter().filter(|probe| in_rock(probe)).count();
+    checks.expect(
+        format!(
+            "{in_rock} of {} light probes in use are in the rock around a buried room",
+            in_use.len()
+        ),
+        in_rock == 0,
+        "probes inside voxels waste rays",
+    );
+    Ok(())
+}
+
 /// No light leaks into a sealed hall, onto steps and into corners seen from far across it,
-/// where the depth buffer is least precise, at full and half trace resolution, and far from
-/// the world's origin, where positions are least precise.
+/// where the depth buffer is least precise, at full and half trace resolution, far from the
+/// world's origin, where positions are least precise, and among chunks spread 27 and 195
+/// chunks wide at each of 4 levels, as far as levels of detail spread them: rays find every
+/// chunk, however far apart, and the chunk table takes as much memory either way.
 fn sealed_hall(checks: &mut Checks) -> VkResult<()> {
     for (how, scene) in [
         ("", Scene::new(&hall, bright())),
@@ -594,8 +777,37 @@ fn sealed_hall(checks: &mut Checks) -> VkResult<()> {
             "light leaks in along its steps and corners",
         );
     }
+    let mut table_bytes = Vec::new();
+    for spread in SPREADS {
+        for (how, lighting) in [("", bright()), (" at half resolution", half(bright()))] {
+            let scene = Scene::new(&hall, lighting).spread(spread);
+            let lit = fraction_over(&checks.render(scene, HALL_VIEW)?, UNLIT);
+            checks.expect(
+                format!(
+                    "{} of a sealed hall's inside is lit among chunks spread {spread} wide{how}",
+                    percent(lit, 2)
+                ),
+                lit == 0.0,
+                "rays miss chunks of its walls, and light leaks in",
+            );
+        }
+        let scene = Scene::new(&hall, bright()).spread(spread);
+        table_bytes.push(chunk_table_bytes(checks.app, scene, HALL_VIEW)?);
+    }
+    checks.expect(
+        format!(
+            "its chunk table is {} bytes a frame among chunks spread {} wide, {} bytes {} wide",
+            table_bytes[0], SPREADS[0], table_bytes[1], SPREADS[1]
+        ),
+        table_bytes[0] == table_bytes[1],
+        "the table should grow with chunks, not with how far apart they are",
+    );
     Ok(())
 }
+
+/// How wide chunks are spread at each level, as levels of detail spread them at their nearest
+/// and furthest.
+const SPREADS: [i32; 2] = [27, 195];
 
 /// A floor drawn as a colored mesh, outside the voxel grid as grass and leaves are, under a
 /// sky brighter than the ground, gets the same light from everywhere all over, at full and
@@ -646,6 +858,53 @@ fn colored_floor(checks: &mut Checks) -> VkResult<()> {
             "it depends on where it is from the camera",
         );
     }
+
+    // A ceiling the same, facing down, seen from under it, is lit facing down at half
+    // resolution too, though the trace pass finds no voxel face for it.
+    let ceiling_corner = |x: f32, z: f32| Vertex {
+        position: [x, 20.0, z],
+        normal: [0.0, -1.0, 0.0],
+        color: [1.0; 3],
+    };
+    let [a, b, c, d] = [
+        ceiling_corner(-reach, -reach),
+        ceiling_corner(-reach, reach),
+        ceiling_corner(reach, reach),
+        ceiling_corner(reach, -reach),
+    ];
+    let ceiling = [a, b, c, a, c, d, a, c, b, a, d, c];
+    // Up at it, and across under it to the horizon, where it's seen at grazing angles.
+    let views = [
+        (
+            "",
+            View {
+                eye: Vec3::new(0.0, 10.0, 0.0),
+                target: Vec3::new(0.0, 20.0, 8.0),
+            },
+        ),
+        (
+            ", seen at grazing angles",
+            View {
+                eye: Vec3::new(0.0, 10.0, 0.0),
+                target: Vec3::new(0.0, 12.0, 60.0),
+            },
+        ),
+    ];
+    for (how, view) in views {
+        let [full, half_resolution] = [lighting, half(lighting)].map(|lighting| {
+            checks
+                .render(Scene::new(&|_, _, _| 0, lighting).colored(&ceiling), view)
+                .map(|frame| mean(&frame))
+        });
+        let ratio = half_resolution? / full?.max(1e-6);
+        checks.expect(
+            format!(
+                "a colored ceiling's light from everywhere is {ratio:.3}x at half resolution what it is at full{how}"
+            ),
+            (ratio - 1.0).abs() <= 0.05,
+            "it's lit as if it faced some other way",
+        );
+    }
     Ok(())
 }
 
@@ -687,8 +946,9 @@ fn steady_light(checks: &mut Checks) -> VkResult<()> {
     Ok(())
 }
 
-/// Sunlight through a hole in a box's roof bounces around it, dimmed through glass, and
-/// follows changes within a few frames.
+/// Sunlight through a hole in a box's roof bounces around it, with probes twice as far apart
+/// too, and with volumes of probes not a power of two wide, anywhere in the world, dimmed
+/// through glass, and follows changes within a few frames.
 fn holed_box(checks: &mut Checks) -> VkResult<()> {
     let open = checks.render(Scene::new(&holed, sun_only()), HOLE_VIEW)?;
     let direct = Lighting {
@@ -709,6 +969,44 @@ fn holed_box(checks: &mut Checks) -> VkResult<()> {
         lit >= MOST,
         "bounced light should reach most of it",
     );
+    let sparse = checks.render(
+        Scene::new(&holed, sun_only()).probes(SPARSE_PROBES),
+        HOLE_VIEW,
+    )?;
+    let lit_sparse = fraction_over(&sparse, BOUNCED);
+    checks.expect(
+        format!(
+            "{} of it is lit with probes twice as far apart",
+            percent(lit_sparse, 0)
+        ),
+        lit_sparse >= MOST,
+        "bounced light should reach most of it",
+    );
+    // Probes are kept by their cell modulo the volume's size, which must wrap the same way for
+    // any size, either side of the world's origin.
+    let uneven = ProbeConfig {
+        probe_counts: [28, 14, 28],
+        ..ProbeConfig::default()
+    };
+    for (how, origin) in [
+        ("", Vec3::ZERO),
+        (" far from the origin", FAR),
+        (" far the other way", -FAR),
+    ] {
+        let frame = checks.render(
+            Scene::new(&holed, sun_only()).probes(uneven).at(origin),
+            HOLE_VIEW,
+        )?;
+        let lit_uneven = fraction_over(&frame, BOUNCED);
+        checks.expect(
+            format!(
+                "{} of it is lit by 28 by 14 by 28 probes{how}",
+                percent(lit_uneven, 0)
+            ),
+            lit_uneven >= MOST,
+            "bounced light should reach most of it",
+        );
+    }
     let brighter = mean(&open) / mean(&without);
     checks.expect(
         format!("bounced light makes the box {brighter:.2}x as bright"),
@@ -1024,44 +1322,52 @@ fn coarse_chunks(checks: &mut Checks) -> VkResult<()> {
     Ok(())
 }
 
-/// A floor of fine chunks on one side and coarser ones on the other, as around a camera
-/// whose fine chunks reach only so far, lit the same on either side of the seam as a floor
-/// all of fine chunks, under a sun and sky, with two cascades, at half trace resolution.
+/// A box with a hole in its roof of fine chunks on one side and coarser ones on the other, as
+/// around a camera whose fine chunks reach only so far, is lit the same on either side as the
+/// box all of fine chunks, by sunlight through the hole bouncing around it, with probes as far
+/// apart as the fine voxels' cells and as the coarse ones'. Every side of it is a whole number of
+/// coarse voxels, so its shape is the same at either level.
 fn level_seam(checks: &mut Checks) -> VkResult<()> {
-    let fine_half = |x: i32, y: i32, z: i32| if x < 0 { floor(x, y, z) } else { 0 };
-    let coarse_half = |x: i32, y: i32, z: i32| if x >= 0 { floor(x, y, z) } else { 0 };
-    let two = ProbeConfig {
-        cascades: 2,
-        ..ProbeConfig::default()
+    let fine_half = |x: i32, y: i32, z: i32| if x < 0 { holed(x, y, z) } else { 0 };
+    let coarse_half = |x: i32, y: i32, z: i32| if x >= 0 { holed(x, y, z) } else { 0 };
+    // Seen along z, the screen's left half is the world's +x, the coarse side.
+    let side = |frame: &[f32], all_fine: &[f32], left: bool| {
+        let (mut sum, mut fine) = (0.0, 0.0);
+        for (index, (&value, &fine_value)) in frame.iter().zip(all_fine).enumerate() {
+            if ((index % WIDTH as usize) < WIDTH as usize / 2) == left {
+                sum += value;
+                fine += fine_value;
+            }
+        }
+        sum / fine.max(1e-6)
     };
-    let view = View {
-        eye: Vec3::new(0.0, 30.0, -40.0),
-        target: Vec3::new(0.0, 8.0, 20.0),
-    };
-    let lighting = half(bright());
-    let mixed = checks.render(
-        Scene::new(&fine_half, lighting)
+    for spacing in [PROBE_CELL, 2 * PROBE_CELL] {
+        let probes = ProbeConfig {
+            spacing,
+            cascades: 2,
+            ..ProbeConfig::default()
+        };
+        let lighting = half(sun_only());
+        let mixed = Scene::new(&fine_half, lighting)
             .coarse(&coarse_half, 2)
-            .probes(two),
-        view,
-    )?;
-    let fine = checks.render(Scene::new(&floor, lighting).probes(two), view)?;
-    let side_mean = |frame: &[f32], right: bool| {
-        let values: Vec<f32> = frame
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| ((index % WIDTH as usize) >= WIDTH as usize / 2) == right)
-            .map(|(_, value)| *value)
-            .collect();
-        mean(&values)
-    };
-    for (side, right) in [("fine", false), ("coarse", true)] {
-        let ratio = side_mean(&mixed, right) / side_mean(&fine, right).max(1e-6);
-        checks.expect(
-            format!("the {side} side of a floor where its chunks' level changes is {ratio:.3}x as bright as all fine"),
-            (ratio - 1.0).abs() <= 0.05,
-            "the seam between levels shows",
+            .probes(probes);
+        // The same levels in the voxel grid, though only the fine one has chunks.
+        let mut fine = Scene::new(&holed, lighting).probes(probes);
+        fine.levels = 2;
+        let (mixed, fine) = (
+            checks.render(mixed, HOLE_VIEW)?,
+            checks.render(fine, HOLE_VIEW)?,
         );
+        for (name, left) in [("coarse", true), ("fine", false)] {
+            let ratio = side(&mixed, &fine, left);
+            checks.expect(
+                format!(
+                    "the {name} side of a box whose chunks' level changes is {ratio:.3}x as bright as all fine, probes {spacing} voxels apart"
+                ),
+                (ratio - 1.0).abs() <= 0.05,
+                "the seam between levels shows",
+            );
+        }
     }
     Ok(())
 }
@@ -1098,10 +1404,41 @@ fn cascades(checks: &mut Checks) -> VkResult<()> {
 }
 
 /// Every check, in the order they run.
-const CHECKS: [fn(&mut Checks) -> VkResult<()>; 13] = [
+/// The box with a hole in its roof is lit by new probes once they replace its own, more of
+/// them in more cascades, and fewer further apart: the renderer makes and uses the new ones.
+fn resized_probes(checks: &mut Checks) -> VkResult<()> {
+    let more = ProbeConfig {
+        probe_counts: [40, 20, 40],
+        cascades: 2,
+        ..ProbeConfig::default()
+    };
+    for (how, probes) in [("more", more), ("fewer", SPARSE_PROBES)] {
+        let scene = Scene::new(&holed, sun_only()).resized(probes);
+        let lit = fraction_over(&checks.render(scene, HOLE_VIEW)?, BOUNCED);
+        checks.expect(
+            format!(
+                "{} of it is lit after its probes are replaced with {how}",
+                percent(lit, 0)
+            ),
+            lit >= MOST,
+            "the new probes should light it",
+        );
+        let count = render_probes(checks.app, scene, HOLE_VIEW)?.len();
+        let expected = probes.probe_counts.iter().product::<u32>() * probes.cascades;
+        checks.expect(
+            format!("{count} probes after, of {expected} replacing them"),
+            count == expected as usize,
+            "the renderer should use the new probes",
+        );
+    }
+    Ok(())
+}
+
+const CHECKS: [fn(&mut Checks) -> VkResult<()>; 15] = [
     sky_floor,
     sealed_box,
     sealed_hall,
+    buried_room_dark,
     colored_floor,
     steady_light,
     holed_box,
@@ -1112,6 +1449,7 @@ const CHECKS: [fn(&mut Checks) -> VkResult<()>; 13] = [
     mirror,
     coarse_wall,
     coarse_chunks_and_cascades,
+    resized_probes,
 ];
 
 /// What was wrong with the lighting, if anything. Skipped, with `Ok(None)`, when frames can't

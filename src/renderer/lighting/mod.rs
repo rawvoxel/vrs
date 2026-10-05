@@ -12,7 +12,7 @@ pub(crate) mod voxel_grid;
 
 pub use debug_view::DebugView;
 pub use lights::{Light, MAX_LIGHTS, Spot};
-pub use probes::{MAX_CASCADES, ProbeConfig, ProbeTuning};
+pub use probes::{MAX_CASCADES, PROBE_CELL, ProbeConfig, ProbeTuning};
 pub use sky::Sky;
 pub use tonemapping::Tonemapping;
 pub use trace::{MAX_SHADOWED_LIGHTS, TraceResolution};
@@ -118,9 +118,13 @@ pub(crate) struct LightingUniforms {
     pub grid_voxels_per_edge: u32,
     pub grid_levels: u32,
     pub trace_distance: f32,
-    /// The chunk coordinate of each level's chunk table's low corner, in that level's
-    /// chunks, w unused.
+    /// The chunk coordinate of each level's box's low corner, then chunks along each side of
+    /// it, in that level's chunks, w unused, see `VoxelGrid`.
     pub chunk_table_corners: [[i32; 4]; MAX_GRID_LEVELS as usize],
+    pub chunk_table_sizes: [[i32; 4]; MAX_GRID_LEVELS as usize],
+    /// The box around every level's, in the finest voxels, w unused.
+    pub grid_box_min: [i32; 4],
+    pub grid_box_max: [i32; 4],
     /// The sky, all 0 without one.
     pub sky_zenith: [f32; 3],
     pub sun_disc_cosine: f32,
@@ -128,7 +132,9 @@ pub(crate) struct LightingUniforms {
     pub sun_brightness: f32,
     pub haze_distance: f32,
     pub has_sky: u32,
-    pub padding: [f32; 2],
+    /// Slots in the chunk table, less one.
+    pub chunk_table_mask: u32,
+    pub padding: f32,
 }
 
 impl Renderer {
@@ -167,9 +173,14 @@ impl Renderer {
         uniforms.grid_voxel_size = grid.voxel_size;
         uniforms.grid_voxels_per_edge = grid.voxels_per_edge;
         uniforms.grid_levels = table.levels;
-        for (level, corner) in table.corners[..table.levels as usize].iter().enumerate() {
-            uniforms.chunk_table_corners[level] = corner.extend(0).to_array();
+        uniforms.chunk_table_mask = table.slots - 1;
+        for level in 0..table.levels as usize {
+            uniforms.chunk_table_corners[level] = table.corners[level].extend(0).to_array();
+            uniforms.chunk_table_sizes[level] = table.sizes[level].extend(0).to_array();
         }
+        let [grid_min, grid_max] = table.grid_box(grid);
+        uniforms.grid_box_min = grid_min.extend(0).to_array();
+        uniforms.grid_box_max = grid_max.extend(0).to_array();
         Ok(uniforms)
     }
 }

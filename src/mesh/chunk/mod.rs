@@ -1,8 +1,10 @@
 //! Chunk meshes, in `PackedVertex` or `AxisAlignedVertex` formats, colored per voxel from their
 //! palette compressed `VoxelTypes`.
 
+mod boundary_faces;
 mod types;
 
+pub(crate) use boundary_faces::boundary_faces;
 pub use types::{OCCUPANCY_BLOCK, VoxelTypes};
 
 use crate::mesh::{AxisAlignedVertex, Index, PackedVertex};

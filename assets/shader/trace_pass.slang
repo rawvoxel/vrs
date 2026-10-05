@@ -110,6 +110,63 @@ void cullLights(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, uint in
     }
 }
 
+// Where pixel `pixel`'s surface is in the world, from the depth buffer, relative to the
+// camera, false where it shows the sky.
+bool depthPosition(int2 pixel, out float3 fromCamera) {
+    uint2 frameSize = uniforms.frameSize;
+    float2 uv = (float2(clamp(pixel, int2(0), int2(frameSize) - 1)) + 0.5) / float2(frameSize);
+    float depth = depthBuffer.SampleLevel(uv, 0.0);
+    float4 offset = mul(uniforms.cameraOffsetFromClip, float4(uv * 2.0 - 1.0, depth, 1.0));
+    fromCamera = offset.xyz / offset.w;
+    return depth < 1.0;
+}
+
+// The axis a flat surface at pixel `pixel`, `fromCamera` from the camera, faces along toward
+// it, from the depth buffer: false unless the pixels either side of it on each axis lie in one
+// plane with it, however steeply it's seen, and that plane faces along an axis, as a voxel face
+// does. Not on uneven surfaces such as grass.
+bool flatFaceNormal(int2 pixel, float3 fromCamera, out float3 normal) {
+    normal = float3(0.0, 1.0, 0.0);
+    // At the frame's edges, the pixel inside it mirrored for the one past it.
+    int2 last = int2(uniforms.frameSize) - 1;
+    int2 low = select(pixel > 0, int2(-1), int2(1));
+    int2 high = select(pixel < last, int2(1), int2(-1));
+    float3 left, right, below, above;
+    if (!depthPosition(pixel + int2(low.x, 0), left) || !depthPosition(pixel + int2(high.x, 0), right)
+        || !depthPosition(pixel + int2(0, low.y), below) || !depthPosition(pixel + int2(0, high.y), above)) {
+        return false;
+    }
+    if (low.x > 0) {
+        left = 2.0 * fromCamera - left;
+    }
+    if (high.x < 0) {
+        right = 2.0 * fromCamera - right;
+    }
+    if (low.y > 0) {
+        below = 2.0 * fromCamera - below;
+    }
+    if (high.y < 0) {
+        above = 2.0 * fromCamera - above;
+    }
+    float3 plane = normalize(cross(right - left, above - below));
+    // In one plane: each neighbor's step from the pixel along it, not off it. Not evenly spaced,
+    // which perspective spreads apart where it's seen at grazing angles.
+    float3 steps[4] = { left - fromCamera, right - fromCamera, below - fromCamera, above - fromCamera };
+    for (int i = 0; i < 4; i++) {
+        if (abs(dot(steps[i], plane)) > 0.05 * length(steps[i])) {
+            return false;
+        }
+    }
+    float3 facing = abs(plane);
+    if (max(facing.x, max(facing.y, facing.z)) < 0.95) {
+        return false;
+    }
+    float3 axis = facing.x > facing.y && facing.x > facing.z ? float3(1.0, 0.0, 0.0)
+        : facing.y > facing.z ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
+    normal = axis * -sign(dot(axis, fromCamera));
+    return true;
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
@@ -148,11 +205,16 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
     VoxelHit surface;
     float3 onFace = float3(0.0);
     bool found = false;
+    // For `DebugView::Levels`: whether the face wasn't found for starting in a voxel, rather
+    // than for meeting none.
+    bool startedInside = false;
     if (hasGrid) {
         for (int attempt = 0; attempt < 2 && !found; attempt++) {
             float back = attempt == 0 ? 1.0 : 0.25;
             float3 start = onSurface - view * back;
-            found = traceVoxels(start, view, back + 1.0, false, true, surface) && surface.distance > 0.0;
+            bool hit = traceVoxels(start, view, back + 1.0, false, true, surface);
+            found = hit && surface.distance > 0.0;
+            startedInside = startedInside || (hit && surface.distance <= 0.0);
             onFace = start + view * surface.distance;
         }
     }
@@ -174,16 +236,18 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
     shadowsStorage[threadId.xy] = float4(visible, distance);
 
     // The light reaching the face from everywhere but the sun, and what it reflects when it's
-    // glossy. Without the face, as on grass and leaves, which aren't voxels, the light
-    // reaching the surface as if facing up, as they mostly do, rather than shading falling
-    // back on the sky's, which indoors is far too bright. Always up, so it's the same however
-    // the camera sees the surface.
+    // glossy. Without the face, the light reaching the surface as if facing the way its
+    // depth says a flat surface faces, such as a voxel face the short ray missed, else as if
+    // facing up, as grass and leaves, which aren't voxels, mostly do, rather than shading
+    // falling back on the sky's, which indoors is far too bright. Never by the way the camera
+    // sees it, so it's the same wherever the camera is.
     float4 reflection = float4(0.0);
     float4 indirect = float4(0.0);
     if (!found && hasGrid && uniforms.tracedIndirect != 0) {
-        float3 up = float3(0.0, 1.0, 0.0);
-        float3 light = indirectLight(onSurface, up, toCamera, false);
-        indirect = float4(light, float(faceNumber(up)));
+        float3 normal;
+        flatFaceNormal(int2(pixel), fromCamera, normal);
+        float3 light = indirectLight(onSurface, normal, toCamera, false);
+        indirect = float4(light, float(faceNumber(normal)));
     }
     if (found) {
         float face = float(faceNumber(surface.normal));
@@ -207,7 +271,7 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
     // sun reaches it, its level, and how the sun's ray ended, in place of the reflection.
     uint debugView = uniforms.lighting.debugView;
     if (debugView == DEBUG_TRACE_VIEW || debugView == DEBUG_LEVELS_VIEW) {
-        float level = found ? float(surface.level) : 0.0;
+        float level = found ? float(surface.level) : (startedInside ? 1.0 : 0.0);
         reflection = float4(found ? 1.0 : 0.0, dot(visible, LUMINANCE), level, float(sunTraceEnd));
     }
     reflectionsStorage[threadId.xy] = reflection;

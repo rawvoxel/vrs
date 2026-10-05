@@ -1,6 +1,6 @@
 // Draws the light probes as small cubes, for `renderer::DebugView::Probes`, each face colored
-// with the light the probe holds from its direction. Probes not placed or not yet updated
-// aren't drawn.
+// with the light the probe holds from its direction. Probes not placed, off or not yet
+// updated aren't drawn.
 
 #include "common.slang"
 
@@ -21,7 +21,7 @@ ProbeOutput probeVert(uint vertexIndex: SV_VertexID, uint slot: SV_InstanceID) {
     // Off the screen, clipped away.
     output.position = float4(0.0, 0.0, 2.0, 1.0);
     output.normal = float3(0.0, 1.0, 0.0);
-    if ((probe.state & PROBE_PLACED) == 0 || probe.updates == 0) {
+    if ((probe.state & PROBE_PLACED) == 0 || (probe.state & PROBE_OFF) != 0 || probe.updates == 0) {
         return output;
     }
 
@@ -41,7 +41,7 @@ ProbeOutput probeVert(uint vertexIndex: SV_VertexID, uint slot: SV_InstanceID) {
     if (side < 0.0) {
         at.x = -at.x;
     }
-    float3 local = (normal + u * at.x + v * at.y) * (PROBE_CUBE * 0.5 * float(1u << uint(cascadeOf(slot))));
+    float3 local = (normal + u * at.x + v * at.y) * (PROBE_CUBE * 0.5 * float(1u << uint(probeLevel(cascadeOf(slot)))));
     float3 world = (probe.position + local) * uniforms.lighting.gridVoxelSize;
     output.position = mul(uniforms.proj, mul(uniforms.view, float4(world, 1.0)));
     output.normal = normal;

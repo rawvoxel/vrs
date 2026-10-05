@@ -7,8 +7,10 @@ mod cells;
 mod convergence;
 mod volume;
 
+use super::VoxelGrid;
 use crate::renderer::Renderer;
-use glam::{IVec3, Mat4, Quat};
+use ash::prelude::VkResult;
+use glam::{IVec3, IVec4, Mat4, Quat, Vec3};
 
 pub(crate) use cells::bake_probe_cells;
 pub(in crate::renderer) use convergence::Convergence;
@@ -24,9 +26,14 @@ pub const MAX_CASCADES: u32 = 4;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProbeConfig {
     /// Probes along each axis of each cascade, which is centered on the camera with probes
-    /// 16 of the `VoxelGrid`'s finest voxels apart in the first, and twice as far apart in
-    /// each next. Each probe takes about 2.9 KB.
+    /// `spacing` apart in the first, and twice as far apart in each next. Each probe takes
+    /// about 2.9 KB.
     pub probe_counts: [u32; 3],
+    /// The `VoxelGrid`'s finest voxels between the first cascade's neighboring probes:
+    /// `PROBE_CELL`, or that times a power of two, rounded down to one. Probes `PROBE_CELL`
+    /// voxels of a level apart are placed by that level's chunks, so further apart they're
+    /// placed by a coarser level's, and their rays reach further in proportion.
+    pub spacing: u32,
     /// Cascades of probes, from 1 to `MAX_CASCADES`. Each reaches twice as far as the last,
     /// with probes twice as far apart, for chunks of coarser `VoxelGrid::levels`. Surfaces
     /// are lit by the finest one around them.
@@ -42,6 +49,7 @@ impl Default for ProbeConfig {
     fn default() -> Self {
         Self {
             probe_counts: [32, 16, 32],
+            spacing: PROBE_CELL,
             cascades: 1,
             rays_per_frame: 1 << 16,
         }
@@ -53,7 +61,8 @@ impl Default for ProbeConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProbeUniforms {
-    /// Each cascade's probe cell at its low corner, in its own cells, w unused.
+    /// Each cascade's probe cell at its low corner, in its own cells, then the level of the
+    /// voxel grid whose `PROBE_CELL` voxels its cells are, see `ProbeConfig::spacing`.
     pub volume_mins: [[i32; 4]; MAX_CASCADES as usize],
     /// Probes along each axis of each cascade.
     pub volume_counts: [u32; 3],
@@ -96,8 +105,9 @@ pub struct ProbeTuning {
     /// How far off a surface probes' visibility is tested, in probe spacings. Higher leaks
     /// less shadow into lit areas, too high leaks light through thin walls.
     pub self_shadow_bias: f32,
-    /// How far the finest cascade's probes' rays reach, in the `VoxelGrid`'s finest voxels,
-    /// twice as far in each coarser one. Further finds more distant light, at more cost.
+    /// How far probes' rays reach, in the `VoxelGrid`'s finest voxels, with probes
+    /// `PROBE_CELL` of them apart, and in proportion with probes further apart, as in coarser
+    /// cascades. Further finds more distant light, at more cost.
     pub ray_distance: f32,
     /// Frames between each probe's updates in the finest cascade, rounded up to a power of
     /// two from 1 to 16, twice as many in each coarser one. The probes take turns, and each
@@ -121,11 +131,43 @@ impl Default for ProbeTuning {
 
 /// The longest `ProbeTuning::update_interval`.
 const MAX_UPDATE_INTERVAL: u32 = 16;
+/// Past this many chunks changing in a frame, as when a world is loaded, every probe converges
+/// faster, rather than finding those next to each.
+const MANY_CHANGED_CHUNKS: usize = 1024;
 
 impl Renderer {
+    /// The light probes', `None` without any, see `set_probe_config`.
+    pub fn probe_config(&self) -> Option<ProbeConfig> {
+        self.probe_config
+    }
+
+    /// Replaces the light probes with `config`'s, `None` for none, as when what they need to
+    /// reach changes. Waits for the device to go idle. The new probes start over, so for a few
+    /// frames, as on the first ones, until they've seen enough, surfaces get the sky's light
+    /// instead of theirs. Nothing changes when `config` is the same.
+    pub fn set_probe_config(&mut self, config: Option<ProbeConfig>) -> VkResult<()> {
+        if config == self.probe_config {
+            return Ok(());
+        }
+        unsafe { self.device.device_wait_idle()? };
+        // Made first, so the old ones are kept should that fail.
+        let volume = ProbeVolume::new(
+            &self.adapter,
+            &self.device,
+            config,
+            self.graphics_pipeline_layout,
+        )?;
+        let mut old = std::mem::replace(&mut self.probe_volume, volume);
+        unsafe { old.destroy(&self.device) };
+        self.probe_volume
+            .write_descriptors(&self.device, &self.frame_desc_sets);
+        self.probe_config = config;
+        self.init_probe_volume()
+    }
+
     /// Whether this frame updates and samples the light probes, see `Lighting::global_illumination`.
     pub(in crate::renderer) fn probes_enabled(&self) -> bool {
-        self.probes_configured
+        self.probe_config.is_some()
             && self.lighting.global_illumination
             && self
                 .lighting
@@ -164,13 +206,67 @@ impl Renderer {
         {
             uniforms.enabled = 1;
             for cascade in 0..cascades {
-                let cell_size = grid.voxel_size * (PROBE_CELL << cascade) as f32;
-                let center = (camera / cell_size).floor().as_ivec3();
-                let half = IVec3::from_array(counts.map(|count| count as i32 / 2));
-                uniforms.volume_mins[cascade as usize] = (center - half).extend(0).to_array();
+                let (volume_min, level) = self.cascade_volume(grid, camera, cascade);
+                uniforms.volume_mins[cascade as usize] = volume_min.extend(level as i32).to_array();
             }
         }
         uniforms
+    }
+
+    /// Cascade `cascade`'s probe cell at its low corner, in its own cells, its volume centered
+    /// on `camera`, and the level of `grid` whose `PROBE_CELL` voxels its cells are.
+    fn cascade_volume(&self, grid: VoxelGrid, camera: Vec3, cascade: u32) -> (IVec3, u32) {
+        let level = self.probe_volume.first_level + cascade;
+        let cell_size = grid.voxel_size * (PROBE_CELL << level) as f32;
+        let center = (camera / cell_size).floor().as_ivec3();
+        let half = IVec3::from_array(self.probe_volume.counts.map(|count| count as i32 / 2));
+        (center - half, level)
+    }
+
+    /// Sets a bit for each light probe over whose cell or a neighboring one a chunk in
+    /// `changed` is, by chunk coordinate, then level, so it converges faster. By probe slot,
+    /// as `classifyProbes` reads them, with the volumes centered on `camera`.
+    pub(in crate::renderer) fn mark_changed_probes(
+        &mut self,
+        grid: VoxelGrid,
+        camera: Vec3,
+        changed: &[IVec4],
+    ) {
+        let probes = self.probe_volume.probe_count() as usize;
+        self.changed_probes.clear();
+        self.changed_probes.resize(probes.div_ceil(32), 0);
+        if !self.probes_enabled() || changed.is_empty() {
+            return;
+        }
+        if changed.len() > MANY_CHANGED_CHUNKS {
+            self.changed_probes.fill(u32::MAX);
+            return;
+        }
+        let counts = IVec3::from_array(self.probe_volume.counts.map(|count| count as i32));
+        let per_cascade = counts.element_product();
+        for cascade in 0..self.probe_volume.cascades {
+            let (volume_min, level) = self.cascade_volume(grid, camera, cascade);
+            let volume_max = volume_min + counts - 1;
+            let spacing = IVec3::splat((PROBE_CELL << level) as i32);
+            for chunk in changed {
+                // In the finest voxels, then the cells a cell away or nearer.
+                let size = (grid.voxels_per_edge << chunk.w) as i32;
+                let chunk_min = chunk.truncate() * size;
+                let low = (chunk_min.div_euclid(spacing) - 1).max(volume_min);
+                let high = ((chunk_min + (size - 1)).div_euclid(spacing) + 1).min(volume_max);
+                for z in low.z..=high.z {
+                    for y in low.y..=high.y {
+                        for x in low.x..=high.x {
+                            let local = IVec3::new(x, y, z).rem_euclid(counts);
+                            let slot = cascade as i32 * per_cascade
+                                + local.x
+                                + counts.x * (local.y + counts.y * local.z);
+                            self.changed_probes[slot as usize / 32] |= 1 << (slot % 32);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

@@ -54,6 +54,18 @@ RayBounds pastFace(float3 direction, int axis, float3 boxMin, float3 boxMax) {
     return bounds;
 }
 
+// Past the face on `axis` of the box from `boxMin` to `boxMax` that a ray going `direction`
+// just entered it through.
+RayBounds pastEntry(float3 direction, int axis, float3 boxMin, float3 boxMax) {
+    RayBounds bounds = unbounded();
+    if (direction[axis] > 0.0) {
+        bounds.lowest[axis] = boxMin[axis];
+    } else {
+        bounds.highest[axis] = below(boxMax)[axis];
+    }
+    return bounds;
+}
+
 // In cell `cell` of cells `scale` wide.
 RayBounds inCell(int3 cell, float scale) {
     RayBounds bounds = { float3(cell) * scale, below(float3(cell + 1) * scale) };
@@ -82,11 +94,14 @@ struct VoxelHit {
     // The level of the chunk it's in, and the chunk's mesh index.
     int level;
     uint mesh;
+    // Whether the ray reached it through a side of its chunk where it has no face, from solid
+    // voxels beyond, such as a chunk left out for being solid throughout: its back.
+    bool backface;
 };
 
 // Whether a ray from `origin` along unit `direction`, both in the voxel grid's finest voxels,
-// enters a solid voxel within `maxDistance`, and which. Rays leaving every level's shadow
-// table hit nothing, as do rays out of their budget of `MAX_RAY_CHUNKS` chunks and
+// enters a solid voxel within `maxDistance`, and which. Rays leaving the box around every
+// level's for good hit nothing, as do rays out of their budget of `MAX_RAY_CHUNKS` chunks and
 // `MAX_RAY_VOXELS` voxels, which only very long rays through busy chunks run out of.
 //
 // An Amanatides-Woo DDA, visiting every voxel the ray passes through in order. It runs a
@@ -102,6 +117,7 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
     hit.transmittance = float3(1.0);
     hit.level = 0;
     hit.mesh = NO_CHUNK;
+    hit.backface = false;
     traceEnd = TRACE_HIT;
     // Whether the last voxel was see-through, so each pane tints the light once.
     bool inGlass = false;
@@ -131,8 +147,32 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
         int3 coverChunk;
         uint meshIndex = chunkAtPoint(position, level, chunk, coverLevel, coverChunk);
         if (coverLevel < 0) {
-            traceEnd = TRACE_LEFT_TABLES;
-            return false;
+            // In no level's box. In the box around them all, the ray crosses the coarsest
+            // level's chunk here, which every box holds all or none of, outside it, it goes on
+            // to where it enters it, if it ever does.
+            float3 gridMin = float3(uniforms.lighting.gridBoxMin.xyz);
+            float3 gridMax = float3(uniforms.lighting.gridBoxMax.xyz);
+            if (all(position >= gridMin) && all(position < gridMax)) {
+                float coarseSize = float(edge << (int(uniforms.lighting.gridLevels) - 1));
+                float3 coarseMin = floor(position / coarseSize) * coarseSize;
+                t = exitDistance(origin, direction, inverse, coarseMin, coarseMin + coarseSize, t, axis);
+                bounds = pastFace(direction, axis, coarseMin, coarseMin + coarseSize);
+            } else {
+                float3 near = (select(direction > 0.0, gridMin, gridMax) - origin) * inverse;
+                float3 far = (select(direction > 0.0, gridMax, gridMin) - origin) * inverse;
+                float enter = max(max(near.x, near.y), near.z);
+                float leave = min(min(far.x, far.y), far.z);
+                if (enter >= leave || leave <= t) {
+                    traceEnd = TRACE_LEFT_TABLES;
+                    return false;
+                }
+                axis = near.x > near.y ? (near.x > near.z ? 0 : 2) : (near.y > near.z ? 1 : 2);
+                t = max(enter, t + RAY_EPSILON);
+                bounds = pastEntry(direction, axis, gridMin, gridMax);
+            }
+            leftSurface = true;
+            inGlass = false;
+            continue;
         }
         // The ray crosses the finest table's chunk here before looking again, no finer chunk
         // is in it.
@@ -207,6 +247,13 @@ bool traceVoxels(float3 origin, float3 direction, float maxDistance, bool skipSt
                 hit.mesh = meshIndex;
                 if (axis >= 0) {
                     hit.normal[axis] = -float(stepDirection[axis]);
+                    // Only chunks' sides tell faces from backs, where the voxel beyond is in
+                    // another chunk, or none; within one, the voxel the ray came from is empty.
+                    bool throughSide = local[axis] == (stepDirection[axis] > 0 ? 0 : edge - 1);
+                    if (throughSide && mesh.kind == KIND_AXIS_ALIGNED) {
+                        int face = axis * 2 + (stepDirection[axis] > 0 ? 0 : 1);
+                        hit.backface = !boundaryFace(mesh, edge, face, local);
+                    }
                 }
                 return true;
             }

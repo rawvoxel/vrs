@@ -72,6 +72,7 @@ static const uint DEBUG_INDIRECT = 3;
 static const uint DEBUG_AMBIENT_OCCLUSION = 4;
 static const uint DEBUG_TRACE = 6;
 static const uint DEBUG_LEVELS = 7;
+static const uint DEBUG_CASCADES = 8;
 
 // Matches `mesh::octahedral::decode`.
 float3 octahedralDecode(uint word) {
@@ -428,6 +429,8 @@ float4 meshFrag(VSOutput input) : SV_Target {
         return float4(light.indirect, 1.0);
     case DEBUG_AMBIENT_OCCLUSION:
         return float4(float3(openness), 1.0);
+    case DEBUG_CASCADES:
+        return float4(cascadeShares(toGrid(input.worldPosition), normal, toViewer), 1.0);
     case DEBUG_TRACE:
     case DEBUG_LEVELS: {
         // The trace pass's texel for this pixel, see `traceSurfaces`.
@@ -437,7 +440,9 @@ float4 meshFrag(VSOutput input) : SV_Target {
                 float3(0.0, 1.0, 0.0), float3(0.0, 0.3, 1.0), float3(1.0, 1.0, 0.0), float3(1.0, 0.0, 1.0)
             };
             bool traced = shadowPass && trace.x > 0.5;
-            return float4(traced ? LEVEL_COLORS[min(uint(round(trace.z)), 3)] : float3(shadowPass ? 1.0 : 0.0, 0.0, 0.0), 1.0);
+            // Not found: white where the search started in a voxel, red where it met none.
+            float3 notFound = trace.z > 0.5 ? float3(1.0) : float3(1.0, 0.0, 0.0);
+            return float4(traced ? LEVEL_COLORS[min(uint(round(trace.z)), 3)] : (shadowPass ? notFound : float3(0.0)), 1.0);
         }
         float brightness = 0.2 + 0.8 * trace.y;
         // Rays that gave up rather than reaching the sky or a voxel stand out.

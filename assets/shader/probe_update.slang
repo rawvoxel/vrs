@@ -51,14 +51,116 @@ uint updatePeriod(uint slot, uint fast) {
     return fast > 0 ? 1 : uniforms.probeVolume.updateInterval << uint(cascadeOf(slot));
 }
 
+// Whether the `size` wide cube of voxels from `low` of the chunk whose types start at
+// `typesBase`, `edge` voxels wide, is empty.
+bool voxelsEmpty(uint typesBase, int edge, int3 low, int size) {
+    for (int i = 0; i < size * size * size; i++) {
+        int3 voxel = low + int3(i % size, (i / size) % size, i / (size * size));
+        if (typeAt(typesBase, uint(edge), uint3(voxel)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Where a probe cell `size` voxels wide from voxel `low` of mesh `mesh`, a chunk `edge` voxels
+// wide, puts its probe, in that chunk's half voxels from `low`, false when it's solid: as
+// `bake_probe_cells` does, the center of the largest empty part of it nearest its center,
+// breadth first. `size` is at most `OCCUPANCY_BLOCK`, so the cell is inside one block, and
+// most cells, with none of its voxels, are settled by it.
+bool placeInVoxels(MeshInfo mesh, int edge, int3 low, int size, out int3 halfVoxel) {
+    halfVoxel = int3(size);
+    if (!blockOccupied(mesh.occupancyBase, occupancyBlocks(edge), low / OCCUPANCY_BLOCK)) {
+        return true;
+    }
+    for (int node = size; node >= 1; node /= 2) {
+        int nodes = size / node;
+        int bestDistance = 0x7fffffff;
+        for (int i = 0; i < nodes * nodes * nodes; i++) {
+            int3 at = int3(i % nodes, (i / nodes) % nodes, i / (nodes * nodes));
+            int3 nodeCenter = at * node * 2 + node;
+            int3 offset = nodeCenter - size;
+            // Not `dot`, which on integers needs the integer dot product feature.
+            int distance = offset.x * offset.x + offset.y * offset.y + offset.z * offset.z;
+            if (distance < bestDistance && voxelsEmpty(mesh.typesBase, edge, low + at * node, node)) {
+                bestDistance = distance;
+                halfVoxel = nodeCenter;
+            }
+        }
+        if (bestDistance != 0x7fffffff) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Where a probe cell from voxel `low` of mesh `mesh`, a chunk `edge` voxels wide, puts its probe,
+// in that chunk's half voxels from its corner, false when it has no room for one, from the
+// cells baked when the chunk was added, see `bake_probe_cells`. The probe cell is `2^finer`
+// baked cells wide, of which those in the chunk count: as the bake does, its center when
+// they're all empty, else the center of the empty one nearest it, else the baked probe
+// nearest it.
+bool placeInBakedCells(MeshInfo mesh, int edge, int3 low, int finer, out float3 halfVoxel) {
+    int cells = edge / PROBE_CELL;
+    int width = PROBE_CELL << finer;
+    float3 center = float3(low * 2 + width);
+    halfVoxel = center;
+    int3 from = max(floorDiv(low, PROBE_CELL), 0);
+    int3 to = min(floorDiv(low + width - 1, PROBE_CELL), cells - 1);
+    uint mask = mesh.probesBase + uint(cells * cells * cells);
+    float bestEmpty = 1e30;
+    float bestPlaced = 1e30;
+    float3 placed = center;
+    for (int z = from.z; z <= to.z; z++) {
+        for (int y = from.y; y <= to.y; y++) {
+            for (int x = from.x; x <= to.x; x++) {
+                int3 baked = int3(x, y, z);
+                uint index = uint(x + cells * (y + cells * z));
+                bool hasVoxels = (chunkWords[mask + index / 32] & (1u << (index % 32))) != 0;
+                if (!hasVoxels) {
+                    float3 cellCenter = float3(baked * PROBE_CELL * 2 + PROBE_CELL);
+                    float distance = dot(cellCenter - center, cellCenter - center);
+                    if (distance < bestEmpty) {
+                        bestEmpty = distance;
+                        halfVoxel = cellCenter;
+                    }
+                    continue;
+                }
+                uint word = chunkWords[mesh.probesBase + index];
+                if ((word & CELL_PLACED) != 0) {
+                    float3 at = float3(baked * PROBE_CELL * 2) + float3(word & 63, (word >> 6) & 63, (word >> 12) & 63);
+                    float distance = dot(at - center, at - center);
+                    if (distance < bestPlaced) {
+                        bestPlaced = distance;
+                        placed = at;
+                    }
+                }
+            }
+        }
+    }
+    // None with voxels: the whole cell is empty, its probe at its center.
+    if (bestEmpty < 1e30 && bestPlaced == 1e30) {
+        halfVoxel = center;
+        return true;
+    }
+    if (bestEmpty < 1e30) {
+        return true;
+    }
+    halfVoxel = placed;
+    return bestPlaced < 1e30;
+}
+
 // Where cascade `cascade`'s probe cell `cell` puts its probe, in the finest voxels, false when it
-// has no room for one. From the chunk of the finest level holding the cell's center, see
-// `chunkAtPoint`: one of the cascade's level has its cells baked when it was added, see
-// `renderer::lighting::probes::bake_probe_cells`, a finer one has the baked cell holding the
-// center. A coarser one's voxels are bigger than the cell, its probe is at its center when that's
-// empty. A cell without a chunk is empty, with its probe at its center.
+// has no room for one: as `renderer::lighting::probes::bake_probe_cells` places them, in the
+// largest empty part of the cell nearest its center, from the chunk of the finest level
+// holding the cell's center, see `chunkAtPoint`. One of the cascade's level, see `probeLevel`,
+// or finer, has the cells it baked when it was added, see `placeInBakedCells`. A coarser one's
+// voxels are searched, see `placeInVoxels`, at most 8 to a side of the cell, or when the cell
+// is smaller than one of them, the probe is at its center when that's empty. A cell without a
+// chunk is empty, with its probe at its center. Probes placed the same whatever the level of
+// the chunks around them light those chunks the same.
 bool probePlacement(int cascade, int3 cell, out float3 position) {
-    int spacing = PROBE_CELL << cascade;
+    int spacing = probeSpacing(cascade);
     float3 center = (float3(cell) + 0.5) * float(spacing);
     position = center;
     int level;
@@ -69,39 +171,28 @@ bool probePlacement(int cascade, int3 cell, out float3 position) {
     if (meshIndex == NO_CHUNK) {
         return true;
     }
+    MeshInfo mesh = meshes[meshIndex];
     int edge = int(uniforms.lighting.gridVoxelsPerEdge);
     float scale = float(1 << level);
-    if (level > cascade) {
-        // The center is a corner of 8 of its voxels. The probe stays there when they're all
-        // empty, else goes to the center of an empty one, so its rays don't start in voxels.
-        int3 low = int3(round(center / scale)) - chunk * edge - 1;
-        int empty = -1;
-        bool allEmpty = true;
-        for (int i = 0; i < 8; i++) {
-            int3 voxel = low + int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
-            bool inChunk = all(voxel >= 0) && all(voxel < edge);
-            if (inChunk && typeAt(meshes[meshIndex].typesBase, uint(edge), uint3(voxel)) != 0) {
-                allEmpty = false;
-            } else if (empty < 0) {
-                empty = i;
-            }
+    int cascadeLevel = probeLevel(cascade);
+    if (level > cascadeLevel) {
+        int size = PROBE_CELL >> (level - cascadeLevel);
+        if (size == 0) {
+            int3 voxel = int3(floor(center / scale)) - chunk * edge;
+            return typeAt(mesh.typesBase, uint(edge), uint3(voxel)) == 0;
         }
-        if (!allEmpty && empty >= 0) {
-            int3 voxel = low + int3(empty & 1, (empty >> 1) & 1, (empty >> 2) & 1);
-            position = (float3(chunk * edge + voxel) + 0.5) * scale;
-        }
-        return empty >= 0;
+        int3 low = cell * size - chunk * edge;
+        int3 halfVoxel;
+        bool placed = placeInVoxels(mesh, edge, low, size, halfVoxel);
+        position = (float3(chunk * edge + low) + float3(halfVoxel) * 0.5) * scale;
+        return placed;
     }
-    int cells = edge / PROBE_CELL;
-    int3 local = int3(floor(center / scale)) - chunk * edge;
-    int3 bakedCell = local / PROBE_CELL;
-    uint word = chunkWords[meshes[meshIndex].probesBase + uint(bakedCell.x + cells * (bakedCell.y + cells * bakedCell.z))];
-    if ((word & CELL_PLACED) == 0) {
-        return false;
-    }
-    float3 inCell = float3(word & 63, (word >> 6) & 63, (word >> 12) & 63) * 0.5;
-    position = (float3(chunk * edge + bakedCell * PROBE_CELL) + inCell) * scale;
-    return true;
+    int finer = cascadeLevel - level;
+    int3 low = cell * (PROBE_CELL << finer) - chunk * edge;
+    float3 halfVoxel;
+    bool placed = placeInBakedCells(mesh, edge, low, finer, halfVoxel);
+    position = (float3(chunk * edge) + halfVoxel * 0.5) * scale;
+    return placed;
 }
 
 // Whether any of cascade `cascade`'s probe cells from `low` to `high` has voxels. From the
@@ -110,7 +201,7 @@ bool probePlacement(int cascade, int3 cell, out float3 position) {
 bool cellsHaveVoxels(int cascade, int3 low, int3 high) {
     int edge = int(uniforms.lighting.gridVoxelsPerEdge);
     int cells = edge / PROBE_CELL;
-    int spacing = PROBE_CELL << cascade;
+    int spacing = probeSpacing(cascade);
     // In the finest voxels.
     int3 regionMin = low * spacing;
     int3 regionMax = (high + 1) * spacing - 1;
@@ -129,7 +220,7 @@ bool cellsHaveVoxels(int cascade, int3 low, int3 high) {
                     if (meshIndex == NO_CHUNK) {
                         continue;
                     }
-                    if (level < cascade) {
+                    if (level < probeLevel(cascade)) {
                         return true;
                     }
                     uint mask = meshes[meshIndex].probesBase + uint(cells * cells * cells);
@@ -152,35 +243,18 @@ bool cellsHaveVoxels(int cascade, int3 low, int3 high) {
     return false;
 }
 
+// A ray's distance when it hits nothing.
+static const float SKY_DISTANCE = 1e9;
+
 // Frames a probe converges faster after nearby chunks changed, for its light, and of those,
 // for its distances [Majercik et al. 2021].
 static const uint FAST_FRAMES = 10;
 static const uint FAST_DISTANCE_FRAMES = 7;
 
-// Whether a chunk of any level holding any of cascade `cascade`'s probe cells from `low` to
-// `high` changed since last frame.
-bool chunksChanged(int cascade, int3 low, int3 high) {
-    int edge = int(uniforms.lighting.gridVoxelsPerEdge);
-    int side = CHUNK_TABLE_SIDE;
-    int spacing = PROBE_CELL << cascade;
-    int3 regionMin = low * spacing;
-    int3 regionMax = (high + 1) * spacing - 1;
-    for (int level = 0; level < int(uniforms.lighting.gridLevels); level++) {
-        int3 corner = uniforms.lighting.chunkTableCorners[level].xyz;
-        int3 chunkLow = floorDiv(regionMin, edge << level) - corner;
-        int3 chunkHigh = floorDiv(regionMax, edge << level) - corner;
-        for (int z = max(chunkLow.z, 0); z <= min(chunkHigh.z, side - 1); z++) {
-            for (int y = max(chunkLow.y, 0); y <= min(chunkHigh.y, side - 1); y++) {
-                for (int x = max(chunkLow.x, 0); x <= min(chunkHigh.x, side - 1); x++) {
-                    uint index = uint(((level * side + z) * side + y) * side + x);
-                    if ((changedChunks[index / 32] & (1u << (index % 32))) != 0) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    return false;
+// Whether a chunk of any level over slot `slot`'s probe's cell or a neighboring one changed
+// since last frame, see `Renderer::mark_changed_probes`.
+bool probeChanged(uint slot) {
+    return (changedProbes[slot / 32] & (1u << (slot % 32))) != 0;
 }
 
 [shader("compute")]
@@ -196,7 +270,7 @@ void classifyProbes(uint3 threadId: SV_DispatchThreadID) {
     uint inCascade = slot % probesPerCascade();
     int3 local = int3(inCascade % counts.x, (inCascade / counts.x) % counts.y, inCascade / (counts.x * counts.y));
     int3 volumeMin = uniforms.probeVolume.volumeMins[cascade].xyz;
-    int3 cell = volumeMin + (((local - volumeMin) % counts) + counts) % counts;
+    int3 cell = volumeMin + floorMod(local - volumeMin, counts);
 
     float3 position;
     bool placed = probePlacement(cascade, cell, position);
@@ -214,13 +288,22 @@ void classifyProbes(uint3 threadId: SV_DispatchThreadID) {
         return;
     }
 
-    // Probes next to a chunk added, removed or remeshed converge faster for a while.
+    // Probes next to a chunk added, removed or remeshed converge faster for a while, and those
+    // off are tried again.
+    bool changed = probeChanged(slot);
     uint fast = fastFrames(probe.state);
-    fast = chunksChanged(cascade, cell - 1, cell + 1) ? FAST_FRAMES : (fast > 0 ? fast - 1 : 0);
+    fast = changed ? FAST_FRAMES : (fast > 0 ? fast - 1 : 0);
     uint state = (probe.state & ((1u << PROBE_FAST_SHIFT) - 1)) | (fast << PROBE_FAST_SHIFT);
+    if (changed) {
+        state &= ~PROBE_OFF;
+    }
     if (state != probe.state) {
         probe.state = state;
         probes[slot].state = state;
+    }
+    // Inside voxels, see `updateIrradiance`.
+    if ((state & PROBE_OFF) != 0) {
+        return;
     }
 
     // Each probe updates every few frames, in turn, unless nearby chunks just changed.
@@ -278,15 +361,16 @@ void traceProbeRays(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID) {
     float3 direction = probeRayDirection(ray, rays);
     float4 result;
     VoxelHit hit;
-    // Coarser cascades' rays reach further, in proportion.
-    float reach = uniforms.probeVolume.rayDistance * float(1 << cascadeOf(slot));
+    // Probes further apart, as in coarser cascades, reach further, in proportion.
+    float reach = uniforms.probeVolume.rayDistance * float(1 << probeLevel(cascadeOf(slot)));
     if (!traceVoxels(probe.position, direction, reach, false, false, hit)) {
         // The sky, or the ground past the world, through any see-through voxels.
-        result = float4(ambientLight(direction) * hit.transmittance, 1e9);
-    } else if (hit.distance <= 0.0) {
-        // Voxels fill the probe's spot, though its chunk says otherwise: dark and close, so
-        // it isn't trusted [Majercik et al. 2021].
-        result = float4(0.0);
+        result = float4(ambientLight(direction) * hit.transmittance, SKY_DISTANCE);
+    } else if (hit.distance <= 0.0 || hit.backface) {
+        // In voxels, or seeing a voxel's back: dark, and nearer than it is, so the probe sees
+        // it as shadowed and doesn't light through it [Majercik et al. 2021]. Negative, to
+        // count toward the probe being inside voxels [Rohacek 2022].
+        result = float4(0.0, 0.0, 0.0, -max(hit.distance * 0.2, 1e-3));
     } else {
         // Lit as the camera would see it, with last frame's light from the probes.
         float3 worldPosition = (probe.position + direction * hit.distance) * uniforms.lighting.gridVoxelSize;
@@ -390,6 +474,24 @@ void updateIrradiance(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, u
         hysteresis = 0.0;
     }
     probeIrradianceStorage[texel] = float4(lerp(irradiance, old, hysteresis), 1.0);
+
+    // More than a quarter of the voxels its rays hit seen from the back, the probe is inside
+    // voxels: it's turned off, until chunks near it change [Majercik et al. 2021]. Of those
+    // hit, not of every ray: rays from inside rock left out for being solid throughout cross
+    // it as open space, and many escape to the sky, though from open space no voxel's back can
+    // be seen at all [Rohacek 2022].
+    if (threadIndex == 0) {
+        uint backs = 0;
+        uint hits = 0;
+        for (uint i = 0; i < rays; i++) {
+            float distance = sharedResults[i].w;
+            backs += distance < 0.0 ? 1 : 0;
+            hits += distance < SKY_DISTANCE ? 1 : 0;
+        }
+        if (backs * 4 > hits) {
+            probes[slot].state = probe.state | PROBE_OFF;
+        }
+    }
 }
 
 [shader("compute")]
@@ -398,7 +500,7 @@ void updateDistances(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, ui
     uint rays = loadRays(group.x, threadIndex, (DISTANCE_TEXELS + 2) * (DISTANCE_TEXELS + 2));
     uint slot = activeProbes[ACTIVE_LIST + group.x];
     Probe probe = probes[slot];
-    float maxDistance = MAX_PROBE_DISTANCE * float(1 << cascadeOf(slot));
+    float maxDistance = MAX_PROBE_DISTANCE * float(1 << probeLevel(cascadeOf(slot)));
 
     // The mean distance and squared distance of the rays near the texel's direction that hit
     // voxels within the cage, or far when none did.
@@ -409,7 +511,8 @@ void updateDistances(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, ui
     for (uint i = 0; i < rays; i++) {
         // Sharpened, so the distances' edges follow the voxels [Majercik et al. 2019].
         float weight = pow(max(dot(direction, sharedDirections[i]), 0.0), uniforms.probeVolume.distanceSharpness);
-        float distance = sharedResults[i].w;
+        // Backs' distances are negative, see `traceProbeRays`.
+        float distance = abs(sharedResults[i].w);
         totalWeight += weight;
         if (distance <= maxDistance) {
             sum += weight * float2(distance, distance * distance);

@@ -1,8 +1,5 @@
 // Sampling the light probes' cascades.
 
-// Voxels along each edge of a probe's cell, and between neighboring probes, in the finest
-// cascade. Matches `renderer::lighting::probes::PROBE_CELL`.
-static const int PROBE_CELL = 16;
 // Matches `renderer::lighting::probes::volume::IRRADIANCE_TEXELS` and
 // `renderer::lighting::probes::volume::DISTANCE_TEXELS`, each with a one texel border.
 static const int IRRADIANCE_TEXELS = 8;
@@ -22,6 +19,17 @@ int cascadeOf(uint slot) {
     return int(slot / probesPerCascade());
 }
 
+// The level of the voxel grid whose `PROBE_CELL` voxels cascade `cascade`'s probe cells are,
+// the cascade's own unless its probes are further apart, see `ProbeConfig::spacing`.
+int probeLevel(int cascade) {
+    return uniforms.probeVolume.volumeMins[cascade].w;
+}
+
+// The finest voxels between cascade `cascade`'s neighboring probes.
+int probeSpacing(int cascade) {
+    return PROBE_CELL << probeLevel(cascade);
+}
+
 // The slot of the probe of cascade `cascade`'s probe cell `cell`, false outside it.
 bool probeSlot(int cascade, int3 cell, out uint slot) {
     slot = 0;
@@ -30,7 +38,7 @@ bool probeSlot(int cascade, int3 cell, out uint slot) {
     if (any(relative < 0) || any(relative >= counts)) {
         return false;
     }
-    int3 local = ((cell % counts) + counts) % counts;
+    int3 local = floorMod(cell, counts);
     slot = uint(cascade) * probesPerCascade() + uint(local.x + counts.x * (local.y + counts.y * local.z));
     return true;
 }
@@ -56,7 +64,7 @@ float2 atlasUV(uint slot, float3 direction, int texels) {
 // weights follow where each probe actually is in its cell, not its cell's center, so probes
 // moved off center blend smoothly [Roháček 2022].
 float3 sampleIrradiance(int cascade, float3 position, float3 normal, float3 toViewer, uint minUpdates, out float coverage, out bool found) {
-    float spacing = float(PROBE_CELL << cascade);
+    float spacing = float(probeSpacing(cascade));
     float bias = 0.75 * spacing * uniforms.probeVolume.selfShadowBias;
     float3 biased = position + (normal * 0.2 + toViewer * 0.8) * bias;
     // Probes sit at the centers of their cells unless voxels are in the way.
@@ -82,7 +90,7 @@ float3 sampleIrradiance(int cascade, float3 position, float3 normal, float3 toVi
             continue;
         }
         Probe probe = probes[slot];
-        if ((probe.state & PROBE_PLACED) == 0 || probe.updates < minUpdates || any(probe.cell != cell)) {
+        if ((probe.state & PROBE_PLACED) == 0 || (probe.state & PROBE_OFF) != 0 || probe.updates < minUpdates || any(probe.cell != cell)) {
             continue;
         }
 

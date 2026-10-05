@@ -85,6 +85,8 @@ drop(renderer);
   grid from the world's origin, and with `VoxelGrid::levels`, coarser levels of detail of
   them, each of voxels twice as big. Rays go through the finest level's chunk wherever there
   is one. Reflections, the light probes and ambient occlusion trace through the same grid.
+  Each frame, rays find the chunks in a hashed table, 32 to 64 bytes a chunk however far
+  apart they are, within a box around each level's chunks up to 1024 of them wide.
   Chunks of other sizes are lit, but no ray sees them, and chunks with no faces, such as
   under the ground, should still be created for their voxels to cast shadows.
   With shadows or lights, frames draw their depth first, trace the shadows from it, then draw
@@ -107,14 +109,21 @@ drop(renderer);
   for each trace texel and upscaled like the shadows, which blends into the probes' light
   from the reflected direction as they get rougher. The sun's and the lights' highlights are
   added on top.
-- **Global illumination**: with `RendererConfig::global_illumination`, a volume of light
-  probes 16 voxels apart follows the camera, and lights chunks inside it with light bounced
-  off the voxels around them, in place of the sky and ground colors. With
+- **Global illumination**: with `RendererConfig::global_illumination`, or
+  `Renderer::set_probe_config` while running, a volume of light probes 16 voxels apart
+  follows the camera, and lights chunks inside it with light bounced
+  off the voxels around them, in place of the sky and ground colors. `ProbeConfig::spacing`
+  sets them further apart, by a power of two, for small voxels. With
   `ProbeConfig::cascades`, further volumes follow it too, each with probes twice as far apart,
   reaching twice as far, for coarser levels of detail. It's dynamic diffuse global
   illumination (Majercik et al. 2019 and 2021):
   - When a chunk is added, each 16³ cell of it bakes where its probe goes: the largest empty
     part of the cell nearest its center, found breadth first, or none when it's solid.
+  - Probes whose rays see voxels from the back, through a side of a chunk where they have no
+    face, are inside voxels, such as rock left out for being solid throughout: rays seeing
+    backs record no light and a shortened distance, and a probe with more than a quarter of
+    its hits backs is turned off, neither traced nor sampled, until chunks near it change
+    (Majercik et al. 2021, Roháček 2022).
   - The probes with voxels in or next to their cell share a fixed budget of rays,
     `ProbeConfig::rays_per_frame`, so the cost stays steady. Each updates every
     `ProbeTuning::update_interval` frames, 4 by default, taking turns, and twice as rarely
