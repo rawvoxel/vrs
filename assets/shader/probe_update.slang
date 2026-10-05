@@ -301,6 +301,18 @@ void traceProbeRays(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID) {
     probeRays[listed * rays + ray] = result;
 }
 
+// How much of its old value a probe keeps on its `updates`th update, of `rays` rays, `period`
+// frames after its last: `hysteresis` for each frame, so probes updated every few frames follow
+// changes as fast, but as much less for each fraction of the most rays it traced fewer. Fewer
+// rays are noisier, so each counts for less, and the probes' noise stays the same however many
+// share the frame's rays. A new probe's first updates are averaged, its first replacing what
+// was there, so it settles quickly before it keeps as much.
+float kept(float hysteresis, uint period, uint rays, uint updates) {
+    float steady = pow(hysteresis, float(period) * float(rays) / float(MAX_RAYS_PER_PROBE));
+    float averaged = float(max(updates, 1) - 1) / float(max(updates, 1));
+    return min(steady, averaged);
+}
+
 groupshared float4 sharedResults[MAX_RAYS_PER_PROBE];
 groupshared float3 sharedDirections[MAX_RAYS_PER_PROBE];
 
@@ -365,13 +377,10 @@ void updateIrradiance(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, u
 
     int2 texel = atlasTexel(group.x, int2(thread.xy), IRRADIANCE_TEXELS);
     float3 old = probeIrradianceStorage[texel].rgb;
-    // A probe's first update replaces what was there, and big changes are let through
-    // faster [Majercik et al. 2021]. Probes updated every few frames keep as much less each
-    // time, so they follow changes as fast.
+    // How much of the old light the probe keeps, see `kept`, less when it changed a lot, so
+    // big changes are let through faster [Majercik et al. 2021].
     uint fast = fastFrames(probe.state);
-    float hysteresis = probe.updates <= 1
-        ? 0.0
-        : pow(uniforms.probeVolume.hysteresis * uniforms.probeVolume.hysteresisScale * (fast > 0 ? 0.5 : 1.0), float(updatePeriod(slot, fast)));
+    float hysteresis = kept(uniforms.probeVolume.hysteresis * uniforms.probeVolume.hysteresisScale * (fast > 0 ? 0.5 : 1.0), updatePeriod(slot, fast), rays, probe.updates);
     float3 change = abs(irradiance - old);
     float largestChange = max(change.x, max(change.y, change.z));
     if (largestChange > 0.25) {
@@ -417,8 +426,6 @@ void updateDistances(uint3 group: SV_GroupID, uint3 thread: SV_GroupThreadID, ui
     int2 texel = atlasTexel(group.x, int2(thread.xy), DISTANCE_TEXELS);
     float2 old = probeDistancesStorage[texel].xy;
     uint fast = fastFrames(probe.state);
-    float hysteresis = probe.updates <= 1
-        ? 0.0
-        : pow(uniforms.probeVolume.distanceHysteresis * uniforms.probeVolume.distanceHysteresisScale * (fast > FAST_FRAMES - FAST_DISTANCE_FRAMES ? 0.5 : 1.0), float(updatePeriod(slot, fast)));
+    float hysteresis = kept(uniforms.probeVolume.distanceHysteresis * uniforms.probeVolume.distanceHysteresisScale * (fast > FAST_FRAMES - FAST_DISTANCE_FRAMES ? 0.5 : 1.0), updatePeriod(slot, fast), rays, probe.updates);
     probeDistancesStorage[texel] = float4(lerp(moments, old, hysteresis), 0.0, 0.0);
 }

@@ -216,6 +216,30 @@ float3 upscaledByFace(Texture2D<float4> texels, ShadowTaps taps, uint face, out 
     return found ? sum / totalWeight : float3(0.0);
 }
 
+// The value from `texels`, which hold each block's and its face's number, upscaled from
+// `taps`, from those that found a face, whichever it is. Weighted as the taps are, or equally
+// when none of those are. `found` is false when none found a face.
+float3 upscaledAnyFace(Texture2D<float4> texels, ShadowTaps taps, out bool found) {
+    float3 weighted = float3(0.0);
+    float totalWeight = 0.0;
+    float3 any = float3(0.0);
+    float count = 0.0;
+    for (int i = 0; i < 4; i++) {
+        float4 texel = texels.Load(int3(taps.texels[i], 0));
+        if (texel.w > 0.0) {
+            weighted += taps.weights[i] * texel.rgb;
+            totalWeight += taps.weights[i];
+            any += texel.rgb;
+            count += 1.0;
+        }
+    }
+    found = count > 0.0;
+    if (totalWeight > 0.0) {
+        return weighted / totalWeight;
+    }
+    return found ? any / count : float3(0.0);
+}
+
 // How much of light `lightIndex`'s light gets through, upscaled from `taps`, from those that
 // shadowed it. Lights none of them shadowed aren't shadowed.
 float upscaledLightShadow(ShadowTaps taps, uint lightIndex) {
@@ -317,12 +341,10 @@ float4 meshFrag(VSOutput input) : SV_Target {
     // Packed faces take that of the side of their voxel they face most.
     if (shadowPass && uniforms.tracedIndirect != 0 && debugView != DEBUG_AMBIENT_OCCLUSION) {
         light.indirect = upscaledByFace(indirect, taps, faceNumber(normal), upscaled);
-        // Along edges, where no texel near is of the same face, the nearest's, which looks
+        // Along edges, where no texel near is of the same face, those of any face, which look
         // the same, rather than some pixels finding their own and slowing those around them.
-        float4 nearest = indirect.Load(int3(taps.texels[taps.closest], 0));
-        if (!upscaled && nearest.w > 0.0) {
-            light.indirect = nearest.rgb;
-            upscaled = true;
+        if (!upscaled) {
+            light.indirect = upscaledAnyFace(indirect, taps, upscaled);
         }
     }
     float openness = 1.0;

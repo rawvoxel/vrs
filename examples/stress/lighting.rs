@@ -5,6 +5,10 @@
 //!   light for shading to upscale.
 //! - A sealed hollow box under a bright sun and sky, seen from inside: no light may leak in,
 //!   at full and half trace resolution, and with 4 cascades of probes blending.
+//! - A sealed hall seen from far across it, where the depth buffer is least precise: no light
+//!   may leak onto its pyramids' steps or into its corners, at full and half trace resolution.
+//! - The box with a hole in its roof, and the hall with skylights, in a still frame: their
+//!   bounced light holds steady from frame to frame.
 //! - The same box with a hole in its roof: sunlight bouncing in lights all of it. With glass
 //!   over the hole, the glass dims it. A few frames after cutting the hole or the sun coming
 //!   out, the light inside has mostly caught up.
@@ -77,6 +81,11 @@ const UNLIT: f32 = 0.02;
 /// Brightness over which a pixel counts as reached by light, in linear color: any byte above
 /// black, sRGB or not.
 const BOUNCED: f32 = 0.002;
+/// How much lit pixels may change from frame to frame once the light has settled, relative to
+/// their brightness, on average, and the fraction of them that may change by over a tenth: the
+/// probes' rays are random, but blended over enough of them the light holds steady.
+const FLICKER: f32 = 0.005;
+const FLICKERING_PIXELS: f32 = 0.0005;
 /// Pixels allowed to show through one pixel cracks between quads, as a fraction of all.
 const CRACKS: f32 = 0.002;
 /// What "most of" a surface is, as a fraction of its pixels.
@@ -154,6 +163,37 @@ fn shell(x: i32, y: i32, z: i32) -> u16 {
     let hollow = inside(x, -16, 16) && inside(y, 6, 38) && inside(z, -16, 16);
     if outer && !hollow { GRAY } else { 0 }
 }
+
+/// A sealed hall nearly as wide as the scene, its walls and roof 2 thick, holding rows of
+/// stepped pyramids, like roofs, whose every step is a concave edge.
+fn hall(x: i32, y: i32, z: i32) -> u16 {
+    let inside = |v: i32, lo: i32, hi: i32| (lo..hi).contains(&v);
+    let outer = inside(x, -62, 126) && inside(y, 4, 60) && inside(z, -62, 126);
+    let hollow = inside(x, -60, 124) && inside(y, 6, 58) && inside(z, -60, 124);
+    if outer && !hollow {
+        return GRAY;
+    }
+    // Pyramids 24 wide every 32, rising a voxel for each 2 in from their edges.
+    let (px, pz) = ((x + 60).rem_euclid(32), (z + 60).rem_euclid(32));
+    let from_edge = px.min(23 - px).min(pz).min(23 - pz);
+    if hollow && px < 24 && pz < 24 && y >= 6 && y < 6 + from_edge / 2 + 1 {
+        return GRAY;
+    }
+    0
+}
+
+/// The hall with a skylight in its roof over every other pyramid, the sun reaching some of
+/// it and its light bouncing around the rest.
+fn skylit_hall(x: i32, y: i32, z: i32) -> u16 {
+    let skylight = y >= 58 && (x + 60).rem_euclid(64) < 12 && (z + 60).rem_euclid(64) < 12;
+    if skylight { 0 } else { hall(x, y, z) }
+}
+
+/// From one corner of the hall, across it to the far corner's floor.
+const HALL_VIEW: View = View {
+    eye: Vec3::new(-55.0, 45.0, -55.0),
+    target: Vec3::new(110.0, 6.0, 110.0),
+};
 
 /// Where the box's roof has a hole.
 fn hole(x: i32, y: i32, z: i32) -> bool {
@@ -362,6 +402,64 @@ fn render(app: &App, scene: Scene, view: View) -> VkResult<Option<Vec<f32>>> {
     Ok(capture.as_ref().and_then(linear_reds))
 }
 
+/// `count` consecutive frames after `scene`'s frames, seen from `view`, each pixel's
+/// brightness in each. Empty when frames can't be captured.
+fn render_frames(app: &App, scene: Scene, view: View, count: u32) -> VkResult<Vec<Vec<f32>>> {
+    let config = RendererConfig {
+        global_illumination: Some(scene.probes),
+        ..Default::default()
+    };
+    let mut renderer = Renderer::with_config(app, WIDTH, HEIGHT, config)?;
+    renderer.set_materials(&MATERIALS);
+    renderer.lights = scene.lights.to_vec();
+    renderer.lighting = Lighting {
+        voxel_grid: Some(VoxelGrid::new(1.0, EDGE as u32).with_levels(scene.levels)),
+        ..scene.lighting
+    };
+    let ids = create_scene(&mut renderer, &scene, scene.voxels)?;
+    let meshes: Vec<&MeshId> = ids.iter().collect();
+    let draws = DrawList {
+        meshes: &meshes,
+        view: Mat4::look_at_rh(view.eye, view.target, Vec3::Y),
+        proj: camera::perspective(70.0, WIDTH as f32 / HEIGHT as f32, 0.1, 500.0),
+    };
+    for _ in 0..FRAMES {
+        renderer.submit(WIDTH, HEIGHT, &draws)?;
+    }
+    let mut frames = Vec::new();
+    for _ in 0..count {
+        if !renderer.debug_capture_next_frame() {
+            return Ok(Vec::new());
+        }
+        renderer.submit(WIDTH, HEIGHT, &draws)?;
+        match renderer.debug_read_capture()?.as_ref().and_then(linear_reds) {
+            Some(frame) => frames.push(frame),
+            None => return Ok(Vec::new()),
+        }
+    }
+    Ok(frames)
+}
+
+/// How much lit pixels change from frame to frame, relative to their brightness, on average,
+/// and the fraction of them changing by over a tenth, over `frames`.
+fn flicker(frames: &[Vec<f32>]) -> (f32, f32) {
+    let (mut change, mut big, mut samples) = (0.0, 0usize, 0usize);
+    for pair in frames.windows(2) {
+        for (before, after) in pair[0].iter().zip(&pair[1]) {
+            let brightness = before.max(*after);
+            if brightness < BOUNCED * 10.0 {
+                continue;
+            }
+            let relative = (after - before).abs() / brightness;
+            change += relative;
+            big += (relative > 0.1) as usize;
+            samples += 1;
+        }
+    }
+    let samples = samples.max(1) as f32;
+    (change / samples, big as f32 / samples)
+}
+
 /// What `Checks::render` fails with when the device's frames can't be captured, which skips
 /// the checks.
 const CANT_CAPTURE: vk::Result = vk::Result::ERROR_FEATURE_NOT_PRESENT;
@@ -420,6 +518,49 @@ fn sealed_box(checks: &mut Checks) -> VkResult<()> {
             format!("{} of a sealed box's inside is lit{how}", percent(lit, 2)),
             lit <= CRACKS,
             "light leaks in",
+        );
+    }
+    Ok(())
+}
+
+/// No light leaks into a sealed hall, onto steps and into corners seen from far across it,
+/// where the depth buffer is least precise, at full and half trace resolution.
+fn sealed_hall(checks: &mut Checks) -> VkResult<()> {
+    for (how, lighting) in [("", bright()), (" at half resolution", half(bright()))] {
+        let lit = fraction_over(&checks.render(Scene::new(&hall, lighting), HALL_VIEW)?, UNLIT);
+        // No crack shows the sky, every surface seen is inside.
+        checks.expect(
+            format!("{} of a sealed hall's inside is lit{how}", percent(lit, 2)),
+            lit == 0.0,
+            "light leaks in along its steps and corners",
+        );
+    }
+    Ok(())
+}
+
+/// The bounced light in a box with a hole in its roof is steady from frame to frame once it
+/// has settled, at full and half trace resolution, and in a hall busy with voxels near most of
+/// its probes, which share the frame's rays, each tracing fewer.
+fn steady_light(checks: &mut Checks) -> VkResult<()> {
+    let scenes: [(&str, Voxels, View, Lighting); 3] = [
+        (" in a box", &holed, HOLE_VIEW, sun_only()),
+        (" in a box at half resolution", &holed, HOLE_VIEW, half(sun_only())),
+        (" in a busy hall at half resolution", &skylit_hall, HALL_VIEW, half(sun_only())),
+    ];
+    for (how, voxels, view, lighting) in scenes {
+        let frames = render_frames(checks.app, Scene::new(voxels, lighting), view, 16)?;
+        if frames.is_empty() {
+            return Err(CANT_CAPTURE);
+        }
+        let (mean_change, big) = flicker(&frames);
+        checks.expect(
+            format!(
+                "bounced light changes {} a frame{how}, {} of pixels by over 10%",
+                percent(mean_change, 2),
+                percent(big, 2)
+            ),
+            mean_change <= FLICKER && big <= FLICKERING_PIXELS,
+            "it flickers",
         );
     }
     Ok(())
@@ -793,9 +934,11 @@ fn cascades(checks: &mut Checks) -> VkResult<()> {
 }
 
 /// Every check, in the order they run.
-const CHECKS: [fn(&mut Checks) -> VkResult<()>; 10] = [
+const CHECKS: [fn(&mut Checks) -> VkResult<()>; 12] = [
     sky_floor,
     sealed_box,
+    sealed_hall,
+    steady_light,
     holed_box,
     lit_box,
     shadowed_light,

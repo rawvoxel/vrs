@@ -129,46 +129,72 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
     float3 position = world.xyz / world.w;
     float3 camera = uniforms.cameraPosition;
     float distance = length(position - camera);
-    // Rays start just off the surface toward the camera, which is always on its open side.
     float3 toCamera = (camera - position) / max(distance, 1e-6);
+    float3 view = -toCamera;
     float3 onSurface = toGrid(position);
-    float3 gridPosition = onSurface + toCamera * SHADOW_RAY_OFFSET;
+    bool hasGrid = uniforms.lighting.gridLevels > 0;
+
+    // The voxel the pixel shows and the face it's seen through, see-through ones too, found by
+    // a short ray from in front of it. The depth buffer only places the surface roughly, more
+    // so further away, so rays start just off this face instead, past no voxel. Near a
+    // concave edge, a voxel back toward the camera can be inside the edge's other face, then
+    // a quarter voxel back is the empty cell in front of this one.
+    VoxelHit surface;
+    float3 onFace = float3(0.0);
+    bool found = false;
+    if (hasGrid) {
+        for (int attempt = 0; attempt < 2 && !found; attempt++) {
+            float back = attempt == 0 ? 1.0 : 0.25;
+            float3 start = onSurface - view * back;
+            found = traceVoxels(start, view, back + 1.0, false, true, surface) && surface.distance > 0.0;
+            onFace = start + view * surface.distance;
+        }
+    }
+    // Where rays toward the sun and the lights start: just off the face, else just off the
+    // surface toward the camera, which is always on its open side, skipping any voxels that's
+    // still in.
+    float3 rayOrigin = found
+        ? onFace + surface.normal * SHADOW_RAY_OFFSET
+        : onSurface + toCamera * SHADOW_RAY_OFFSET;
 
     float3 visible = float3(1.0);
-    if (uniforms.lighting.gridLevels > 0) {
-        visible = sunVisibility(gridPosition, uniforms.lighting.sunDirection);
+    if (hasGrid) {
+        VoxelHit hit;
+        bool blocked = traceVoxels(rayOrigin, uniforms.lighting.sunDirection, uniforms.lighting.traceDistance, !found, false, hit);
+        visible = blocked ? float3(0.0) : hit.transmittance;
     }
     shadowsStorage[threadId.xy] = float4(visible, distance);
 
-    // The voxel the pixel shows and the face it's seen through, see-through ones too, found by
-    // a short ray from just in front of it, then the light reaching that face from everywhere
-    // but the sun, and what it reflects when it's glossy.
+    // The light reaching the face from everywhere but the sun, and what it reflects when it's
+    // glossy. Without the face, the light reaching the surface as if facing the camera along
+    // the axis nearest, rather than shading falling back on the sky's, which indoors is far
+    // too bright.
     float4 reflection = float4(0.0);
     float4 indirect = float4(0.0);
-    bool lightsIndirect = uniforms.tracedIndirect != 0;
-    if ((uniforms.trace.traceReflections != 0 || lightsIndirect) && uniforms.lighting.gridLevels > 0) {
-        float3 view = -toCamera;
-        float3 start = onSurface - view;
-        VoxelHit surface;
-        if (traceVoxels(start, view, 2.0, false, true, surface) && surface.distance > 0.0) {
-            float3 onFace = start + view * surface.distance;
-            float face = float(faceNumber(surface.normal));
-            if (lightsIndirect) {
-                float3 light = indirectLight(onFace, surface.normal, toCamera, false);
-                // Only axis aligned faces are darkened, as when each pixel finds its own.
-                float occlusionStrength = uniforms.lighting.ambientOcclusion;
-                if (occlusionStrength > 0.0 && meshes[surface.mesh].kind == KIND_AXIS_ALIGNED) {
-                    float3 inLevel = onFace / float(1 << surface.level);
-                    light *= lerp(1.0, gridOpenness(surface.level, inLevel, int3(surface.normal)), occlusionStrength);
-                }
-                indirect = float4(light, face);
+    if (!found && hasGrid && uniforms.tracedIndirect != 0) {
+        float3 along = abs(toCamera);
+        float3 axis = along.x > along.y && along.x > along.z ? float3(1.0, 0.0, 0.0)
+            : along.y > along.z ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0);
+        float3 normal = axis * sign(dot(axis, toCamera));
+        float3 light = indirectLight(onSurface, normal, toCamera, false);
+        indirect = float4(light, float(faceNumber(normal)));
+    }
+    if (found) {
+        float face = float(faceNumber(surface.normal));
+        if (uniforms.tracedIndirect != 0) {
+            float3 light = indirectLight(onFace, surface.normal, toCamera, false);
+            // Only axis aligned faces are darkened, as when each pixel finds its own.
+            float occlusionStrength = uniforms.lighting.ambientOcclusion;
+            if (occlusionStrength > 0.0 && meshes[surface.mesh].kind == KIND_AXIS_ALIGNED) {
+                float3 inLevel = onFace / float(1 << surface.level);
+                light *= lerp(1.0, gridOpenness(surface.level, inLevel, int3(surface.normal)), occlusionStrength);
             }
-            Material material = materialOf(surface.id);
-            if (uniforms.trace.traceReflections != 0 && material.colorRoughness.w < GLOSSY_ROUGHNESS) {
-                float3 onSurface = onFace + surface.normal * SHADOW_RAY_OFFSET;
-                float3 reflected = radianceAlong(onSurface, reflect(view, surface.normal), uniforms.lighting.traceDistance);
-                reflection = float4(reflected, face);
-            }
+            indirect = float4(light, face);
+        }
+        Material material = materialOf(surface.id);
+        if (uniforms.trace.traceReflections != 0 && material.colorRoughness.w < GLOSSY_ROUGHNESS) {
+            float3 reflected = radianceAlong(rayOrigin, reflect(view, surface.normal), uniforms.lighting.traceDistance);
+            reflection = float4(reflected, face);
         }
     }
     reflectionsStorage[threadId.xy] = reflection;
@@ -185,7 +211,7 @@ void traceSurfaces(uint3 threadId: SV_DispatchThreadID) {
     }
     uint2 result = NO_SHADOWED_LIGHTS;
     for (uint k = 0; k < shadowed && brightest.lights[k] != NO_LIGHT; k++) {
-        float lit = lightShadow(lights[brightest.lights[k]], gridPosition);
+        float lit = lightShadow(lights[brightest.lights[k]], rayOrigin);
         result.x = (result.x & ~(NO_LIGHT << (k * 8))) | (brightest.lights[k] << (k * 8));
         result.y |= uint(round(saturate(lit) * 255.0)) << (k * 8);
     }
