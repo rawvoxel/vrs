@@ -27,10 +27,27 @@ impl Renderer {
         indices: &[Index],
         vertices: &[Vertex],
     ) -> VkResult<MeshId> {
-        let vertex_words: Vec<u32> = vertices.iter().flat_map(Vertex::words).collect();
+        let (vertex_words, bounds) = colored_words(vertices);
+        self.add_colored_mesh(indices, &vertex_words, bounds)
+    }
+
+    /// [`Self::create_colored_mesh`] for a mesh `prepared` already, on any thread.
+    pub fn add_prepared_colored_mesh(
+        &mut self,
+        prepared: &PreparedColoredMesh,
+    ) -> VkResult<MeshId> {
+        self.add_colored_mesh(&prepared.indices, &prepared.vertex_words, prepared.bounds)
+    }
+
+    fn add_colored_mesh(
+        &mut self,
+        indices: &[Index],
+        vertex_words: &[u32],
+        bounds: (Vec3, Vec3),
+    ) -> VkResult<MeshId> {
         self.add_mesh(&NewMesh {
             kind: MeshKind::Colored,
-            vertex_words: &vertex_words,
+            vertex_words,
             indices,
             type_words: &[],
             occupancy: &[],
@@ -39,7 +56,7 @@ impl Renderer {
             origin: Vec3::ZERO,
             scale: 1.0,
             voxels_per_edge: 0,
-            bounds: bounds(vertices.iter().map(|vertex| Vec3::from(vertex.position))),
+            bounds,
         })
     }
 
@@ -48,36 +65,42 @@ impl Renderer {
     ///
     /// See `add_mesh` for when this stalls or fails.
     pub fn create_chunk_mesh(&mut self, chunk: &ChunkMesh) -> VkResult<MeshId> {
-        let edge = chunk.types.voxels_per_edge();
-        // Only axis aligned faces lie exactly in a chunk's sides, to tell which voxels have
-        // faces out of it.
-        let (kind, vertex_words, boundary_faces) = match chunk.vertices {
-            ChunkVertices::AxisAligned(vertices) => (
-                MeshKind::AxisAligned,
-                slice_as_words(vertices),
-                boundary_faces(edge, vertices, chunk.indices),
-            ),
-            ChunkVertices::Packed(vertices) => {
-                (MeshKind::Packed, slice_as_words(vertices), Vec::new())
+        self.add_prepared_chunk(chunk, &PreparedChunk::new(chunk))
+    }
+
+    /// [`Self::create_chunk_mesh`] for a chunk whose `prepared` was worked out already, on
+    /// any thread.
+    ///
+    /// # Panics
+    /// If `prepared` wasn't made from `chunk`'s own vertices and types.
+    pub fn add_prepared_chunk(
+        &mut self,
+        chunk: &ChunkMesh,
+        prepared: &PreparedChunk,
+    ) -> VkResult<MeshId> {
+        let (kind, vertex_words) = match chunk.vertices {
+            ChunkVertices::AxisAligned(vertices) => {
+                (MeshKind::AxisAligned, slice_as_words(vertices))
             }
+            ChunkVertices::Packed(vertices) => (MeshKind::Packed, slice_as_words(vertices)),
         };
-        let positions = vertex_words
-            .chunks_exact(kind.words_per_vertex() as usize)
-            .map(|words| {
-                chunk.origin + unpack_position(words[0], words[1], edge) * chunk.voxel_size
-            });
+        assert_eq!(
+            prepared.vertices,
+            chunk.vertices.len(),
+            "a chunk prepared from other vertices"
+        );
         self.add_mesh(&NewMesh {
             kind,
             vertex_words,
             indices: chunk.indices,
             type_words: chunk.types.words(),
-            occupancy: &chunk.types.occupancy(),
-            probes: &bake_probe_cells(chunk.types),
-            boundary_faces: &boundary_faces,
+            occupancy: &prepared.occupancy,
+            probes: &prepared.probes,
+            boundary_faces: &prepared.boundary_faces,
             origin: chunk.origin,
             scale: chunk.voxel_size,
-            voxels_per_edge: edge,
-            bounds: bounds(positions),
+            voxels_per_edge: chunk.types.voxels_per_edge(),
+            bounds: prepared.bounds,
         })
     }
 
@@ -150,6 +173,83 @@ impl Renderer {
                 .create(&self.adapter, &self.device, frame, new)
         }
     }
+}
+
+/// What the renderer works out from a chunk before uploading it: its occupancy, its light
+/// probes' cells, the voxels along its sides with faces out of it, and its bounds. Pure, so a
+/// host can make it on any thread and add the chunk with `Renderer::add_prepared_chunk`.
+#[derive(Clone, Debug)]
+pub struct PreparedChunk {
+    occupancy: Vec<u32>,
+    probes: Vec<u32>,
+    boundary_faces: Vec<u32>,
+    bounds: (Vec3, Vec3),
+    /// The chunk's vertex count, to catch one prepared from other vertices.
+    vertices: usize,
+}
+
+impl PreparedChunk {
+    pub fn new(chunk: &ChunkMesh) -> Self {
+        let edge = chunk.types.voxels_per_edge();
+        // Only axis aligned faces lie exactly in a chunk's sides, to tell which voxels have
+        // faces out of it.
+        let (kind, vertex_words, boundary_faces) = match chunk.vertices {
+            ChunkVertices::AxisAligned(vertices) => (
+                MeshKind::AxisAligned,
+                slice_as_words(vertices),
+                boundary_faces(edge, vertices, chunk.indices),
+            ),
+            ChunkVertices::Packed(vertices) => {
+                (MeshKind::Packed, slice_as_words(vertices), Vec::new())
+            }
+        };
+        let positions = vertex_words
+            .chunks_exact(kind.words_per_vertex() as usize)
+            .map(|words| {
+                chunk.origin + unpack_position(words[0], words[1], edge) * chunk.voxel_size
+            });
+        Self {
+            occupancy: chunk.types.occupancy(),
+            probes: bake_probe_cells(chunk.types),
+            boundary_faces,
+            bounds: bounds(positions),
+            vertices: chunk.vertices.len(),
+        }
+    }
+}
+
+/// A mesh with colors of its own as the renderer uploads it: its indices, its vertices in the
+/// GPU's words, and its bounds. Pure, so a host can make it on any thread and add it with
+/// `Renderer::add_prepared_colored_mesh`.
+#[derive(Clone, Debug)]
+pub struct PreparedColoredMesh {
+    indices: Vec<Index>,
+    vertex_words: Vec<u32>,
+    bounds: (Vec3, Vec3),
+}
+
+impl PreparedColoredMesh {
+    pub fn new(indices: Vec<Index>, vertices: &[Vertex]) -> Self {
+        let (vertex_words, bounds) = colored_words(vertices);
+        Self {
+            indices,
+            vertex_words,
+            bounds,
+        }
+    }
+
+    /// Whether it draws nothing.
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+}
+
+/// A colored mesh's vertices as the GPU's words, and their bounds.
+fn colored_words(vertices: &[Vertex]) -> (Vec<u32>, (Vec3, Vec3)) {
+    (
+        vertices.iter().flat_map(Vertex::words).collect(),
+        bounds(vertices.iter().map(|vertex| Vec3::from(vertex.position))),
+    )
 }
 
 /// The box around `positions`, zero sized at the origin when there are none.

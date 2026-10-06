@@ -110,8 +110,8 @@ drop(renderer);
   from the reflected direction as they get rougher. The sun's and the lights' highlights are
   added on top.
 - **Global illumination**: with `RendererConfig::global_illumination`, or
-  `Renderer::set_probe_config` while running, a volume of light probes 16 voxels apart
-  follows the camera, and lights chunks inside it with light bounced
+  `Renderer::set_probe_config` while running, taking `ProbeConfig::device_bytes` of memory, a
+  volume of light probes 16 voxels apart follows the camera, and lights chunks inside it with light bounced
   off the voxels around them, in place of the sky and ground colors. `ProbeConfig::spacing`
   sets them further apart, by a power of two, for small voxels. With
   `ProbeConfig::cascades`, further volumes follow it too, each with probes twice as far apart,

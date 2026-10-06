@@ -21,7 +21,9 @@ pub use lighting::{
     PROBE_CELL, ProbeConfig, ProbeTuning, Sky, Spot, Tonemapping, TraceResolution, VoxelGrid,
 };
 pub use material::Material;
-pub use mesh_pool::{MeshCapacity, MeshKind, MeshPoolStats, MeshRecord};
+pub use mesh_pool::{
+    MeshCapacity, MeshKind, MeshPoolStats, MeshRecord, PreparedChunk, PreparedColoredMesh,
+};
 pub use timings::{GpuStage, GpuTimings};
 
 use crate::{

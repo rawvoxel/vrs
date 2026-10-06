@@ -27,7 +27,7 @@ pub const MAX_CASCADES: u32 = 4;
 pub struct ProbeConfig {
     /// Probes along each axis of each cascade, which is centered on the camera with probes
     /// `spacing` apart in the first, and twice as far apart in each next. Each probe takes
-    /// about 2.9 KB.
+    /// about 3.4 KB, see `device_bytes`.
     pub probe_counts: [u32; 3],
     /// The `VoxelGrid`'s finest voxels between the first cascade's neighboring probes:
     /// `PROBE_CELL`, or that times a power of two, rounded down to one. Probes `PROBE_CELL`
@@ -53,6 +53,21 @@ impl Default for ProbeConfig {
             cascades: 1,
             rays_per_frame: 1 << 16,
         }
+    }
+}
+
+impl ProbeConfig {
+    /// Probes in every cascade, as the renderer makes them: at least one along each axis, in
+    /// 1 to `MAX_CASCADES` cascades.
+    pub fn probe_count(&self) -> u32 {
+        let counts = self.probe_counts.map(|count| count.max(1));
+        counts.iter().product::<u32>() * self.cascades.clamp(1, MAX_CASCADES)
+    }
+
+    /// Bytes of device memory the probes take: their light and distance atlases, and their
+    /// buffers and rays.
+    pub fn device_bytes(&self) -> u64 {
+        volume::device_bytes(self.probe_count(), self.rays_per_frame)
     }
 }
 
@@ -290,4 +305,19 @@ fn random_rotation(seed: u64) -> Quat {
         b * (tau * u3).sin(),
         b * (tau * u3).cos(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_probes_device_bytes() {
+        // 16 Ki probes in 128 by 128 tiles of 10 and 16 texels a side, 8 bytes each, 32 bytes
+        // each, 512 Ki rays of 16 bytes, 32 of them each, and an active list of 8 words and
+        // one each.
+        let atlases = 1280 * 1280 * 8 + 2048 * 2048 * 8;
+        let buffers = 16384 * 32 + 524_288 * 16 + (8 + 16384) * 4;
+        assert_eq!(ProbeConfig::default().device_bytes(), atlases + buffers);
+    }
 }

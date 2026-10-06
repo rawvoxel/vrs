@@ -9,6 +9,7 @@ mod repack;
 mod staging;
 mod stats;
 
+pub use lifecycle::{PreparedChunk, PreparedColoredMesh};
 pub(crate) use record::MeshInfo;
 pub use record::{MeshKind, MeshRecord};
 pub use stats::MeshPoolStats;

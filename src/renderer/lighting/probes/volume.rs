@@ -19,8 +19,9 @@ const PROBE_UPDATE_SPV: &[u8] = include_bytes!("../../../../assets/shader/probe_
 /// Match `IRRADIANCE_TEXELS` and `DISTANCE_TEXELS` in `common/probes.slang`.
 const IRRADIANCE_TEXELS: u32 = 8;
 const DISTANCE_TEXELS: u32 = 14;
-/// Base storage formats every device supports.
+/// Base storage formats every device supports, and its bytes a texel.
 const ATLAS_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+const ATLAS_TEXEL_BYTES: vk::DeviceSize = 8;
 /// Matches `Probe` in `common/layout.slang`.
 const PROBE_SIZE: vk::DeviceSize = 32;
 /// The fewest rays a probe traces in a frame, however many probes share the budget. Matches
@@ -36,6 +37,35 @@ const ACTIVE_LIST: vk::DeviceSize = 8;
 const UPDATE_GROUPS: vk::DeviceSize = 3 * size_of::<u32>() as vk::DeviceSize;
 /// A probe cell that no probe holds, so every probe is placed on the first frame.
 const UNPLACED: u32 = 0x8000_0000;
+
+/// Probes along and down the atlases: nearly square, so they fit the smallest image limits
+/// for longer.
+fn atlas_layout(probes: u32) -> (u32, u32) {
+    let columns = (probes as f64).sqrt().ceil() as u32;
+    (columns, probes.div_ceil(columns))
+}
+
+/// Rays the ray buffer holds for `probes` probes: the budget, or the fewest rays each when
+/// there are more active probes than it covers.
+fn ray_capacity(probes: vk::DeviceSize, rays_per_frame: u32) -> vk::DeviceSize {
+    (rays_per_frame as vk::DeviceSize).max(probes * MIN_RAYS_PER_PROBE)
+}
+
+/// Bytes of device memory `probes` probes take, tracing `rays_per_frame` rays a frame: their
+/// buffers and atlases, as `ProbeVolume::new` makes them, see `ProbeConfig::device_bytes`.
+pub(super) fn device_bytes(probes: u32, rays_per_frame: u32) -> vk::DeviceSize {
+    let (columns, rows) = atlas_layout(probes);
+    let atlas = |texels: u32| {
+        let tile = (texels + 2) as vk::DeviceSize;
+        columns as vk::DeviceSize * tile * rows as vk::DeviceSize * tile * ATLAS_TEXEL_BYTES
+    };
+    let probes = probes as vk::DeviceSize;
+    probes * PROBE_SIZE
+        + ray_capacity(probes, rays_per_frame) * size_of::<[f32; 4]>() as vk::DeviceSize
+        + (ACTIVE_LIST + probes) * size_of::<u32>() as vk::DeviceSize
+        + atlas(IRRADIANCE_TEXELS)
+        + atlas(DISTANCE_TEXELS)
+}
 
 /// A probe volume's buffers, atlases and compute pipelines.
 ///
@@ -141,10 +171,8 @@ impl ProbeVolume {
             probes * PROBE_SIZE,
             vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
         )?;
-        // The budget, or the fewest rays each when there are more active probes than it covers.
-        let rays = (self.rays_per_frame as vk::DeviceSize).max(probes * MIN_RAYS_PER_PROBE);
         self.ray_buffer = storage_buffer(
-            rays * size_of::<[f32; 4]>() as vk::DeviceSize,
+            ray_capacity(probes, self.rays_per_frame) * size_of::<[f32; 4]>() as vk::DeviceSize,
             vk::BufferUsageFlags::empty(),
         )?;
         self.active_buffer = storage_buffer(
@@ -152,9 +180,8 @@ impl ProbeVolume {
             vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         )?;
 
-        // Nearly square atlases, so they fit the smallest image limits for longer.
-        self.atlas_columns = (probes as f64).sqrt().ceil() as u32;
-        let rows = (probes as u32).div_ceil(self.atlas_columns);
+        let rows;
+        (self.atlas_columns, rows) = atlas_layout(probes as u32);
         let max_dimension = adapter.properties.limits.max_image_dimension2_d;
         if self.atlas_columns.max(rows) * (DISTANCE_TEXELS + 2) > max_dimension {
             return Err(vk::Result::ERROR_FORMAT_NOT_SUPPORTED);
