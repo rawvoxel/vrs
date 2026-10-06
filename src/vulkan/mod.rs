@@ -8,6 +8,7 @@ pub(crate) mod bytes;
 pub mod commands;
 pub mod compute;
 pub mod descriptors;
+pub mod gpu;
 pub mod image;
 pub(crate) mod pipeline;
 pub mod queue;
