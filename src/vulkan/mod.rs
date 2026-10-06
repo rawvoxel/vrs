@@ -6,6 +6,7 @@ pub mod alloc;
 pub mod buffer;
 pub(crate) mod bytes;
 pub mod commands;
+pub mod compute;
 pub mod descriptors;
 pub mod image;
 pub(crate) mod pipeline;
