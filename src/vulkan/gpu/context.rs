@@ -10,6 +10,8 @@ use crate::{
 use ash::{ext, khr, prelude::VkResult, vk};
 use std::{ffi::CStr, slice, sync::Mutex};
 
+mod shared;
+
 /// What a [`GpuContext`] is made for, beyond compute and mesh-shader rasterization.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuOptions {
@@ -77,7 +79,7 @@ impl GpuContext {
     /// Makes the device on `adapter`. `app` must have been made with Vulkan 1.3 or later, and
     /// with a window when `options.present` is set.
     pub fn new(app: &App, adapter: &Adapter, options: GpuOptions) -> VkResult<Self> {
-        let support = query_support(app, adapter);
+        let support = query_support(app.instance(), adapter);
         if !support.missing.is_empty() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
@@ -147,7 +149,7 @@ impl GpuContext {
         adapter: &Adapter,
         options: GpuOptions,
     ) -> Vec<&'static str> {
-        let mut missing = query_support(app, adapter).missing;
+        let mut missing = query_support(app.instance(), adapter).missing;
         if pick_queue_family(app, adapter, options).is_none() {
             missing.push(if options.present {
                 "a graphics and compute queue that can present to the window"
@@ -155,7 +157,7 @@ impl GpuContext {
                 "a graphics and compute queue"
             });
         }
-        if options.present && !has_extension(app, adapter, khr::swapchain::NAME) {
+        if options.present && !has_extension(app.instance(), adapter, khr::swapchain::NAME) {
             missing.push("VK_KHR_swapchain");
         }
         missing
@@ -284,9 +286,9 @@ fn create_immediate(device: &ash::Device, queue_family: &QueueFamily) -> VkResul
     }
 }
 
-fn has_extension(app: &App, adapter: &Adapter, name: &CStr) -> bool {
+fn has_extension(instance: &ash::Instance, adapter: &Adapter, name: &CStr) -> bool {
     unsafe {
-        app.instance()
+        instance
             .enumerate_device_extension_properties(adapter.handle())
             .map(|extensions| {
                 extensions
@@ -297,8 +299,7 @@ fn has_extension(app: &App, adapter: &Adapter, name: &CStr) -> bool {
     }
 }
 
-fn query_support(app: &App, adapter: &Adapter) -> Support {
-    let instance = app.instance();
+fn query_support(instance: &ash::Instance, adapter: &Adapter) -> Support {
     let mut missing = Vec::new();
 
     let api_version = adapter.properties().api_version;
@@ -309,7 +310,7 @@ fn query_support(app: &App, adapter: &Adapter) -> Support {
     {
         missing.push("Vulkan 1.3");
     }
-    let mesh_extension = has_extension(app, adapter, ext::mesh_shader::NAME);
+    let mesh_extension = has_extension(instance, adapter, ext::mesh_shader::NAME);
     if !mesh_extension {
         missing.push("VK_EXT_mesh_shader");
     }
