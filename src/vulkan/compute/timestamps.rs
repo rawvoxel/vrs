@@ -86,11 +86,18 @@ impl TimestampPool {
     /// Each timestamp's ticks, or `None` for one that wasn't written. Call once the device is
     /// done with the command buffer that wrote them.
     pub fn read_ticks(&self, device: &ash::Device) -> Vec<Option<u64>> {
-        if !self.is_recording() {
+        self.read_first_ticks(device, self.count)
+    }
+
+    /// The first `count` timestamps' ticks (at most all of them), as [`TimestampPool::read_ticks`]:
+    /// those a submission wrote, when it wrote them in order from the first.
+    pub fn read_first_ticks(&self, device: &ash::Device, count: u32) -> Vec<Option<u64>> {
+        let count = count.min(self.count);
+        if !self.is_recording() || count == 0 {
             return Vec::new();
         }
         // Each timestamp, then whether it was written.
-        let mut results = vec![[0u64; 2]; self.count as usize];
+        let mut results = vec![[0u64; 2]; count as usize];
         // Timestamps that weren't written make it not ready, but every result is still filled in
         // with whether it was.
         let read = unsafe {
@@ -102,7 +109,7 @@ impl TimestampPool {
             )
         };
         if !matches!(read, Ok(()) | Err(vk::Result::NOT_READY)) {
-            return vec![None; self.count as usize];
+            return vec![None; count as usize];
         }
         let mask = if self.valid_bits >= 64 {
             u64::MAX

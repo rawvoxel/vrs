@@ -29,6 +29,42 @@ impl ComputePipelines {
         cache: &PipelineCache,
         required_subgroup_size: Option<u32>,
     ) -> VkResult<Self> {
+        Self::specialized(
+            device,
+            words,
+            entry_points,
+            push_constant_size,
+            cache,
+            required_subgroup_size,
+            &[],
+        )
+    }
+
+    /// [`ComputePipelines::new`], every pipeline with the module's specialization constants
+    /// `constants` set: each `(id, value)` a 32-bit constant (a `bool`'s `VkBool32`, a `uint`).
+    pub fn specialized(
+        device: &ash::Device,
+        words: &[u32],
+        entry_points: &[&CStr],
+        push_constant_size: u32,
+        cache: &PipelineCache,
+        required_subgroup_size: Option<u32>,
+        constants: &[(u32, u32)],
+    ) -> VkResult<Self> {
+        let entries: Vec<vk::SpecializationMapEntry> = constants
+            .iter()
+            .enumerate()
+            .map(|(index, &(id, _))| {
+                vk::SpecializationMapEntry::default()
+                    .constant_id(id)
+                    .offset(4 * index as u32)
+                    .size(4)
+            })
+            .collect();
+        let values: Vec<u32> = constants.iter().map(|&(_, value)| value).collect();
+        let specialization = vk::SpecializationInfo::default()
+            .map_entries(&entries)
+            .data(crate::vulkan::bytes::slice_as_bytes(&values));
         let module_info = vk::ShaderModuleCreateInfo::default().code(words);
         let module = unsafe { device.create_shader_module(&module_info, None)? };
 
@@ -65,6 +101,9 @@ impl ComputePipelines {
                     .stage(vk::ShaderStageFlags::COMPUTE)
                     .module(module)
                     .name(name);
+                if !constants.is_empty() {
+                    stage = stage.specialization_info(&specialization);
+                }
                 if required_subgroup_size.is_some() {
                     stage = stage.push_next(subgroup_size);
                 } else {
