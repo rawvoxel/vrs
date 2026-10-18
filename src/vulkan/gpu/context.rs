@@ -57,6 +57,26 @@ pub struct GpuContext {
     subgroup: SubgroupProperties,
     mesh_limits: MeshShaderLimits,
     options: GpuOptions,
+    /// The `VK_KHR_pipeline_executable_properties` commands, where the adapter has them.
+    pipeline_executables: Option<khr::pipeline_executable_properties::Device>,
+    /// Whether shaders may read the subgroup's and the device's clocks (`VK_KHR_shader_clock`).
+    shader_clock: bool,
+    /// The instance, kept for [`GpuContext::memory_budget`] where the adapter reports budgets.
+    budget: Option<ash::Instance>,
+}
+
+/// The instance to read `physical_device`'s memory budgets through, if it reports them
+/// (`VK_EXT_memory_budget`).
+pub(super) fn budget_instance(
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+) -> Option<ash::Instance> {
+    let extensions =
+        unsafe { instance.enumerate_device_extension_properties(physical_device) }.ok()?;
+    extensions
+        .iter()
+        .any(|extension| extension.extension_name_as_c_str() == Ok(ext::memory_budget::NAME))
+        .then(|| instance.clone())
 }
 
 /// A command buffer and fence for one-off submissions.
@@ -94,6 +114,14 @@ impl GpuContext {
         if options.present {
             extensions.push(khr::swapchain::NAME.as_ptr());
         }
+        let pipeline_executables = pipeline_executables_supported(app.instance(), adapter);
+        if pipeline_executables {
+            extensions.push(khr::pipeline_executable_properties::NAME.as_ptr());
+        }
+        let shader_clock = shader_clock_supported(app.instance(), adapter);
+        if shader_clock {
+            extensions.push(khr::shader_clock::NAME.as_ptr());
+        }
         let features = vk::PhysicalDeviceFeatures::default()
             .shader_int64(true)
             .fragment_stores_and_atomics(true);
@@ -112,13 +140,25 @@ impl GpuContext {
             .task_shader(true)
             .mesh_shader(true)
             .mesh_shader_queries(support.mesh_shader_queries);
-        let device_info = vk::DeviceCreateInfo::default()
+        let mut executable_features =
+            vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+                .pipeline_executable_info(true);
+        let mut device_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(slice::from_ref(&queue_info))
             .enabled_extension_names(&extensions)
             .enabled_features(&features)
             .push_next(&mut vulkan_12_features)
             .push_next(&mut vulkan_13_features)
             .push_next(&mut mesh_features);
+        if pipeline_executables {
+            device_info = device_info.push_next(&mut executable_features);
+        }
+        let mut clock_features = vk::PhysicalDeviceShaderClockFeaturesKHR::default()
+            .shader_subgroup_clock(true)
+            .shader_device_clock(true);
+        if shader_clock {
+            device_info = device_info.push_next(&mut clock_features);
+        }
         let device = unsafe {
             app.instance()
                 .create_device(adapter.handle(), &device_info, None)?
@@ -130,6 +170,8 @@ impl GpuContext {
                 return Err(error);
             }
         };
+        let pipeline_executables = pipeline_executables
+            .then(|| khr::pipeline_executable_properties::Device::new(app.instance(), &device));
         Ok(Self {
             adapter: adapter.clone(),
             mesh_shader: ext::mesh_shader::Device::new(app.instance(), &device),
@@ -140,6 +182,9 @@ impl GpuContext {
             subgroup: support.subgroup,
             mesh_limits: support.mesh_limits,
             options,
+            pipeline_executables,
+            shader_clock,
+            budget: budget_instance(app.instance(), adapter.handle()),
         })
     }
 
@@ -173,6 +218,21 @@ impl GpuContext {
         &self.device
     }
 
+    /// The `VK_KHR_pipeline_executable_properties` commands, where the adapter has them: what
+    /// the driver compiled a pipeline into (its registers, its shared memory), for pipelines made
+    /// to capture it ([`ComputePipelines::capturing_statistics`](crate::vulkan::compute::ComputePipelines::capturing_statistics)).
+    #[inline]
+    pub fn pipeline_executables(&self) -> Option<&khr::pipeline_executable_properties::Device> {
+        self.pipeline_executables.as_ref()
+    }
+
+    /// Whether shaders may read the subgroup's and the device's clocks (`VK_KHR_shader_clock`,
+    /// enabled where the adapter has it): for instrumented builds that time their own phases.
+    #[inline]
+    pub fn shader_clock(&self) -> bool {
+        self.shader_clock
+    }
+
     /// The `VK_EXT_mesh_shader` commands: `cmd_draw_mesh_tasks` and its indirect forms.
     #[inline]
     pub fn mesh_shader(&self) -> &ext::mesh_shader::Device {
@@ -187,6 +247,28 @@ impl GpuContext {
     #[inline]
     pub fn subgroup(&self) -> SubgroupProperties {
         self.subgroup
+    }
+
+    /// Each memory heap's budget and what this process uses of it, in bytes, as the driver says
+    /// now (`VK_EXT_memory_budget`: the budget allows for other processes); `None` where the
+    /// adapter doesn't report them.
+    pub fn memory_budget(&self) -> Option<Vec<(u64, u64)>> {
+        let instance = self.budget.as_ref()?;
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let heaps = {
+            let mut properties =
+                vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe {
+                instance
+                    .get_physical_device_memory_properties2(self.adapter.handle(), &mut properties)
+            };
+            properties.memory_properties.memory_heap_count as usize
+        };
+        Some(
+            (0..heaps)
+                .map(|heap| (budget.heap_budget[heap], budget.heap_usage[heap]))
+                .collect(),
+        )
     }
 
     #[inline]
@@ -284,6 +366,35 @@ fn create_immediate(device: &ash::Device, queue_family: &QueueFamily) -> VkResul
             Err(error)
         }
     }
+}
+
+/// Whether `adapter`'s shaders can read the subgroup's and the device's clocks
+/// (`VK_KHR_shader_clock`, both of its features).
+fn shader_clock_supported(instance: &ash::Instance, adapter: &Adapter) -> bool {
+    if !has_extension(instance, adapter, khr::shader_clock::NAME) {
+        return false;
+    }
+    let mut clock_features = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
+    {
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut clock_features);
+        unsafe { instance.get_physical_device_features2(adapter.handle(), &mut features) };
+    }
+    clock_features.shader_subgroup_clock == vk::TRUE && clock_features.shader_device_clock == vk::TRUE
+}
+
+/// Whether `adapter`'s driver tells what it compiled a pipeline into
+/// (`VK_KHR_pipeline_executable_properties`, with `pipelineExecutableInfo`).
+fn pipeline_executables_supported(instance: &ash::Instance, adapter: &Adapter) -> bool {
+    if !has_extension(instance, adapter, khr::pipeline_executable_properties::NAME) {
+        return false;
+    }
+    let mut executable_features =
+        vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
+    {
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut executable_features);
+        unsafe { instance.get_physical_device_features2(adapter.handle(), &mut features) };
+    }
+    executable_features.pipeline_executable_info == vk::TRUE
 }
 
 fn has_extension(instance: &ash::Instance, adapter: &Adapter, name: &CStr) -> bool {

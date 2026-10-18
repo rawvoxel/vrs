@@ -20,5 +20,7 @@ mod timestamps;
 
 pub use buffer::{AddressedBuffer, HostAccess, HostBuffer};
 pub use context::{ComputeContext, SubgroupProperties};
-pub use pipeline::{ComputePipelines, PipelineCache, pipeline_cache_key};
+pub use pipeline::{
+    ComputePipelines, PipelineCache, PipelineRepresentation, PipelineStatistic, pipeline_cache_key,
+};
 pub use timestamps::TimestampPool;
