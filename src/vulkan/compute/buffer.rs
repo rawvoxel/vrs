@@ -274,10 +274,7 @@ fn create(
     required: vk::MemoryPropertyFlags,
     preferred: vk::MemoryPropertyFlags,
 ) -> VkResult<(vk::Buffer, vk::DeviceMemory, vk::MemoryPropertyFlags)> {
-    let buffer_info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(usage)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer_info = adapter.sharing(vk::BufferCreateInfo::default().size(size).usage(usage));
     let handle = unsafe { device.create_buffer(&buffer_info, None)? };
     let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
     let memory_type_index = find_memory_type(adapter, requirements, required, preferred);

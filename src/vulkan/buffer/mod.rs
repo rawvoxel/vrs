@@ -203,10 +203,11 @@ pub fn create_device_local_buffer(
     usage: vk::BufferUsageFlags,
     size: vk::DeviceSize,
 ) -> VkResult<Buffer> {
-    let info = vk::BufferCreateInfo::default()
-        .size(size)
-        .usage(usage | vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let info = adapter.sharing(
+        vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage | vk::BufferUsageFlags::TRANSFER_DST),
+    );
 
     Buffer::new(
         adapter,

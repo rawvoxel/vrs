@@ -38,10 +38,7 @@ impl DynamicBuffer {
         memory_flags: vk::MemoryPropertyFlags,
         capacity: vk::DeviceSize,
     ) -> VkResult<Self> {
-        let info = vk::BufferCreateInfo::default()
-            .size(capacity)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = adapter.sharing(vk::BufferCreateInfo::default().size(capacity).usage(usage));
         let mut buffer = Buffer::new(adapter, device, info, memory_flags, 0)?;
         if memory_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
             && let Err(err) = buffer.mem_map(device)

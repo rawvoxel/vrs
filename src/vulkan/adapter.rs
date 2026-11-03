@@ -12,6 +12,11 @@ pub struct Adapter {
     pub(crate) properties: vk::PhysicalDeviceProperties,
     pub(crate) memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub(crate) queue_families: Vec<QueueFamily>,
+    /// The queue families the buffers made with it are used on, when more than one (a
+    /// [`GpuContext`](crate::vulkan::gpu::GpuContext)'s, with a compute queue of its own): they're
+    /// made `CONCURRENT` across them, so each queue reads and writes them with no ownership
+    /// transfer. Empty: `EXCLUSIVE`.
+    pub(crate) shared_by: Vec<u32>,
 }
 impl Adapter {
     #[inline]
@@ -37,6 +42,29 @@ impl Adapter {
     #[inline]
     pub fn queue_families(&self) -> &[QueueFamily] {
         &self.queue_families
+    }
+
+    /// The first family of compute queues without graphics (an async compute queue's) that can
+    /// write timestamps, if it has one.
+    pub fn compute_only_family(&self) -> Option<QueueFamily> {
+        self.queue_families.iter().copied().find(|family| {
+            let properties = family.properties();
+            properties.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                && !properties.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                && properties.queue_count >= 1
+                && properties.timestamp_valid_bits > 0
+        })
+    }
+
+    /// `info` shared across the queue families buffers are used on ([`Adapter::shared_by`]'s):
+    /// `CONCURRENT` across them, or `EXCLUSIVE` with one.
+    pub(crate) fn sharing<'a>(&'a self, info: vk::BufferCreateInfo<'a>) -> vk::BufferCreateInfo<'a> {
+        if self.shared_by.len() > 1 {
+            info.sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(&self.shared_by)
+        } else {
+            info.sharing_mode(vk::SharingMode::EXCLUSIVE)
+        }
     }
 }
 
@@ -64,6 +92,7 @@ impl Adapter {
                 properties,
                 memory_properties,
                 queue_families,
+                shared_by: Vec::new(),
             }
         }
     }

@@ -45,13 +45,18 @@ pub struct MeshShaderLimits {
 /// [`GpuContext::missing_features`] says which.
 ///
 /// The queue is shared: whoever submits goes through [`GpuContext::with_queue`], so submits from
-/// different owners of the context never race.
+/// different owners of the context never race. Where the adapter has a family of compute queues
+/// without graphics, the device has one of them too, for work beside the queue's
+/// ([`GpuContext::with_compute_queue`]); its buffers are then shared by both families
+/// (`CONCURRENT`: [`Adapter`]'s `shared_by`).
 pub struct GpuContext {
     adapter: Adapter,
     device: ash::Device,
     mesh_shader: ext::mesh_shader::Device,
     queue_family: QueueFamily,
     queue: Mutex<Queue>,
+    /// The compute queue's family and the queue, where the device has one.
+    compute: Option<(QueueFamily, Mutex<Queue>)>,
     /// For [`GpuContext::submit_and_wait`].
     immediate: Mutex<Immediate>,
     subgroup: SubgroupProperties,
@@ -105,11 +110,19 @@ impl GpuContext {
         }
         let queue_family = pick_queue_family(app, adapter, options)
             .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let compute_family = adapter.compute_only_family();
 
         let queue_priorities = [1.0];
-        let queue_info = vk::DeviceQueueCreateInfo::default()
+        let mut queue_infos = vec![vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family.index())
-            .queue_priorities(&queue_priorities);
+            .queue_priorities(&queue_priorities)];
+        if let Some(family) = compute_family {
+            queue_infos.push(
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(family.index())
+                    .queue_priorities(&queue_priorities),
+            );
+        }
         let mut extensions = vec![ext::mesh_shader::NAME.as_ptr()];
         if options.present {
             extensions.push(khr::swapchain::NAME.as_ptr());
@@ -144,7 +157,7 @@ impl GpuContext {
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
                 .pipeline_executable_info(true);
         let mut device_info = vk::DeviceCreateInfo::default()
-            .queue_create_infos(slice::from_ref(&queue_info))
+            .queue_create_infos(&queue_infos)
             .enabled_extension_names(&extensions)
             .enabled_features(&features)
             .push_next(&mut vulkan_12_features)
@@ -173,9 +186,11 @@ impl GpuContext {
         let pipeline_executables = pipeline_executables
             .then(|| khr::pipeline_executable_properties::Device::new(app.instance(), &device));
         Ok(Self {
-            adapter: adapter.clone(),
+            adapter: shared_adapter(adapter.clone(), &queue_family, compute_family),
             mesh_shader: ext::mesh_shader::Device::new(app.instance(), &device),
             queue: Mutex::new(Queue::new(&queue_family, &device, 0)),
+            compute: compute_family
+                .map(|family| (family, Mutex::new(Queue::new(&family, &device, 0)))),
             device,
             queue_family,
             immediate: Mutex::new(immediate),
@@ -244,6 +259,12 @@ impl GpuContext {
         self.queue_family
     }
 
+    /// The compute queue's family, where the device has one ([`GpuContext::with_compute_queue`]).
+    #[inline]
+    pub fn compute_queue_family(&self) -> Option<QueueFamily> {
+        self.compute.as_ref().map(|(family, _)| *family)
+    }
+
     #[inline]
     pub fn subgroup(&self) -> SubgroupProperties {
         self.subgroup
@@ -302,6 +323,14 @@ impl GpuContext {
         use_queue(queue.handle())
     }
 
+    /// Runs `use_queue` with the compute queue, which no one else submits to meanwhile; nothing
+    /// without one.
+    pub fn with_compute_queue<R>(&self, use_queue: impl FnOnce(vk::Queue) -> R) -> Option<R> {
+        let (_, queue) = self.compute.as_ref()?;
+        let queue = queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(use_queue(queue.handle()))
+    }
+
     /// Records commands with `record`, submits them and waits until the device has run them.
     pub fn submit_and_wait<F: FnOnce(vk::CommandBuffer)>(&self, record: F) -> VkResult<()> {
         let immediate = self
@@ -344,6 +373,19 @@ impl Drop for GpuContext {
             self.device.destroy_device(None);
         }
     }
+}
+
+/// `adapter` with the buffers made with it shared by `queue_family` and the compute queue's
+/// family (`compute`), where the device has one.
+pub(super) fn shared_adapter(
+    mut adapter: Adapter,
+    queue_family: &QueueFamily,
+    compute: Option<QueueFamily>,
+) -> Adapter {
+    if let Some(compute) = compute {
+        adapter.shared_by = vec![queue_family.index(), compute.index()];
+    }
+    adapter
 }
 
 fn create_immediate(device: &ash::Device, queue_family: &QueueFamily) -> VkResult<Immediate> {

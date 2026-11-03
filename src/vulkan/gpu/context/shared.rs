@@ -1,7 +1,7 @@
 //! A [`GpuContext`] whose device another Vulkan user (such as wgpu) shares: that user describes
 //! the device it needs, the context merges in its own needs, makes the device and owns it.
 
-use super::{GpuContext, GpuOptions, budget_instance, create_immediate, query_support};
+use super::{GpuContext, GpuOptions, budget_instance, create_immediate, query_support, shared_adapter};
 use crate::vulkan::{adapter::Adapter, queue::Queue};
 use ash::{ext, khr, prelude::VkResult, vk};
 use std::{
@@ -15,8 +15,10 @@ impl GpuContext {
     /// the context is dropped.
     ///
     /// `extensions` and `info` are the other user's: its device extensions, and its create info
-    /// with its one queue (whose family must have graphics, compute and timestamps), its enabled
-    /// features and its chain of feature structs. The context's own needs are merged in:
+    /// with its queue first (whose family must have graphics, compute and timestamps), then at
+    /// most one more, the context's compute queue ([`Adapter::compute_only_family`]'s, queue 0),
+    /// its enabled features and its chain of feature structs. The context's own needs are merged
+    /// in:
     /// - a missing extension is appended to `extensions`, which on return lists every extension
     ///   the device has;
     /// - a feature is turned on in the struct of the chain that holds it, the Vulkan 1.2 or 1.3
@@ -38,10 +40,23 @@ impl GpuContext {
     ) -> VkResult<Self> {
         let adapter = Adapter::new(instance, physical_device);
         let support = query_support(instance, &adapter);
-        if !support.missing.is_empty() || info.queue_create_info_count != 1 {
+        if !support.missing.is_empty() || !(1..=2).contains(&info.queue_create_info_count) {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let queue_info = unsafe { &*info.p_queue_create_infos };
+        let queue_infos = unsafe {
+            std::slice::from_raw_parts(info.p_queue_create_infos, info.queue_create_info_count as usize)
+        };
+        let queue_info = &queue_infos[0];
+        // The compute queue, where asked for: its family's queue 0, without graphics.
+        let compute_family = match queue_infos.get(1) {
+            None => None,
+            Some(compute_info) => Some(
+                adapter
+                    .compute_only_family()
+                    .filter(|family| family.index() == compute_info.queue_family_index && compute_info.queue_count >= 1)
+                    .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?,
+            ),
+        };
         let queue_family = adapter
             .queue_families()
             .iter()
@@ -175,7 +190,9 @@ impl GpuContext {
         Ok(Self {
             mesh_shader: ext::mesh_shader::Device::new(instance, &device),
             queue: Mutex::new(Queue::new(&queue_family, &device, 0)),
-            adapter,
+            compute: compute_family
+                .map(|family| (family, Mutex::new(Queue::new(&family, &device, 0)))),
+            adapter: shared_adapter(adapter, &queue_family, compute_family),
             device,
             queue_family,
             immediate: Mutex::new(immediate),
