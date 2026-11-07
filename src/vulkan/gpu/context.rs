@@ -12,35 +12,13 @@ use std::{ffi::CStr, slice, sync::Mutex};
 
 mod shared;
 
-/// What a [`GpuContext`] is made for, beyond compute and mesh-shader rasterization.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GpuOptions {
-    /// Present to the app's window surface: the queue must be able to, and the swapchain
-    /// extension is enabled. The app must have a window.
-    pub present: bool,
-}
-
-/// The mesh-shader limits of a device, for sizing task and mesh workgroups.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MeshShaderLimits {
-    pub max_task_workgroup_invocations: u32,
-    pub max_task_workgroup_total_count: u32,
-    pub max_task_payload_size: u32,
-    pub max_mesh_workgroup_invocations: u32,
-    pub max_mesh_workgroup_total_count: u32,
-    pub max_mesh_output_vertices: u32,
-    pub max_mesh_output_primitives: u32,
-    pub max_preferred_task_workgroup_invocations: u32,
-    pub max_preferred_mesh_workgroup_invocations: u32,
-}
-
 /// A device for GPU-driven rendering on any adapter that has it: compute, and rasterization
 /// through task and mesh shaders, on one queue, with buffers reached by address.
 ///
 /// It has everything a [`ComputeContext`](crate::vulkan::compute::ComputeContext) has (buffer
 /// device addresses, 64-bit integers, timeline semaphores, synchronization2, subgroup size
 /// control with full subgroups), plus task and mesh shaders, 64-bit buffer atomics, stores and
-/// atomics in fragment shaders, dynamic rendering and maintenance4, and optionally a swapchain.
+/// atomics in fragment shaders, dynamic rendering and maintenance4.
 /// Adapters without them are refused with [`vk::Result::ERROR_FEATURE_NOT_PRESENT`];
 /// [`GpuContext::missing_features`] says which.
 ///
@@ -55,8 +33,6 @@ pub struct GpuContext {
     /// For [`GpuContext::submit_and_wait`].
     immediate: Mutex<Immediate>,
     subgroup: SubgroupProperties,
-    mesh_limits: MeshShaderLimits,
-    options: GpuOptions,
     /// The `VK_KHR_pipeline_executable_properties` commands, where the adapter has them.
     pipeline_executables: Option<khr::pipeline_executable_properties::Device>,
     /// Whether shaders may read the subgroup's and the device's clocks (`VK_KHR_shader_clock`).
@@ -92,28 +68,23 @@ struct Support {
     subgroup: SubgroupProperties,
     subgroup_extended_types: bool,
     mesh_shader_queries: bool,
-    mesh_limits: MeshShaderLimits,
 }
 
 impl GpuContext {
-    /// Makes the device on `adapter`. `app` must have been made with Vulkan 1.3 or later, and
-    /// with a window when `options.present` is set.
-    pub fn new(app: &App, adapter: &Adapter, options: GpuOptions) -> VkResult<Self> {
+    /// Makes the device on `adapter`. `app` must have been made with Vulkan 1.3 or later.
+    pub fn new(app: &App, adapter: &Adapter) -> VkResult<Self> {
         let support = query_support(app.instance(), adapter);
         if !support.missing.is_empty() {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
-        let queue_family = pick_queue_family(app, adapter, options)
-            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let queue_family =
+            pick_queue_family(adapter).ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
 
         let queue_priorities = [1.0];
         let queue_info = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family.index())
             .queue_priorities(&queue_priorities);
         let mut extensions = vec![ext::mesh_shader::NAME.as_ptr()];
-        if options.present {
-            extensions.push(khr::swapchain::NAME.as_ptr());
-        }
         let pipeline_executables = pipeline_executables_supported(app.instance(), adapter);
         if pipeline_executables {
             extensions.push(khr::pipeline_executable_properties::NAME.as_ptr());
@@ -180,30 +151,17 @@ impl GpuContext {
             queue_family,
             immediate: Mutex::new(immediate),
             subgroup: support.subgroup,
-            mesh_limits: support.mesh_limits,
-            options,
             pipeline_executables,
             shader_clock,
             budget: budget_instance(app.instance(), adapter.handle()),
         })
     }
 
-    /// Why `adapter` can't make a [`GpuContext`] with `options`, or nothing when it can.
-    pub fn missing_features(
-        app: &App,
-        adapter: &Adapter,
-        options: GpuOptions,
-    ) -> Vec<&'static str> {
+    /// Why `adapter` can't make a [`GpuContext`], or nothing when it can.
+    pub fn missing_features(app: &App, adapter: &Adapter) -> Vec<&'static str> {
         let mut missing = query_support(app.instance(), adapter).missing;
-        if pick_queue_family(app, adapter, options).is_none() {
-            missing.push(if options.present {
-                "a graphics and compute queue that can present to the window"
-            } else {
-                "a graphics and compute queue"
-            });
-        }
-        if options.present && !has_extension(app.instance(), adapter, khr::swapchain::NAME) {
-            missing.push("VK_KHR_swapchain");
+        if pick_queue_family(adapter).is_none() {
+            missing.push("a graphics and compute queue");
         }
         missing
     }
@@ -269,16 +227,6 @@ impl GpuContext {
                 .map(|heap| (budget.heap_budget[heap], budget.heap_usage[heap]))
                 .collect(),
         )
-    }
-
-    #[inline]
-    pub fn mesh_limits(&self) -> MeshShaderLimits {
-        self.mesh_limits
-    }
-
-    #[inline]
-    pub fn options(&self) -> GpuOptions {
-        self.options
     }
 
     /// Nanoseconds per timestamp tick.
@@ -381,7 +329,8 @@ fn shader_clock_supported(instance: &ash::Instance, adapter: &Adapter) -> bool {
         let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut clock_features);
         unsafe { instance.get_physical_device_features2(adapter.handle(), &mut features) };
     }
-    clock_features.shader_subgroup_clock == vk::TRUE && clock_features.shader_device_clock == vk::TRUE
+    clock_features.shader_subgroup_clock == vk::TRUE
+        && clock_features.shader_device_clock == vk::TRUE
 }
 
 /// Whether `adapter`'s driver tells what it compiled a pipeline into
@@ -393,7 +342,8 @@ fn pipeline_executables_supported(instance: &ash::Instance, adapter: &Adapter) -
     let mut executable_features =
         vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
     {
-        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut executable_features);
+        let mut features =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut executable_features);
         unsafe { instance.get_physical_device_features2(adapter.handle(), &mut features) };
     }
     executable_features.pipeline_executable_info == vk::TRUE
@@ -488,14 +438,10 @@ fn query_support(instance: &ash::Instance, adapter: &Adapter) -> Support {
 
     let mut vulkan_11_properties = vk::PhysicalDeviceVulkan11Properties::default();
     let mut vulkan_13_properties = vk::PhysicalDeviceVulkan13Properties::default();
-    let mut mesh_properties = vk::PhysicalDeviceMeshShaderPropertiesEXT::default();
     {
         let mut properties = vk::PhysicalDeviceProperties2::default()
             .push_next(&mut vulkan_11_properties)
             .push_next(&mut vulkan_13_properties);
-        if mesh_extension {
-            properties = properties.push_next(&mut mesh_properties);
-        }
         unsafe { instance.get_physical_device_properties2(adapter.handle(), &mut properties) };
     }
     if !vulkan_11_properties
@@ -524,38 +470,11 @@ fn query_support(instance: &ash::Instance, adapter: &Adapter) -> Support {
         },
         subgroup_extended_types: vulkan_12_features.shader_subgroup_extended_types == vk::TRUE,
         mesh_shader_queries: mesh_features.mesh_shader_queries == vk::TRUE,
-        mesh_limits: MeshShaderLimits {
-            max_task_workgroup_invocations: mesh_properties.max_task_work_group_invocations,
-            max_task_workgroup_total_count: mesh_properties.max_task_work_group_total_count,
-            max_task_payload_size: mesh_properties.max_task_payload_size,
-            max_mesh_workgroup_invocations: mesh_properties.max_mesh_work_group_invocations,
-            max_mesh_workgroup_total_count: mesh_properties.max_mesh_work_group_total_count,
-            max_mesh_output_vertices: mesh_properties.max_mesh_output_vertices,
-            max_mesh_output_primitives: mesh_properties.max_mesh_output_primitives,
-            max_preferred_task_workgroup_invocations: mesh_properties
-                .max_preferred_task_work_group_invocations,
-            max_preferred_mesh_workgroup_invocations: mesh_properties
-                .max_preferred_mesh_work_group_invocations,
-        },
     }
 }
 
-/// A queue family with graphics, compute and timestamps, that can present to the app's window
-/// when `options.present` asks for it.
-fn pick_queue_family(app: &App, adapter: &Adapter, options: GpuOptions) -> Option<QueueFamily> {
-    let presents = |family: &QueueFamily| {
-        if !options.present {
-            return true;
-        }
-        let Some(surface) = app.surface() else {
-            return false;
-        };
-        unsafe {
-            app.surface_instance
-                .get_physical_device_surface_support(adapter.handle(), family.index(), surface)
-                .unwrap_or(false)
-        }
-    };
+/// A queue family with graphics, compute and timestamps.
+fn pick_queue_family(adapter: &Adapter) -> Option<QueueFamily> {
     adapter
         .queue_families()
         .iter()
@@ -565,7 +484,6 @@ fn pick_queue_family(app: &App, adapter: &Adapter, options: GpuOptions) -> Optio
                 .queue_flags
                 .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
                 && properties.timestamp_valid_bits > 0
-                && presents(family)
         })
         .copied()
 }

@@ -8,7 +8,7 @@ use crate::vulkan::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-const DEPTH_PYRAMID_SPV: &[u8] = include_bytes!("../../../assets/shader/depth_pyramid.spv");
+const DEPTH_PYRAMID_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/depth_pyramid.spv"));
 /// Matches `numthreads` in `depth_pyramid.slang`.
 const WORKGROUP_SIZE: u32 = 8;
 const PYRAMID_FORMAT: vk::Format = vk::Format::R32_SFLOAT;

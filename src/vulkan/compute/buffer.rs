@@ -12,16 +12,6 @@ pub struct AddressedBuffer {
 }
 
 impl AddressedBuffer {
-    /// Nothing, until it's replaced; destroying it does nothing.
-    pub fn null() -> Self {
-        Self {
-            handle: vk::Buffer::null(),
-            memory: vk::DeviceMemory::null(),
-            size: 0,
-            address: 0,
-        }
-    }
-
     /// `size` bytes of device-local memory, usable as storage, as either end of a copy, and as
     /// indirect arguments, plus whatever `usage` adds.
     pub fn new(

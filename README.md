@@ -174,8 +174,8 @@ drop(renderer);
 - `drawIndirectFirstInstance`, `shaderDrawParameters`, `multiDrawIndirect` and
   `drawIndirectCount`, which every desktop GPU has: each indirect draw names its mesh by its
   first instance, which the mesh shaders read, and culling writes how many draws there are.
-- The compiled shaders in `assets/shader` are committed, so building only needs `slangc`, from
-  the Vulkan SDK, after editing a `.slang` file.
+- `slangc`, from the Vulkan SDK, on the path: `build.rs` compiles the shaders in `assets/shader`
+  into Cargo's `OUT_DIR`, and the renderer includes them from there.
 - Debug builds turn on the Vulkan validation layer when it's installed.
 
 ## Examples
@@ -247,8 +247,7 @@ check only sees races the GPU loses, so a missing barrier before vertex input ca
 and a docs build, then runs the stress test headless on Mesa's lavapipe, a Vulkan driver that
 runs on the CPU, with the validation layers installed so it checks synchronization too.
 
-The compiled shaders are committed, and `build.rs` keeps them when `slangc` isn't installed,
-since a fresh checkout's file times can make them look out of date.
+Both jobs install `slangc` from a Slang release first, for `build.rs`.
 
 ## Debug hooks
 

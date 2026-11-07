@@ -20,7 +20,7 @@ use crate::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-const TRACE_PASS_SPV: &[u8] = include_bytes!("../../../../assets/shader/trace_pass.spv");
+const TRACE_PASS_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/trace_pass.spv"));
 /// Each texel's sun visibility, tinted by see-through voxels, and its surface's distance from
 /// the camera, which upscaling compares. A base storage format every device supports.
 const SHADOW_FORMAT: vk::Format = vk::Format::R32G32B32A32_SFLOAT;

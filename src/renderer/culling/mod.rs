@@ -21,7 +21,7 @@ use glam::Mat4;
 use glam::Vec4;
 use std::slice;
 
-const CULL_SPV: &[u8] = include_bytes!("../../../assets/shader/cull.spv");
+const CULL_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cull.spv"));
 /// Matches `numthreads` in `cull.slang`.
 const WORKGROUP_SIZE: u32 = 64;
 /// Starting number of meshes each frame's buffers fit, they grow to fit.

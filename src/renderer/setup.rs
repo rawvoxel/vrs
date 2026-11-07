@@ -32,9 +32,9 @@ use crate::{
 use ash::{khr, prelude::VkResult, vk};
 use std::slice;
 
-const MESH_SPV: &[u8] = include_bytes!("../../assets/shader/mesh.spv");
-const PROBE_OVERLAY_SPV: &[u8] = include_bytes!("../../assets/shader/probe_overlay.spv");
-const SKY_PASS_SPV: &[u8] = include_bytes!("../../assets/shader/sky_pass.spv");
+const MESH_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mesh.spv"));
+const PROBE_OVERLAY_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/probe_overlay.spv"));
+const SKY_PASS_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky_pass.spv"));
 pub(super) const FRAMES_IN_FLIGHT: u32 = 2;
 /// Materials each frame's palette buffer starts with room for, it grows to fit.
 const INITIAL_MATERIALS: vk::DeviceSize = 1024;

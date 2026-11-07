@@ -10,14 +10,6 @@ pub struct ComputePipelines {
 }
 
 impl ComputePipelines {
-    /// Nothing, until it's replaced; destroying it does nothing.
-    pub fn null() -> Self {
-        Self {
-            layout: vk::PipelineLayout::null(),
-            pipelines: Vec::new(),
-        }
-    }
-
     /// One pipeline per name in `entry_points`, in that order, from the SPIR-V `words`, made
     /// through `cache`. Every pipeline runs full subgroups, at `required_subgroup_size` when
     /// there is one, so a workgroup's width must be a multiple of the largest subgroup size.
@@ -96,11 +88,7 @@ impl ComputePipelines {
         let pipeline_info = vk::PipelineInfoKHR::default().pipeline(self.pipelines[index]);
         let properties = unsafe { executables.get_pipeline_executable_properties(&pipeline_info)? };
         let mut statistics = Vec::new();
-        for (executable_index, property) in properties.iter().enumerate() {
-            let executable = property
-                .name_as_c_str()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
+        for executable_index in 0..properties.len() {
             let executable_info = vk::PipelineExecutableInfoKHR::default()
                 .pipeline(self.pipelines[index])
                 .executable_index(executable_index as u32);
@@ -125,11 +113,7 @@ impl ComputePipelines {
                         _ => format!("{}", statistic.value.f64),
                     }
                 };
-                statistics.push(PipelineStatistic {
-                    executable: executable.clone(),
-                    name,
-                    value,
-                });
+                statistics.push(PipelineStatistic { name, value });
             }
         }
         Ok(statistics)
@@ -151,15 +135,19 @@ impl ComputePipelines {
                 .pipeline(self.pipelines[index])
                 .executable_index(executable_index as u32);
             // Asked twice: first their names and sizes, then their text into buffers that big.
-            let mut sized =
-                unsafe { executables.get_pipeline_executable_internal_representations(&executable_info)? };
-            let mut buffers: Vec<Vec<u8>> = sized.iter().map(|each| vec![0u8; each.data_size]).collect();
+            let mut sized = unsafe {
+                executables.get_pipeline_executable_internal_representations(&executable_info)?
+            };
+            let mut buffers: Vec<Vec<u8>> =
+                sized.iter().map(|each| vec![0u8; each.data_size]).collect();
             for (each, buffer) in sized.iter_mut().zip(buffers.iter_mut()) {
                 each.p_data = buffer.as_mut_ptr().cast();
             }
             let mut count = sized.len() as u32;
             unsafe {
-                (executables.fp().get_pipeline_executable_internal_representations_khr)(
+                (executables
+                    .fp()
+                    .get_pipeline_executable_internal_representations_khr)(
                     executables.device(),
                     &executable_info,
                     &mut count,
@@ -168,13 +156,11 @@ impl ComputePipelines {
             }
             .result()?;
             for (each, buffer) in sized.iter().zip(buffers) {
-                let name = each
-                    .name_as_c_str()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                let length = buffer.iter().position(|&byte| byte == 0).unwrap_or(buffer.len());
+                let length = buffer
+                    .iter()
+                    .position(|&byte| byte == 0)
+                    .unwrap_or(buffer.len());
                 representations.push(PipelineRepresentation {
-                    name,
                     text: each.is_text == vk::TRUE,
                     data: buffer[..length.min(each.data_size)].to_vec(),
                 });
@@ -288,16 +274,6 @@ impl ComputePipelines {
         self.pipelines[index]
     }
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.pipelines.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.pipelines.is_empty()
-    }
-
     /// # Safety
     /// Once the device no longer uses them.
     pub unsafe fn destroy(&self, device: &ash::Device) {
@@ -310,20 +286,18 @@ impl ComputePipelines {
     }
 }
 
-/// One statistic a driver gives of a pipeline it compiled ([`ComputePipelines::statistics`]): the
-/// executable it's of (a compute pipeline's one, as the driver names it), its name and its value.
+/// One statistic a driver gives of a pipeline it compiled ([`ComputePipelines::statistics`]): its
+/// name and its value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineStatistic {
-    pub executable: String,
     pub name: String,
     pub value: String,
 }
 
-/// What a driver shows of a pipeline's compiled code ([`ComputePipelines::representations`]): its
-/// name, whether it's text, and its bytes (text without its terminating zero).
+/// What a driver shows of a pipeline's compiled code ([`ComputePipelines::representations`]):
+/// whether it's text, and its bytes (text without its terminating zero).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineRepresentation {
-    pub name: String,
     pub text: bool,
     pub data: Vec<u8>,
 }

@@ -11,13 +11,6 @@ pub struct DepthState {
 }
 
 impl DepthState {
-    /// No depth test and no depth writes.
-    pub const NONE: Self = Self {
-        test: false,
-        write: false,
-        compare: vk::CompareOp::ALWAYS,
-    };
-
     /// Reverse-Z: nearer is larger, so a fragment passes when it's at least as near.
     pub const REVERSE_Z: Self = Self {
         test: true,
@@ -60,14 +53,6 @@ pub struct MeshPipeline {
 }
 
 impl MeshPipeline {
-    /// Nothing, until it's replaced; destroying it does nothing.
-    pub fn null() -> Self {
-        Self {
-            layout: vk::PipelineLayout::null(),
-            pipeline: vk::Pipeline::null(),
-        }
-    }
-
     /// The stages every mesh pipeline's push constants are visible to.
     pub const PUSH_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(
         vk::ShaderStageFlags::TASK_EXT.as_raw()

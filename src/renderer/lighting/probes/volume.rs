@@ -14,7 +14,7 @@ use crate::{
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-const PROBE_UPDATE_SPV: &[u8] = include_bytes!("../../../../assets/shader/probe_update.spv");
+const PROBE_UPDATE_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/probe_update.spv"));
 /// Interior texels along a probe's irradiance and distance maps, each with a one texel border.
 /// Match `IRRADIANCE_TEXELS` and `DISTANCE_TEXELS` in `common/probes.slang`.
 const IRRADIANCE_TEXELS: u32 = 8;

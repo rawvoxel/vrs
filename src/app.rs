@@ -73,11 +73,6 @@ impl App {
     }
 
     #[inline]
-    pub fn entry(&self) -> &ash::Entry {
-        &self.entry
-    }
-
-    #[inline]
     pub fn instance(&self) -> &ash::Instance {
         &self.instance
     }
@@ -86,11 +81,6 @@ impl App {
     #[inline]
     pub fn surface(&self) -> Option<vk::SurfaceKHR> {
         (self.surface != vk::SurfaceKHR::null()).then_some(self.surface)
-    }
-
-    #[inline]
-    pub fn is_headless(&self) -> bool {
-        self.surface().is_none()
     }
 
     /// Only in debug builds, when the validation layer is installed.

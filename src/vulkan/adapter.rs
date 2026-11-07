@@ -20,11 +20,6 @@ impl Adapter {
     }
 
     #[inline]
-    pub fn features(&self) -> &vk::PhysicalDeviceFeatures {
-        &self.features
-    }
-
-    #[inline]
     pub fn properties(&self) -> &vk::PhysicalDeviceProperties {
         &self.properties
     }

@@ -1,9 +1,9 @@
 //! A [`GpuContext`] whose device another Vulkan user (such as wgpu) shares: that user describes
 //! the device it needs, the context merges in its own needs, makes the device and owns it.
 
-use super::{GpuContext, GpuOptions, budget_instance, create_immediate, query_support};
+use super::{GpuContext, budget_instance, create_immediate, query_support};
 use crate::vulkan::{adapter::Adapter, queue::Queue};
-use ash::{ext, khr, prelude::VkResult, vk};
+use ash::{ext, prelude::VkResult, vk};
 use std::{
     ffi::{CStr, c_char, c_void},
     sync::Mutex,
@@ -180,10 +180,6 @@ impl GpuContext {
             queue_family,
             immediate: Mutex::new(immediate),
             subgroup: support.subgroup,
-            mesh_limits: support.mesh_limits,
-            options: GpuOptions {
-                present: extensions.contains(&khr::swapchain::NAME),
-            },
             pipeline_executables: None,
             shader_clock: false,
             budget: budget_instance(instance, physical_device),

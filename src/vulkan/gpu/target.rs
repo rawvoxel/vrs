@@ -8,21 +8,10 @@ use ash::{prelude::VkResult, vk};
 pub struct RenderImage {
     image: Image,
     view: vk::ImageView,
-    format: vk::Format,
     extent: vk::Extent2D,
 }
 
 impl RenderImage {
-    /// Owns nothing; destroying it does nothing.
-    pub fn null() -> Self {
-        Self {
-            image: Image::null(),
-            view: vk::ImageView::null(),
-            format: vk::Format::UNDEFINED,
-            extent: vk::Extent2D::default(),
-        }
-    }
-
     /// `extent` texels of `format`, usable for `usage`, viewed through `aspect`.
     pub fn new(
         adapter: &Adapter,
@@ -48,7 +37,6 @@ impl RenderImage {
             Ok(view) => Ok(Self {
                 image,
                 view,
-                format,
                 extent,
             }),
             Err(error) => {
@@ -83,11 +71,6 @@ impl RenderImage {
     #[inline]
     pub fn view(&self) -> vk::ImageView {
         self.view
-    }
-
-    #[inline]
-    pub fn format(&self) -> vk::Format {
-        self.format
     }
 
     #[inline]
