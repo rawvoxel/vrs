@@ -302,7 +302,8 @@ impl GpuContext {
         use_queue(queue.handle())
     }
 
-    /// Records commands with `record`, submits them and waits until the device has run them.
+    /// Records commands with `record`, submits them and waits until the device has run them, their
+    /// writes then visible to the host ([`commands::record_host_read_barrier`]).
     pub fn submit_and_wait<F: FnOnce(vk::CommandBuffer)>(&self, record: F) -> VkResult<()> {
         let immediate = self
             .immediate
@@ -316,6 +317,7 @@ impl GpuContext {
             self.device
                 .begin_command_buffer(immediate.command_buffer, &begin_info)?;
             record(immediate.command_buffer);
+            commands::record_host_read_barrier(&self.device, immediate.command_buffer);
             self.device.end_command_buffer(immediate.command_buffer)?;
             let submit = vk::SubmitInfo::default()
                 .command_buffers(slice::from_ref(&immediate.command_buffer));

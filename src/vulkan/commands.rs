@@ -95,3 +95,24 @@ pub fn record_submit_command_buffer<F: FnOnce(vk::CommandBuffer)>(
         device.queue_submit(submit_queue, &submit_info, command_buffer_fence)
     }
 }
+
+/// Records a barrier that makes every device write recorded before it visible to the host once the
+/// submission's fence has signaled: a fence makes device writes available, not visible to the host.
+/// A submission the host waits on to read what it wrote ends with it.
+#[inline]
+pub fn record_host_read_barrier(device: &ash::Device, cmd_buffer: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier::default()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+        .dst_access_mask(vk::AccessFlags::HOST_READ);
+    unsafe {
+        device.cmd_pipeline_barrier(
+            cmd_buffer,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            slice::from_ref(&barrier),
+            &[],
+            &[],
+        )
+    };
+}

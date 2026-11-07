@@ -149,17 +149,22 @@ impl ComputeContext {
         self.queue_family.properties().timestamp_valid_bits
     }
 
-    /// Records commands with `record`, submits them and waits until the device has run them.
+    /// Records commands with `record`, submits them and waits until the device has run them, their
+    /// writes then visible to the host ([`commands::record_host_read_barrier`]).
     pub fn submit_and_wait<F: FnOnce(vk::CommandBuffer)>(&mut self, record: F) -> VkResult<()> {
+        let device = &self.device;
         commands::record_submit_command_buffer(
-            &self.device,
+            device,
             self.command_buffer,
             self.fence,
             self.queue.handle(),
             &[],
             &[],
             &[],
-            record,
+            |cmd_buffer| {
+                record(cmd_buffer);
+                commands::record_host_read_barrier(device, cmd_buffer);
+            },
         )?;
         unsafe {
             self.device
