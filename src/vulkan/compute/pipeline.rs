@@ -13,7 +13,10 @@ impl ComputePipelines {
     /// One pipeline per name in `entry_points`, in that order, from the SPIR-V `words`, made
     /// through `cache`. Every pipeline runs full subgroups, at `required_subgroup_size` when
     /// there is one, so a workgroup's width must be a multiple of the largest subgroup size.
+    /// A required size `adapter` can't run its compute shaders at (see
+    /// [`Adapter::subgroup`]) is refused with [`vk::Result::ERROR_FEATURE_NOT_PRESENT`].
     pub fn new(
+        adapter: &Adapter,
         device: &ash::Device,
         words: &[u32],
         entry_points: &[&CStr],
@@ -22,6 +25,7 @@ impl ComputePipelines {
         required_subgroup_size: Option<u32>,
     ) -> VkResult<Self> {
         Self::specialized(
+            adapter,
             device,
             words,
             entry_points,
@@ -34,7 +38,9 @@ impl ComputePipelines {
 
     /// [`ComputePipelines::new`], every pipeline with the module's specialization constants
     /// `constants` set: each `(id, value)` a 32-bit constant (a `bool`'s `VkBool32`, a `uint`).
+    #[allow(clippy::too_many_arguments)]
     pub fn specialized(
+        adapter: &Adapter,
         device: &ash::Device,
         words: &[u32],
         entry_points: &[&CStr],
@@ -44,6 +50,7 @@ impl ComputePipelines {
         constants: &[(u32, u32)],
     ) -> VkResult<Self> {
         Self::build(
+            adapter,
             device,
             words,
             entry_points,
@@ -55,25 +62,30 @@ impl ComputePipelines {
         )
     }
 
-    /// [`ComputePipelines::new`] through no cache, each pipeline keeping what the driver compiled
-    /// it into for [`ComputePipelines::statistics`] (`VK_KHR_pipeline_executable_properties`:
-    /// the device must have it enabled).
+    /// [`ComputePipelines::specialized`] through no cache, each pipeline keeping what the driver
+    /// compiled it into for [`ComputePipelines::statistics`] and
+    /// [`ComputePipelines::representations`] (`VK_KHR_pipeline_executable_properties`: the device
+    /// must have it enabled).
     pub fn capturing_statistics(
+        adapter: &Adapter,
         device: &ash::Device,
         words: &[u32],
         entry_points: &[&CStr],
         push_constant_size: u32,
         required_subgroup_size: Option<u32>,
+        constants: &[(u32, u32)],
     ) -> VkResult<Self> {
         Self::build(
+            adapter,
             device,
             words,
             entry_points,
             push_constant_size,
             vk::PipelineCache::null(),
             required_subgroup_size,
-            &[],
-            vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR,
+            constants,
+            vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR
+                | vk::PipelineCreateFlags::CAPTURE_INTERNAL_REPRESENTATIONS_KHR,
         )
     }
 
@@ -119,6 +131,21 @@ impl ComputePipelines {
         Ok(statistics)
     }
 
+    /// The subgroup size the driver chose for each of the `index`th pipeline's executables, for
+    /// pipelines made by `capturing_statistics`.
+    pub fn subgroup_sizes(
+        &self,
+        executables: &khr::pipeline_executable_properties::Device,
+        index: usize,
+    ) -> VkResult<Vec<u32>> {
+        let pipeline_info = vk::PipelineInfoKHR::default().pipeline(self.pipelines[index]);
+        let properties = unsafe { executables.get_pipeline_executable_properties(&pipeline_info)? };
+        Ok(properties
+            .iter()
+            .map(|executable| executable.subgroup_size)
+            .collect())
+    }
+
     /// What the driver shows of the code it compiled the `index`th pipeline into, each of its
     /// executables' representations as text (AMD's: the ISA disassembly), for pipelines made by
     /// [`ComputePipelines::capturing_statistics`]. Empty where the driver shows none.
@@ -156,12 +183,22 @@ impl ComputePipelines {
             }
             .result()?;
             for (each, buffer) in sized.iter().zip(buffers) {
-                let length = buffer
-                    .iter()
-                    .position(|&byte| byte == 0)
-                    .unwrap_or(buffer.len());
+                let text = each.is_text == vk::TRUE;
+                // Text ends at its terminating zero; binary data is every byte the driver wrote.
+                let length = if text {
+                    buffer
+                        .iter()
+                        .position(|&byte| byte == 0)
+                        .unwrap_or(buffer.len())
+                } else {
+                    buffer.len()
+                };
                 representations.push(PipelineRepresentation {
-                    text: each.is_text == vk::TRUE,
+                    name: each
+                        .name_as_c_str()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    text,
                     data: buffer[..length.min(each.data_size)].to_vec(),
                 });
             }
@@ -171,6 +208,7 @@ impl ComputePipelines {
 
     #[allow(clippy::too_many_arguments)]
     fn build(
+        adapter: &Adapter,
         device: &ash::Device,
         words: &[u32],
         entry_points: &[&CStr],
@@ -180,6 +218,17 @@ impl ComputePipelines {
         constants: &[(u32, u32)],
         flags: vk::PipelineCreateFlags,
     ) -> VkResult<Self> {
+        if let Some(size) = required_subgroup_size {
+            // Vulkan's rule: a power of two in the adapter's range, for a stage that can require
+            // one.
+            let subgroup = adapter.subgroup();
+            if !(subgroup.requirable
+                && size.is_power_of_two()
+                && (subgroup.min_size..=subgroup.max_size).contains(&size))
+            {
+                return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
+            }
+        }
         let entries: Vec<vk::SpecializationMapEntry> = constants
             .iter()
             .enumerate()
@@ -193,7 +242,7 @@ impl ComputePipelines {
         let values: Vec<u32> = constants.iter().map(|&(_, value)| value).collect();
         let specialization = vk::SpecializationInfo::default()
             .map_entries(&entries)
-            .data(crate::vulkan::bytes::slice_as_bytes(&values));
+            .data(bytemuck::cast_slice(&values));
         let module_info = vk::ShaderModuleCreateInfo::default().code(words);
         let module = unsafe { device.create_shader_module(&module_info, None)? };
 
@@ -295,9 +344,11 @@ pub struct PipelineStatistic {
 }
 
 /// What a driver shows of a pipeline's compiled code ([`ComputePipelines::representations`]):
-/// whether it's text, and its bytes (text without its terminating zero).
+/// its name, as the driver gives it; whether it's text; and its bytes (text without its
+/// terminating zero).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PipelineRepresentation {
+    pub name: String,
     pub text: bool,
     pub data: Vec<u8>,
 }
@@ -309,22 +360,21 @@ pub struct PipelineCache {
 }
 
 impl PipelineCache {
-    /// Nothing; pipelines made through it aren't cached.
-    pub fn null() -> Self {
-        Self {
-            handle: vk::PipelineCache::null(),
-        }
-    }
-
     /// A cache starting from `data`, which a driver ignores when it was saved by another device
-    /// or driver. If the driver rejects it outright, the cache starts empty.
+    /// or driver. If the driver rejects the data outright, the cache starts empty; running out of
+    /// memory is returned.
     pub fn new(device: &ash::Device, data: &[u8]) -> VkResult<Self> {
         let info = vk::PipelineCacheCreateInfo::default().initial_data(data);
         let handle = match unsafe { device.create_pipeline_cache(&info, None) } {
             Ok(handle) => handle,
-            Err(_) if !data.is_empty() => unsafe {
-                device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)?
-            },
+            Err(error)
+                if !data.is_empty()
+                    && !matches!(
+                        error,
+                        vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                            | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    ) =>
+            unsafe { device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)? },
             Err(error) => return Err(error),
         };
         Ok(Self { handle })
@@ -337,9 +387,6 @@ impl PipelineCache {
 
     /// What the cache holds, to save and load into a later run's cache.
     pub fn data(&self, device: &ash::Device) -> VkResult<Vec<u8>> {
-        if self.handle == vk::PipelineCache::null() {
-            return Ok(Vec::new());
-        }
         unsafe { device.get_pipeline_cache_data(self.handle) }
     }
 

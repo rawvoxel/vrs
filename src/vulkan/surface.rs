@@ -10,7 +10,7 @@ pub struct Surface {
     /// Every present mode the surface supports, for changing vsync.
     pub(crate) present_modes: Vec<vk::PresentModeKHR>,
     pub(crate) format: vk::Format,
-    /// A sampleable depth format, for the depth pyramid.
+    /// A depth format that can be rendered to and sampled.
     pub(crate) depth_format: vk::Format,
     pub(crate) color_space: vk::ColorSpaceKHR,
     pub(crate) transform_flags: vk::SurfaceTransformFlagsKHR,
@@ -109,6 +109,28 @@ impl Surface {
     #[inline]
     pub fn present_mode(&self) -> vk::PresentModeKHR {
         self.present_mode
+    }
+
+    #[inline]
+    pub fn color_space(&self) -> vk::ColorSpaceKHR {
+        self.color_space
+    }
+
+    #[inline]
+    pub fn transform_flags(&self) -> vk::SurfaceTransformFlagsKHR {
+        self.transform_flags
+    }
+
+    /// How many images to present from: one more than the surface's minimum, within its maximum.
+    #[inline]
+    pub fn image_count(&self) -> u32 {
+        self.image_count
+    }
+
+    /// How its images can be used: as color attachments, and copied from when [`Surface::can_capture`].
+    #[inline]
+    pub fn image_usage(&self) -> vk::ImageUsageFlags {
+        self.image_usage
     }
 
     /// Whether frames can be copied out of the images.

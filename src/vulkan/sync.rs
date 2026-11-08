@@ -1,11 +1,12 @@
 use ash::{prelude::VkResult, vk};
 
-/// Records a barrier making `src_access` in `src_stage` available to `dst_access` in
-/// `dst_stage`, for every resource.
+/// Records a barrier making `src`'s accesses in its stages available and visible to `dst`'s
+/// accesses in its stages, for every resource: each a `(stage, access)` pair.
 ///
 /// # Safety
 /// `cmd_buffer` must be recording.
-pub(crate) unsafe fn cmd_memory_barrier(
+#[inline]
+pub unsafe fn cmd_memory_barrier(
     device: &ash::Device,
     cmd_buffer: vk::CommandBuffer,
     src: (vk::PipelineStageFlags2, vk::AccessFlags2),
@@ -24,6 +25,59 @@ pub(crate) unsafe fn cmd_memory_barrier(
     };
 }
 
+/// Records a barrier after which every write recorded before it is done and visible to every
+/// read and write recorded after it, in any stage.
+///
+/// # Safety
+/// `command_buffer` must be recording.
+#[inline]
+pub unsafe fn cmd_pipeline_barrier(device: &ash::Device, command_buffer: vk::CommandBuffer) {
+    unsafe {
+        cmd_memory_barrier(
+            device,
+            command_buffer,
+            (
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_WRITE,
+            ),
+            (
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE,
+            ),
+        )
+    };
+}
+
+/// Waits until `fence` is signaled: the driver's own wait, as long as the work takes. A lost
+/// device returns `ERROR_DEVICE_LOST`.
+///
+/// # Safety
+/// `fence` is signaled, or a submission still to finish signals it.
+#[inline]
+pub unsafe fn wait_for_fence(device: &ash::Device, fence: vk::Fence) -> VkResult<()> {
+    unsafe { device.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX) }
+}
+
+/// Waits until `device` runs nothing: every queue's work done, a shared device's other user's
+/// included. On a lost device the driver's wait returns `ERROR_DEVICE_LOST` in finite time, and
+/// nothing is pending after it (the spec's Lost Device section).
+///
+/// # Safety
+/// No other thread submits to `device`'s queues during the wait.
+#[inline]
+pub unsafe fn wait_for_device_idle(device: &ash::Device) -> VkResult<()> {
+    unsafe { device.device_wait_idle() }
+}
+
+/// Whether `fence` is signaled, without waiting. A lost device returns `ERROR_DEVICE_LOST`.
+///
+/// # Safety
+/// `fence` is a fence of `device`'s.
+#[inline]
+pub unsafe fn fence_signaled(device: &ash::Device, fence: vk::Fence) -> VkResult<bool> {
+    unsafe { device.get_fence_status(fence) }
+}
+
 /// Starts signaled, so the first wait on it returns straight away.
 #[inline]
 pub fn create_fence(device: &ash::Device) -> VkResult<vk::Fence> {
@@ -31,44 +85,12 @@ pub fn create_fence(device: &ash::Device) -> VkResult<vk::Fence> {
     unsafe { device.create_fence(&fence_info, None) }
 }
 
-/// See `create_fence`. If one fails, those already created are destroyed.
+/// Destroys `fence`.
+///
+/// # Safety
+///
+/// `fence` was made on `device`, and no submission still pending signals it.
 #[inline]
-pub fn create_fences(device: &ash::Device, count: u32) -> VkResult<Vec<vk::Fence>> {
-    let mut fences = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        match create_fence(device) {
-            Ok(fence) => fences.push(fence),
-            Err(err) => {
-                for fence in fences {
-                    unsafe { device.destroy_fence(fence, None) };
-                }
-                return Err(err);
-            }
-        }
-    }
-    Ok(fences)
-}
-
-#[inline]
-pub fn create_semaphore(device: &ash::Device) -> VkResult<vk::Semaphore> {
-    let semaphore_info = vk::SemaphoreCreateInfo::default();
-    unsafe { device.create_semaphore(&semaphore_info, None) }
-}
-
-/// If one fails, those already created are destroyed.
-#[inline]
-pub fn create_semaphores(device: &ash::Device, count: u32) -> VkResult<Vec<vk::Semaphore>> {
-    let mut semaphores = Vec::with_capacity(count as usize);
-    for _ in 0..count {
-        match create_semaphore(device) {
-            Ok(semaphore) => semaphores.push(semaphore),
-            Err(err) => {
-                for semaphore in semaphores {
-                    unsafe { device.destroy_semaphore(semaphore, None) };
-                }
-                return Err(err);
-            }
-        }
-    }
-    Ok(semaphores)
+pub unsafe fn destroy_fence(device: &ash::Device, fence: vk::Fence) {
+    unsafe { device.destroy_fence(fence, None) };
 }

@@ -9,9 +9,6 @@ edition = "2024"
 anyhow = "1.0.98"
 ash = "0.38.0"
 ash-window = "0.13.0"
-glam = "0.32.1"
+bytemuck = "1.23.1"
+log = "0.4.27"
 raw-window-handle = "0.6.2"
-
-[dev-dependencies]
-# External crates
-winit = "0.30.11"

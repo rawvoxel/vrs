@@ -1,5 +1,6 @@
 use crate::vulkan::adapter::Adapter;
 use ash::{prelude::VkResult, vk};
+use bytemuck::{AnyBitPattern, NoUninit};
 use std::{ffi::c_void, mem, ptr::NonNull, slice};
 
 /// Device memory a shader reaches through a 64-bit address, for storage, copies and indirect
@@ -50,6 +51,8 @@ impl AddressedBuffer {
         self.handle
     }
 
+    /// Its memory, dedicated to this buffer alone and bound at offset 0: the buffer's bytes are
+    /// the memory's bytes from its start.
     #[inline]
     pub fn memory(&self) -> vk::DeviceMemory {
         self.memory
@@ -181,22 +184,24 @@ impl HostBuffer {
     ///
     /// # Panics
     /// When it doesn't fit.
-    pub fn write<T: Copy>(&mut self, device: &ash::Device, offset: vk::DeviceSize, data: &[T]) {
-        let bytes = mem::size_of_val(data) as vk::DeviceSize;
-        assert!(
-            offset + bytes <= self.size,
-            "the write doesn't fit the buffer"
-        );
+    pub fn write<T: NoUninit>(
+        &mut self,
+        device: &ash::Device,
+        offset: vk::DeviceSize,
+        data: &[T],
+    ) -> VkResult<()> {
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        let size = bytes.len() as vk::DeviceSize;
+        assert!(self.fits(offset, size), "the write doesn't fit the buffer");
         unsafe {
             let destination = self.mapped.as_ptr().cast::<u8>().add(offset as usize);
-            std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), destination, bytes as usize);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
         }
         if !self.coherent {
-            let range = self.atom_range(offset, bytes);
-            unsafe {
-                let _ = device.flush_mapped_memory_ranges(slice::from_ref(&range));
-            }
+            let range = self.atom_range(offset, size);
+            unsafe { device.flush_mapped_memory_ranges(slice::from_ref(&range))? };
         }
+        Ok(())
     }
 
     /// Copies out what's at byte `offset`, once the device's writes there are done and visible
@@ -204,22 +209,31 @@ impl HostBuffer {
     ///
     /// # Panics
     /// When `data` reaches past the end.
-    pub fn read<T: Copy>(&self, device: &ash::Device, offset: vk::DeviceSize, data: &mut [T]) {
-        let bytes = mem::size_of_val(data) as vk::DeviceSize;
-        assert!(
-            offset + bytes <= self.size,
-            "the read doesn't fit the buffer"
-        );
+    pub fn read<T: AnyBitPattern>(
+        &self,
+        device: &ash::Device,
+        offset: vk::DeviceSize,
+        data: &mut [T],
+    ) -> VkResult<()> {
+        let size = mem::size_of_val(data) as vk::DeviceSize;
+        assert!(self.fits(offset, size), "the read doesn't fit the buffer");
         if !self.coherent {
-            let range = self.atom_range(offset, bytes);
-            unsafe {
-                let _ = device.invalidate_mapped_memory_ranges(slice::from_ref(&range));
-            }
+            let range = self.atom_range(offset, size);
+            unsafe { device.invalidate_mapped_memory_ranges(slice::from_ref(&range))? };
         }
+        // Every bit pattern is a valid `T`, so any bytes make valid values.
         unsafe {
             let source = self.mapped.as_ptr().cast::<u8>().add(offset as usize);
-            std::ptr::copy_nonoverlapping(source, data.as_mut_ptr().cast::<u8>(), bytes as usize);
+            std::ptr::copy_nonoverlapping(source, data.as_mut_ptr().cast::<u8>(), size as usize);
         }
+        Ok(())
+    }
+
+    /// Whether `size` bytes at byte `offset` lie inside the buffer; an offset so large that the
+    /// sum overflows lies outside.
+    #[inline]
+    fn fits(&self, offset: vk::DeviceSize, size: vk::DeviceSize) -> bool {
+        offset.checked_add(size).is_some_and(|end| end <= self.size)
     }
 
     /// The range to flush or invalidate for `bytes` at `offset`, widened to whole atoms.
@@ -270,19 +284,37 @@ fn create(
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     let handle = unsafe { device.create_buffer(&buffer_info, None)? };
     let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
-    let memory_type_index = find_memory_type(adapter, requirements, required, preferred);
-    let Some(memory_type_index) = memory_type_index else {
-        unsafe { device.destroy_buffer(handle, None) };
-        return Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+    let allocate = |memory_type_index: u32| {
+        let mut flags_info =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut flags_info);
+        unsafe { device.allocate_memory(&allocate_info, None) }
+            .map(|memory| (memory, memory_type_index))
     };
-    let mut flags_info =
-        vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-    let allocate_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type_index)
-        .push_next(&mut flags_info);
-    let memory = match unsafe { device.allocate_memory(&allocate_info, None) } {
-        Ok(memory) => memory,
+    // A type with the preferred properties too, and when its heap is full (such as the small
+    // heap of device-local memory the host sees without resizable BAR), one with the required
+    // properties alone.
+    let preferred_type = find_memory_type(adapter, requirements, required | preferred);
+    let required_type = find_memory_type(adapter, requirements, required);
+    let allocated = match (preferred_type, required_type) {
+        (Some(preferred_type), Some(required_type)) if preferred_type != required_type => {
+            allocate(preferred_type).or_else(|error| match error {
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY => {
+                    allocate(required_type)
+                }
+                _ => Err(error),
+            })
+        }
+        (Some(memory_type_index), _) | (None, Some(memory_type_index)) => {
+            allocate(memory_type_index)
+        }
+        (None, None) => Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+    };
+    let (memory, memory_type_index) = match allocated {
+        Ok(allocated) => allocated,
         Err(error) => {
             unsafe { device.destroy_buffer(handle, None) };
             return Err(error);
@@ -299,25 +331,63 @@ fn create(
     Ok((handle, memory, flags))
 }
 
-/// The first memory type with `required | preferred`, else the first with `required`, that the
-/// buffer can use and whose heap can hold it.
+/// The first memory type with `flags` that the buffer can use and whose heap can hold it.
 fn find_memory_type(
     adapter: &Adapter,
     requirements: vk::MemoryRequirements,
-    required: vk::MemoryPropertyFlags,
-    preferred: vk::MemoryPropertyFlags,
+    flags: vk::MemoryPropertyFlags,
 ) -> Option<u32> {
     let properties = adapter.memory_properties();
     let types = &properties.memory_types[..properties.memory_type_count as usize];
-    let fits = |flags: vk::MemoryPropertyFlags| {
-        types.iter().enumerate().position(|(index, memory_type)| {
+    types
+        .iter()
+        .enumerate()
+        .position(|(index, memory_type)| {
             let heap = &properties.memory_heaps[memory_type.heap_index as usize];
             (1 << index) & requirements.memory_type_bits != 0
                 && memory_type.property_flags.contains(flags)
                 && requirements.size <= heap.size
         })
-    };
-    fits(required | preferred)
-        .or_else(|| fits(required))
         .map(|index| index as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A host buffer of `size` bytes whose memory flushes in `atom`-byte atoms: no device memory
+    /// behind it, for the range arithmetic alone.
+    fn unbacked(size: vk::DeviceSize, atom: vk::DeviceSize) -> HostBuffer {
+        HostBuffer {
+            handle: vk::Buffer::null(),
+            memory: vk::DeviceMemory::null(),
+            size,
+            address: 0,
+            mapped: NonNull::dangling(),
+            coherent: false,
+            non_coherent_atom_size: atom,
+        }
+    }
+
+    /// The range to flush or invalidate covers the bytes asked, widened out to whole atoms, and
+    /// becomes the whole size where it would reach the buffer's end.
+    #[test]
+    fn a_range_widens_to_whole_atoms_and_to_the_end() {
+        let buffer = unbacked(1024, 64);
+        let range = |offset, bytes| {
+            let range = buffer.atom_range(offset, bytes);
+            (range.offset, range.size)
+        };
+        assert_eq!(range(0, 64), (0, 64));
+        assert_eq!(range(64, 64), (64, 64));
+        assert_eq!(range(65, 1), (64, 64));
+        assert_eq!(range(60, 8), (0, 128));
+        assert_eq!(range(100, 200), (64, 256));
+        assert_eq!(range(960, 64), (960, vk::WHOLE_SIZE));
+        assert_eq!(range(1000, 24), (960, vk::WHOLE_SIZE));
+        // A size that isn't a whole number of atoms: its last atom runs past the end.
+        let buffer = unbacked(1000, 64);
+        assert_eq!(buffer.atom_range(990, 10).size, vk::WHOLE_SIZE);
+        assert_eq!(buffer.atom_range(900, 10).size, 64);
+    }
 }

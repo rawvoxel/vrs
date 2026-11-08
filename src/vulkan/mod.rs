@@ -1,18 +1,13 @@
-//! Vulkan building blocks: the GPU and its queues, memory, buffers and images, pipelines,
-//! descriptors, commands and synchronization, and what frames are presented to.
+//! Vulkan building blocks: the GPU and the device made on it, memory, buffers and images,
+//! pipelines, commands and synchronization, and the window's surface.
 
 pub mod adapter;
 pub mod alloc;
-pub mod buffer;
-pub(crate) mod bytes;
 pub mod commands;
 pub mod compute;
-pub mod descriptors;
 pub mod gpu;
 pub mod image;
-pub(crate) mod pipeline;
 pub mod queue;
 pub mod surface;
-pub mod swapchain;
 pub mod sync;
 pub mod validation;

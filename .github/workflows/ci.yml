@@ -17,49 +17,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # `build.rs` compiles the renderer's shaders with `slangc`.
-      - name: Install slangc
-        run: |
-          mkdir -p "$RUNNER_TEMP/slang"
-          curl -sSfL https://github.com/shader-slang/slang/releases/download/v2025.10.3/slang-2025.10.3-linux-x86_64.tar.gz \
-            | tar -xz -C "$RUNNER_TEMP/slang"
-          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/slang/lib" >> "$GITHUB_ENV"
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # The unit tests, and the README's usage example, which is compiled but not run.
+      # The tests, and the README's usage example, which is compiled but not run.
       - run: cargo test
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-
-  stress:
-    name: Stress test on lavapipe
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # `build.rs` compiles the renderer's shaders with `slangc`.
-      - name: Install slangc
-        run: |
-          mkdir -p "$RUNNER_TEMP/slang"
-          curl -sSfL https://github.com/shader-slang/slang/releases/download/v2025.10.3/slang-2025.10.3-linux-x86_64.tar.gz \
-            | tar -xz -C "$RUNNER_TEMP/slang"
-          echo "$RUNNER_TEMP/slang/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/slang/lib" >> "$GITHUB_ENV"
-
-      # Mesa's lavapipe is a Vulkan driver running on the CPU, as runners have no GPU.
-      # The validation layers let the stress test fail on synchronization errors.
-      - name: Install lavapipe and the validation layers
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y mesa-vulkan-drivers vulkan-validationlayers vulkan-tools
-      - name: List Vulkan devices
-        run: vulkaninfo --summary
-
-      # A debug build, so validation is on.
-      - name: Run the stress test headless
-        run: cargo run --example stress -- --headless

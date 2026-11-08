@@ -2,7 +2,6 @@ use crate::vulkan::{adapter::Adapter, alloc};
 use ash::{prelude::VkResult, vk};
 use std::slice;
 
-#[derive(Clone, Copy)]
 pub struct Image {
     pub(crate) memory: vk::DeviceMemory,
     pub(crate) handle: vk::Image,
@@ -19,14 +18,6 @@ impl Image {
         self.memory
     }
 
-    /// Owns nothing, destroying it does nothing.
-    pub fn null() -> Self {
-        Self {
-            memory: vk::DeviceMemory::null(),
-            handle: vk::Image::null(),
-        }
-    }
-
     pub fn new(
         adapter: &Adapter,
         device: &ash::Device,
@@ -34,20 +25,26 @@ impl Image {
         memory_property_flags: vk::MemoryPropertyFlags,
     ) -> VkResult<Self> {
         unsafe {
-            let mut this = Self::null();
-            this.handle = device.create_image(&image_info, None)?;
-            let memory_requirements = device.get_image_memory_requirements(this.handle);
-            let bound =
-                alloc::vk_alloc(adapter, device, memory_requirements, memory_property_flags)
-                    .and_then(|memory| {
-                        this.memory = memory;
-                        device.bind_image_memory(this.handle, memory, 0)
-                    });
-            if let Err(err) = bound {
-                this.destroy(device);
-                return Err(err);
+            let handle = device.create_image(&image_info, None)?;
+            let memory_requirements = device.get_image_memory_requirements(handle);
+            let memory = match alloc::vk_alloc(
+                adapter,
+                device,
+                memory_requirements,
+                memory_property_flags,
+            ) {
+                Ok(memory) => memory,
+                Err(error) => {
+                    device.destroy_image(handle, None);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = device.bind_image_memory(handle, memory, 0) {
+                device.destroy_image(handle, None);
+                device.free_memory(memory, None);
+                return Err(error);
             }
-            Ok(this)
+            Ok(Self { memory, handle })
         }
     }
 
@@ -59,70 +56,6 @@ impl Image {
             device.free_memory(self.memory, None);
             device.destroy_image(self.handle, None);
         }
-    }
-}
-
-/// A 2D image compute shaders write and others sample, with its view, in device memory.
-pub(crate) struct StorageImage {
-    pub image: Image,
-    pub view: vk::ImageView,
-}
-
-impl StorageImage {
-    /// Owns nothing, destroying it does nothing.
-    pub fn null() -> Self {
-        Self {
-            image: Image::null(),
-            view: vk::ImageView::null(),
-        }
-    }
-
-    /// `extent` texels of `format`, usable for `usage` too.
-    pub fn new(
-        adapter: &Adapter,
-        device: &ash::Device,
-        extent: vk::Extent2D,
-        format: vk::Format,
-        usage: vk::ImageUsageFlags,
-    ) -> VkResult<Self> {
-        let info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .format(format)
-            .extent(extent.into())
-            .mip_levels(1)
-            .array_layers(1)
-            .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
-        let image = Image::new(adapter, device, info, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        let view = create_image_view(
-            device,
-            image.handle,
-            format,
-            vk::ComponentMapping::default(),
-            vk::ImageAspectFlags::COLOR,
-        );
-        match view {
-            Ok(view) => Ok(Self { image, view }),
-            Err(err) => {
-                unsafe { image.destroy(device) };
-                Err(err)
-            }
-        }
-    }
-
-    /// Leaves it null.
-    ///
-    /// # Safety
-    /// The device must be done with it.
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        unsafe {
-            device.destroy_image_view(self.view, None);
-            self.image.destroy(device);
-        }
-        *self = Self::null();
     }
 }
 
@@ -149,25 +82,31 @@ pub fn create_image_view(
     unsafe { device.create_image_view(&info, None) }
 }
 
+/// Records a barrier moving `image` from `old_layout` to `new_layout`, after `src`'s accesses in
+/// its stages and before `dst`'s: each a `(stage, access)` pair, as [`cmd_memory_barrier`] takes.
+///
+/// [`cmd_memory_barrier`]: crate::vulkan::sync::cmd_memory_barrier
+///
+/// # Safety
+/// `cmd_buffer` is recording, outside any rendering, and `image` is in `old_layout` (or it's
+/// `UNDEFINED`, its contents then lost).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn transition_layout(
+pub unsafe fn transition_layout(
     device: &ash::Device,
     image: vk::Image,
     cmd_buffer: vk::CommandBuffer,
     old_layout: vk::ImageLayout,
     new_layout: vk::ImageLayout,
-    src_access_mask: vk::AccessFlags2,
-    dst_access_mask: vk::AccessFlags2,
-    src_stage_mask: vk::PipelineStageFlags2,
-    dst_stage_mask: vk::PipelineStageFlags2,
+    src: (vk::PipelineStageFlags2, vk::AccessFlags2),
+    dst: (vk::PipelineStageFlags2, vk::AccessFlags2),
     aspect_mask: vk::ImageAspectFlags,
 ) {
     let image_memory_barrier = vk::ImageMemoryBarrier2::default()
-        .src_stage_mask(src_stage_mask)
-        .src_access_mask(src_access_mask)
-        .dst_stage_mask(dst_stage_mask)
-        .dst_access_mask(dst_access_mask)
+        .src_stage_mask(src.0)
+        .src_access_mask(src.1)
+        .dst_stage_mask(dst.0)
+        .dst_access_mask(dst.1)
         .old_layout(old_layout)
         .new_layout(new_layout)
         .image(image)

@@ -1,4 +1,8 @@
-use crate::vulkan::{adapter::Adapter, validation::Messenger};
+use crate::vulkan::{
+    adapter::Adapter,
+    gpu::VulkanDevice,
+    validation::{self, Messenger},
+};
 use anyhow::Result;
 use ash::{ext, khr, prelude::VkResult, vk};
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
@@ -6,21 +10,25 @@ use std::ffi::{self, CStr};
 
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
-/// The Vulkan instance, and the window surface everything renders to unless it's headless.
+/// The Vulkan instance, the window surface everything renders to unless it's headless, and the
+/// devices made from it with [`create_device`](crate::vulkan::gpu::create_device), which it
+/// destroys.
 pub struct App {
     pub(crate) entry: ash::Entry,
     pub(crate) instance: ash::Instance,
     pub(crate) debug_instance: ext::debug_utils::Instance,
-    /// Only present in debug builds, when the validation layer is installed.
+    /// Only with validation turned on ([`validation::VARIABLE`]), when the layer is installed.
     pub(crate) messenger: Option<Messenger>,
     pub(crate) surface_instance: khr::surface::Instance,
     /// The window's surface, owned by the `App`. Null when headless.
     pub(crate) surface: vk::SurfaceKHR,
     pub(crate) adapters: Vec<Adapter>,
+    /// The devices made from it and not yet destroyed, destroyed when it's dropped.
+    pub(crate) devices: Vec<ash::Device>,
 }
 
 impl App {
-    /// Renders to the window.
+    /// Renders to the window. The instance is Vulkan 1.3 or later, whatever `app_info` asks for.
     pub fn new(
         display_handle: RawDisplayHandle,
         window_handle: RawWindowHandle,
@@ -40,14 +48,25 @@ impl App {
         Ok(app)
     }
 
-    /// Renders to images of its own instead of a window, such as for tests on machines without a display.
+    /// Renders to images of its own instead of a window, such as for tests on machines without a
+    /// display. The instance is Vulkan 1.3 or later, whatever `app_info` asks for.
     pub fn headless(app_info: vk::ApplicationInfo) -> Result<App> {
         Self::create(app_info, &[])
     }
 
+    /// The instance takes `app_info`'s API version, raised to Vulkan 1.3 when it asks for less:
+    /// every device made from it needs 1.3.
     fn create(app_info: vk::ApplicationInfo, extensions: &[*const ffi::c_char]) -> Result<App> {
+        let app_info = app_info.api_version(app_info.api_version.max(vk::API_VERSION_1_3));
         let entry = unsafe { ash::Entry::load()? };
-        let validation = cfg!(debug_assertions) && validation_available(&entry)?;
+        let wanted = std::env::var(validation::VARIABLE).is_ok_and(|value| value != "0");
+        let validation = wanted && validation_available(&entry)?;
+        if wanted && !validation {
+            log::warn!(
+                "{} is set, but the validation layer isn't installed",
+                validation::VARIABLE
+            );
+        }
         let instance = create_instance(&entry, extensions, app_info, validation)?;
         // Dropping the `App` destroys whatever was created, if anything below fails.
         let mut app = Self {
@@ -56,19 +75,17 @@ impl App {
             surface_instance: khr::surface::Instance::new(&entry, &instance),
             surface: vk::SurfaceKHR::null(),
             adapters: Vec::new(),
+            devices: Vec::new(),
             entry,
             instance,
         };
         if validation {
             app.messenger = Some(Messenger::new(&app.debug_instance)?);
         }
-        app.adapters = unsafe {
-            app.instance
-                .enumerate_physical_devices()?
-                .into_iter()
-                .map(|physical_device| Adapter::new(&app.instance, physical_device))
-                .collect()
-        };
+        app.adapters = unsafe { app.instance.enumerate_physical_devices()? }
+            .into_iter()
+            .map(|physical_device| Adapter::new(&app.instance, physical_device))
+            .collect::<VkResult<_>>()?;
         Ok(app)
     }
 
@@ -83,7 +100,7 @@ impl App {
         (self.surface != vk::SurfaceKHR::null()).then_some(self.surface)
     }
 
-    /// Only in debug builds, when the validation layer is installed.
+    /// Whether validation is on: turned on ([`validation::VARIABLE`]), with the layer installed.
     #[inline]
     pub fn validation_enabled(&self) -> bool {
         self.messenger.is_some()
@@ -106,12 +123,42 @@ impl App {
         adapters.sort_by_key(rank);
         adapters
     }
+
+    /// Destroys `device`, one made from this `App`, once the device has finished all its work:
+    /// its wait's error, such as `ERROR_DEVICE_LOST`, is returned, the device destroyed anyway.
+    ///
+    /// # Panics
+    /// When `device` wasn't made from this `App`, or was destroyed already.
+    ///
+    /// # Safety
+    /// Everything made with the device is destroyed, and nothing uses it any more.
+    pub unsafe fn destroy_device(&mut self, device: &VulkanDevice) -> VkResult<()> {
+        let index = self
+            .devices
+            .iter()
+            .position(|recorded| recorded.handle() == device.device.handle())
+            .expect("the device was made from this App, and not destroyed yet");
+        let recorded = self.devices.swap_remove(index);
+        unsafe {
+            let waited = recorded.device_wait_idle();
+            recorded.destroy_device(None);
+            waited
+        }
+    }
 }
 
-/// Anything created from this `App`, such as a `Renderer`, must be dropped first.
+/// Every device made from this `App` is destroyed, then the instance. Anything made with them
+/// must be dropped first.
 impl Drop for App {
     fn drop(&mut self) {
         unsafe {
+            for device in self.devices.drain(..) {
+                // Nothing can be destroyed while the device might still use it.
+                if let Err(error) = device.device_wait_idle() {
+                    log::warn!("waiting for a device to finish before destroying it: {error}");
+                }
+                device.destroy_device(None);
+            }
             // A headless instance never loads the surface functions.
             if let Some(surface) = self.surface() {
                 self.surface_instance.destroy_surface(surface, None);
@@ -128,15 +175,25 @@ impl Drop for App {
 #[inline]
 fn validation_available(entry: &ash::Entry) -> VkResult<bool> {
     unsafe {
-        let has_layer = entry
-            .enumerate_instance_layer_properties()?
+        let has_layer = enumerated(|| entry.enumerate_instance_layer_properties())?
             .iter()
             .any(|layer| layer.layer_name_as_c_str() == Ok(VALIDATION_LAYER));
-        let has_extension = entry
-            .enumerate_instance_extension_properties(None)?
+        let has_extension = enumerated(|| entry.enumerate_instance_extension_properties(None))?
             .iter()
             .any(|extension| extension.extension_name_as_c_str() == Ok(ext::debug_utils::NAME));
         Ok(has_layer && has_extension)
+    }
+}
+
+/// `enumerate`'s list, asked again while the loader answers `INCOMPLETE`: the list changed
+/// between its count and its read (Vulkan's enumeration pattern; the loader can return it on the
+/// count query itself, as it did with validation runs in parallel), so the answer is asked anew.
+fn enumerated<T>(enumerate: impl Fn() -> VkResult<Vec<T>>) -> VkResult<Vec<T>> {
+    loop {
+        match enumerate() {
+            Err(vk::Result::INCOMPLETE) => continue,
+            answered => return answered,
+        }
     }
 }
 
