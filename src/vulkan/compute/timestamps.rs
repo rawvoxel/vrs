@@ -1,3 +1,4 @@
+use crate::vulkan::gpu::VulkanDevice;
 use ash::{prelude::VkResult, vk};
 
 /// GPU timestamps at any number of points in a command buffer, read back as ticks or as the
@@ -12,12 +13,13 @@ pub struct TimestampPool {
 }
 
 impl TimestampPool {
-    /// `count` timestamps (not none), read with `period` nanoseconds a tick and `valid_bits` bits
-    /// meaningful (from the adapter's limits and the queue family's properties). A queue without
-    /// timestamps (`valid_bits == 0`) is refused with
+    /// `count` timestamps (not none) for `device`'s queue, read with its adapter's nanoseconds a
+    /// tick and its queue family's meaningful bits. A queue without timestamps is refused with
     /// [`vk::Result::ERROR_FEATURE_NOT_PRESENT`].
-    pub fn new(device: &ash::Device, count: u32, period: f32, valid_bits: u32) -> VkResult<Self> {
+    pub fn new(device: &VulkanDevice, count: u32) -> VkResult<Self> {
         debug_assert!(count > 0, "a timestamp pool holds some timestamps");
+        let period = device.adapter.properties().limits.timestamp_period;
+        let valid_bits = device.queue_family.properties().timestamp_valid_bits;
         if valid_bits == 0 {
             return Err(vk::Result::ERROR_FEATURE_NOT_PRESENT);
         }
@@ -25,7 +27,7 @@ impl TimestampPool {
             .query_type(vk::QueryType::TIMESTAMP)
             .query_count(count);
         Ok(Self {
-            pool: unsafe { device.create_query_pool(&info, None)? },
+            pool: unsafe { device.device.create_query_pool(&info, None)? },
             count,
             period,
             mask: valid_mask(valid_bits),
