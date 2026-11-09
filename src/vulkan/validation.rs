@@ -13,13 +13,8 @@ use std::{
 pub const VARIABLE: &str = "VRS_VALIDATION";
 
 /// The validation errors known and not yet fixed, which [`assert_no_new_errors`] lets pass, each
-/// by its message ID:
-/// - NEW-012: two compute modules declare more workgroup memory than the device allows;
-/// - NEW-014: render mesh shaders decorate triangle indices without the triangles output mode.
-pub const KNOWN_ERRORS: [&str; 2] = [
-    "VUID-RuntimeSpirv-Workgroup-06530",
-    "VUID-PrimitiveTriangleIndicesEXT-PrimitiveTriangleIndicesEXT-07054",
-];
+/// by its message ID: none.
+pub const KNOWN_ERRORS: [&str; 0] = [];
 
 static ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 static WARNING_COUNT: AtomicU32 = AtomicU32::new(0);
