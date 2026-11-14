@@ -636,6 +636,11 @@ const DRAWS_NOTHING_SPIRV: [u32; 100] = [
     0x00000009, 0x00000009, 0x000100fd, 0x00010038,
 ];
 
+/// How far past a buffer's start our engine's lost devices read (2026-11-13, `VK_EXT_device_fault`'s
+/// `READ_INVALID`): the tree corner of key `0xFF_FFFF` (the sky's visibility value's key, decoded as a
+/// leaf's), a corner of 16 bytes for each eight keys, past the end of the corners there are.
+const SKY_KEY_CORNER_OFFSET: u64 = (0xFF_FFFF / 8) * 16;
+
 /// A lost device's objects destroyed in the spec's order, each step timed (NEW-010's close: the
 /// RTX 4070's driver spun in `vkDestroyCommandPool` after a lost device, past 70 s): a kernel that
 /// never ends ([`NEVER_ENDS_SPIRV`]) dispatched on the preferred adapter, so Windows' watchdog
@@ -655,7 +660,10 @@ const DRAWS_NOTHING_SPIRV: [u32; 100] = [
 /// 5. several GB of buffers held;
 /// 6. the pipeline cache's data read after the loss;
 /// 7. a fault in place of the kernel that never ends: a read through a destroyed buffer's address
-///    ([`FAULTS_SPIRV`]).
+///    ([`FAULTS_SPIRV`]);
+/// 8. our engine's fault in place of that one ([`SKY_KEY_CORNER_OFFSET`]): a read past a live buffer's end into
+///    a page nothing's mapped at, from a pass after the draw, in both submissions (each a frame in flight, the
+///    kernel that never ends a short one in each).
 #[test]
 #[ignore = "loses the device: a driver report's repro, run by hand"]
 fn a_lost_device_s_objects_are_destroyed_in_order() {
@@ -768,8 +776,8 @@ fn a_lost_device_s_objects_are_destroyed_in_order() {
     } else {
         Vec::new()
     };
-    // The faulting kernel's address: a buffer's, destroyed before the dispatch.
-    let freed = (steps >= 7).then(|| {
+    // The faulting kernel's address: a buffer's, destroyed before the dispatch (step 7 alone).
+    let freed = (steps == 7).then(|| {
         let buffer =
             AddressedBuffer::new(&device.adapter, raw, 1 << 20, vk::BufferUsageFlags::empty())
                 .expect("a buffer to free");
@@ -777,12 +785,19 @@ fn a_lost_device_s_objects_are_destroyed_in_order() {
         unsafe { buffer.destroy(raw) };
         address
     });
-    // Each submission's commands: its timestamps reset, the copies, the dispatch, the draw, a
-    // timestamp written after each.
+    // Step 8's: past a live buffer's end, as our engine's read was past its tree's corners; made last, so no
+    // buffer of the test's lies after it.
+    let read_past = (steps >= 8).then(|| {
+        AddressedBuffer::new(&device.adapter, raw, 1 << 20, vk::BufferUsageFlags::empty())
+            .expect("the buffer read past")
+    });
+    // Each submission's commands: its timestamps reset, the copies, the dispatch, the draw, then a dispatch
+    // after the draw (`after`, step 8's), a timestamp written after each.
     let record = |cmd: vk::CommandBuffer,
                   which: usize,
                   pipelines: &ComputePipelines,
-                  push: [u64; 2]| unsafe {
+                  push: [u64; 2],
+                  after: Option<(&ComputePipelines, [u64; 2])>| unsafe {
         let mut stamp = 0u32;
         let mut stamped = |cmd: vk::CommandBuffer| {
             if let Some(pools) = &timestamps {
@@ -834,17 +849,43 @@ fn a_lost_device_s_objects_are_destroyed_in_order() {
             commands::cmd_end_rendering(raw, cmd);
             stamped(cmd);
         }
+        if let Some((pipelines, push)) = after {
+            sync::cmd_pipeline_barrier(raw, cmd);
+            commands::cmd_dispatch(
+                raw,
+                cmd,
+                pipelines.pipeline(0),
+                pipelines.layout(),
+                bytemuck::bytes_of(&push),
+                1,
+                1,
+            );
+            stamped(cmd);
+        }
     };
     // The first submission loses the device (the kernel that never ends, or the fault); the second,
-    // behind it, is short.
-    let (lost_pipelines, lost_push) = match (&faults, freed) {
-        (Some(faults), Some(freed)) => (faults, [words.address(), freed]),
+    // behind it, is short. With step 8 both are short, and both read past the buffer after the draw.
+    let (lost_pipelines, lost_push) = match (&faults, freed, &read_past) {
+        (Some(faults), Some(freed), _) => (faults, [words.address(), freed]),
+        (_, _, Some(_)) => (&never_ends, [words.address(), 1u64]),
         _ => (&never_ends, [words.address(), 0u64]),
     };
+    let after = match (&faults, &read_past) {
+        (Some(faults), Some(past)) => Some((faults, [words.address(), past.address() + SKY_KEY_CORNER_OFFSET])),
+        _ => None,
+    };
+    if let Some(past) = &read_past {
+        println!(
+            "reading {:#x}: {SKY_KEY_CORNER_OFFSET:#x} past a buffer of {:#x} bytes at {:#x}",
+            past.address() + SKY_KEY_CORNER_OFFSET,
+            past.size(),
+            past.address()
+        );
+    }
     let began = Instant::now();
     unsafe {
         commands::begin_command_buffer(raw, first.command_buffer).expect("recording");
-        record(first.command_buffer, 0, lost_pipelines, lost_push);
+        record(first.command_buffer, 0, lost_pipelines, lost_push, after);
         commands::submit(&device, first.command_buffer, first.fence, &[], &[])
             .expect("the submission");
         if let Some(second) = &second {
@@ -854,6 +895,7 @@ fn a_lost_device_s_objects_are_destroyed_in_order() {
                 1,
                 &never_ends,
                 [words.address(), 1u64],
+                after,
             );
             commands::submit(&device, second.command_buffer, second.fence, &[], &[])
                 .expect("the second submission");
@@ -903,7 +945,7 @@ fn a_lost_device_s_objects_are_destroyed_in_order() {
     let began = Instant::now();
     unsafe {
         words.destroy(raw);
-        for buffer in scratch.iter().flatten().chain(&held) {
+        for buffer in scratch.iter().flatten().chain(&held).chain(&read_past) {
             buffer.destroy(raw);
         }
     }
