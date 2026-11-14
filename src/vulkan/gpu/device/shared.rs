@@ -7,7 +7,7 @@ use crate::vulkan::{
     adapter::Adapter,
     queue::{Queue, QueueFamily},
 };
-use ash::{ext, khr, prelude::VkResult, vk};
+use ash::{ext, khr, nv, prelude::VkResult, vk};
 use std::ffi::{CStr, c_char, c_void};
 
 /// Makes the device another Vulkan user (such as wgpu-hal) asks for, with everything a
@@ -48,12 +48,14 @@ pub unsafe fn create_shared_device(
         .copied()
         .filter(|family| suits_device(family) && queue_info.queue_count >= 1)
         .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
-    unsafe { create_merged(instance, adapter, queue_family, extensions, info) }
+    unsafe { create_merged(instance, adapter, queue_family, extensions, info, false) }
 }
 
 /// Makes the device `info` describes on `adapter`, its one queue of `queue_family`, with every
 /// extension and feature a [`VulkanDevice`] needs merged into `extensions` and `info`'s chain
-/// (see [`create_shared_device`]): both creation paths enable the same set.
+/// (see [`create_shared_device`]): both creation paths enable the same set. With `diagnostics`, the
+/// lost-device diagnostics too, where the adapter has them
+/// ([`create_device_with_diagnostics`](super::create_device_with_diagnostics)).
 ///
 /// # Safety
 /// As [`create_shared_device`].
@@ -63,6 +65,7 @@ pub(super) unsafe fn create_merged(
     queue_family: QueueFamily,
     extensions: &mut Vec<&'static CStr>,
     info: &vk::DeviceCreateInfo<'_>,
+    diagnostics: bool,
 ) -> VkResult<VulkanDevice> {
     let support = query_support(instance, &adapter);
     if !support.missing.is_empty() {
@@ -75,6 +78,19 @@ pub(super) unsafe fn create_merged(
     }
     if support.shader_clock {
         needed.push(khr::shader_clock::NAME);
+    }
+    let checkpoints = diagnostics && adapter.has_extension(nv::device_diagnostic_checkpoints::NAME);
+    if checkpoints {
+        needed.push(nv::device_diagnostic_checkpoints::NAME);
+    }
+    let device_fault = diagnostics && adapter.has_extension(ext::device_fault::NAME) && {
+        let mut fault_features = vk::PhysicalDeviceFaultFeaturesEXT::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut fault_features);
+        unsafe { instance.get_physical_device_features2(adapter.handle(), &mut features) };
+        fault_features.device_fault == vk::TRUE
+    };
+    if device_fault {
+        needed.push(ext::device_fault::NAME);
     }
     for name in needed {
         if !extensions.contains(&name) {
@@ -126,6 +142,7 @@ pub(super) unsafe fn create_merged(
     let mut mesh_shader = vk::PhysicalDeviceMeshShaderFeaturesEXT::default();
     let mut executables = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
     let mut clock = vk::PhysicalDeviceShaderClockFeaturesKHR::default();
+    let mut fault = vk::PhysicalDeviceFaultFeaturesEXT::default();
     unsafe {
         match vulkan_12 {
             Some(features) => {
@@ -205,6 +222,11 @@ pub(super) unsafe fn create_merged(
                 features.shader_device_clock = vk::TRUE;
             });
         }
+        if device_fault {
+            links.enable(&chain, &mut fault, |features| {
+                features.device_fault = vk::TRUE;
+            });
+        }
     }
     merged.p_next = links.head;
 
@@ -219,6 +241,9 @@ pub(super) unsafe fn create_merged(
             .has_extension(ext::memory_budget::NAME)
             .then(|| instance.clone()),
         shader_clock: support.shader_clock,
+        checkpoints: checkpoints
+            .then(|| nv::device_diagnostic_checkpoints::Device::new(instance, &device)),
+        device_fault: device_fault.then(|| ext::device_fault::Device::new(instance, &device)),
         device,
         adapter,
         queue_family,

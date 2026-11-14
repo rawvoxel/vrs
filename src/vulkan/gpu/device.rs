@@ -5,8 +5,8 @@ use crate::{
         queue::{Queue, QueueFamily},
     },
 };
-use ash::{ext, khr, prelude::VkResult, vk};
-use std::slice;
+use ash::{ext, khr, nv, prelude::VkResult, vk};
+use std::{ffi::c_void, slice};
 
 mod shared;
 
@@ -49,6 +49,16 @@ pub struct VulkanDevice {
     /// Whether shaders may read the subgroup's and the device's clocks (`VK_KHR_shader_clock`,
     /// enabled where the adapter has it): for instrumented builds that time their own phases.
     pub shader_clock: bool,
+    /// The `VK_NV_device_diagnostic_checkpoints` commands, on a device made with the lost-device
+    /// diagnostics ([`create_device_with_diagnostics`]) where the adapter has them: checkpoints
+    /// recorded between commands
+    /// ([`cmd_set_checkpoint`](crate::vulkan::commands::cmd_set_checkpoint)), and after a lost
+    /// device the last each stage of the queue reached ([`queue_checkpoints`]).
+    pub checkpoints: Option<nv::device_diagnostic_checkpoints::Device>,
+    /// The `VK_EXT_device_fault` command, on a device made with the lost-device diagnostics where
+    /// the adapter has it: after a lost device, what the driver says went wrong
+    /// ([`device_fault_info`]).
+    pub device_fault: Option<ext::device_fault::Device>,
 }
 
 /// Makes the device on `adapter`, one of `app`'s adapters. `app` records it and destroys it when
@@ -59,6 +69,28 @@ pub struct VulkanDevice {
 /// Everything made with the device is dropped before `app` is, or before
 /// [`App::destroy_device`] destroys the device.
 pub unsafe fn create_device(app: &mut App, adapter: &Adapter) -> VkResult<VulkanDevice> {
+    unsafe { create_on(app, adapter, false) }
+}
+
+/// [`create_device`], with the lost-device diagnostics enabled where the adapter has them:
+/// `VK_NV_device_diagnostic_checkpoints` ([`VulkanDevice::checkpoints`]) and `VK_EXT_device_fault`
+/// ([`VulkanDevice::device_fault`]). For finding where a device was lost, not for running: the
+/// driver may track more as it runs.
+///
+/// # Safety
+/// As [`create_device`].
+pub unsafe fn create_device_with_diagnostics(
+    app: &mut App,
+    adapter: &Adapter,
+) -> VkResult<VulkanDevice> {
+    unsafe { create_on(app, adapter, true) }
+}
+
+/// [`create_device`]'s device, with the lost-device diagnostics when `diagnostics`.
+///
+/// # Safety
+/// As [`create_device`].
+unsafe fn create_on(app: &mut App, adapter: &Adapter, diagnostics: bool) -> VkResult<VulkanDevice> {
     let queue_family = pick_queue_family(adapter).ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
     let queue_priorities = [1.0];
     let queue_info = vk::DeviceQueueCreateInfo::default()
@@ -72,6 +104,7 @@ pub unsafe fn create_device(app: &mut App, adapter: &Adapter) -> VkResult<Vulkan
             queue_family,
             &mut Vec::new(),
             &info,
+            diagnostics,
         )?
     };
     app.devices.push(device.device.clone());
@@ -85,6 +118,76 @@ pub fn missing_features(app: &App, adapter: &Adapter) -> Vec<&'static str> {
         missing.push("a graphics and compute queue with timestamps");
     }
     missing
+}
+
+/// The last checkpoint each stage of `queue` reached, after `checkpoints`' device was lost: each
+/// stage, and the marker given to [`cmd_set_checkpoint`](crate::vulkan::commands::cmd_set_checkpoint)
+/// there. The top of the pipe's is the last whose commands before it began, the bottom's the last
+/// whose commands before it finished.
+///
+/// # Safety
+/// `queue` is a queue of `checkpoints`' device, which is lost: nothing submits to it meanwhile.
+pub unsafe fn queue_checkpoints(
+    checkpoints: &nv::device_diagnostic_checkpoints::Device,
+    queue: vk::Queue,
+) -> Vec<(vk::PipelineStageFlags, u64)> {
+    let count = unsafe { checkpoints.get_queue_checkpoint_data_len(queue) };
+    let mut data = vec![vk::CheckpointDataNV::default(); count];
+    unsafe { checkpoints.get_queue_checkpoint_data(queue, &mut data) };
+    data.iter()
+        .map(|checkpoint| {
+            (
+                checkpoint.stage,
+                checkpoint.p_checkpoint_marker as usize as u64,
+            )
+        })
+        .collect()
+}
+
+/// What the driver says went wrong, after `device` was lost (`VK_EXT_device_fault`): its
+/// description, the addresses the fault involved, and the vendor's own records.
+/// [`vk::Result::ERROR_EXTENSION_NOT_PRESENT`] where the device wasn't made with
+/// [`create_device_with_diagnostics`] on an adapter that has it.
+///
+/// # Safety
+/// `device` is lost: nothing uses it meanwhile.
+pub unsafe fn device_fault_info(
+    device: &VulkanDevice,
+) -> VkResult<(
+    String,
+    Vec<vk::DeviceFaultAddressInfoEXT>,
+    Vec<vk::DeviceFaultVendorInfoEXT>,
+)> {
+    let Some(fault) = &device.device_fault else {
+        return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+    };
+    let handle = device.device.handle();
+    let mut counts = vk::DeviceFaultCountsEXT::default();
+    unsafe { (fault.fp().get_device_fault_info_ext)(handle, &mut counts, std::ptr::null_mut()) }
+        .result()?;
+    let mut addresses =
+        vec![vk::DeviceFaultAddressInfoEXT::default(); counts.address_info_count as usize];
+    let mut vendors =
+        vec![vk::DeviceFaultVendorInfoEXT::default(); counts.vendor_info_count as usize];
+    // The vendor's binary dump isn't asked for.
+    counts.vendor_binary_size = 0;
+    let mut info = vk::DeviceFaultInfoEXT {
+        p_address_infos: addresses.as_mut_ptr(),
+        p_vendor_infos: vendors.as_mut_ptr(),
+        p_vendor_binary_data: std::ptr::null_mut::<c_void>(),
+        ..Default::default()
+    };
+    let got = unsafe { (fault.fp().get_device_fault_info_ext)(handle, &mut counts, &mut info) };
+    if got != vk::Result::SUCCESS && got != vk::Result::INCOMPLETE {
+        return Err(got);
+    }
+    addresses.truncate(counts.address_info_count as usize);
+    vendors.truncate(counts.vendor_info_count as usize);
+    let description = info.description_as_c_str().map_or_else(
+        |_| String::new(),
+        |text| text.to_string_lossy().into_owned(),
+    );
+    Ok((description, addresses, vendors))
 }
 
 /// Each memory heap's budget and what this process uses of it, in bytes, as the driver says now

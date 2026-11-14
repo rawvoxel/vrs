@@ -13,7 +13,9 @@ use vrs::{
     App,
     vulkan::{
         commands,
-        compute::{AddressedBuffer, HostAccess, HostBuffer},
+        compute::{
+            AddressedBuffer, ComputePipelines, HostAccess, HostBuffer, PipelineCache, TimestampPool,
+        },
         gpu::{self, RenderImage, VulkanDevice},
         image, sync, validation,
     },
@@ -506,4 +508,435 @@ fn recording_functions_refuse_what_their_commands_forbid() {
     one_shot.destroy(&device);
     drop(app);
     validation::assert_no_new_errors();
+}
+
+/// A compute kernel that never ends: one workgroup of 64 threads counting a 64-bit number up from
+/// 1 until it equals the push constant `never` (0, so 2^64 steps), then writing it through the
+/// address `words` (so the count can't be dropped). Its push constants: the address, then `never`.
+/// Compiled from this GLSL with `glslangValidator -V --target-env vulkan1.3` (SDK 1.4.313.2):
+///
+/// ```glsl
+/// #version 460
+/// #extension GL_EXT_buffer_reference : require
+/// #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+/// layout(local_size_x = 64) in;
+/// layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint value; };
+/// layout(push_constant) uniform Push { Words words; uint64_t never; } push;
+/// void main()
+/// {
+///     uint64_t count = 0ul;
+///     do
+///     {
+///         count += 1ul;
+///     } while (count != push.never);
+///     push.words.value = uint(count);
+/// }
+/// ```
+const NEVER_ENDS_SPIRV: [u32; 299] = [
+    0x07230203, 0x00010600, 0x0008000b, 0x0000002b, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x0000000b, 0x00020011, 0x000014e3, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
+    0x00000000, 0x0003000e, 0x000014e4, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d,
+    0x00000000, 0x00000017, 0x00060010, 0x00000004, 0x00000011, 0x00000040, 0x00000001, 0x00000001,
+    0x00030003, 0x00000002, 0x000001cc, 0x00070004, 0x455f4c47, 0x625f5458, 0x65666675, 0x65725f72,
+    0x65726566, 0x0065636e, 0x000d0004, 0x455f4c47, 0x735f5458, 0x65646168, 0x78655f72, 0x63696c70,
+    0x615f7469, 0x68746972, 0x6974656d, 0x79745f63, 0x5f736570, 0x36746e69, 0x00000034, 0x00040005,
+    0x00000004, 0x6e69616d, 0x00000000, 0x00040005, 0x00000008, 0x6e756f63, 0x00000074, 0x00040005,
+    0x00000013, 0x68737550, 0x00000000, 0x00050006, 0x00000013, 0x00000000, 0x64726f77, 0x00000073,
+    0x00050006, 0x00000013, 0x00000001, 0x6576656e, 0x00000072, 0x00040005, 0x00000015, 0x64726f57,
+    0x00000073, 0x00050006, 0x00000015, 0x00000000, 0x756c6176, 0x00000065, 0x00040005, 0x00000017,
+    0x68737570, 0x00000000, 0x00030047, 0x00000013, 0x00000002, 0x00050048, 0x00000013, 0x00000000,
+    0x00000023, 0x00000000, 0x00050048, 0x00000013, 0x00000001, 0x00000023, 0x00000008, 0x00030047,
+    0x00000015, 0x00000002, 0x00050048, 0x00000015, 0x00000000, 0x00000023, 0x00000000, 0x00020013,
+    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006, 0x00000040, 0x00000000,
+    0x00040020, 0x00000007, 0x00000007, 0x00000006, 0x0005002b, 0x00000006, 0x00000009, 0x00000000,
+    0x00000000, 0x0005002b, 0x00000006, 0x0000000e, 0x00000001, 0x00000000, 0x00030027, 0x00000012,
+    0x000014e5, 0x0004001e, 0x00000013, 0x00000012, 0x00000006, 0x00040015, 0x00000014, 0x00000020,
+    0x00000000, 0x0003001e, 0x00000015, 0x00000014, 0x00040020, 0x00000012, 0x000014e5, 0x00000015,
+    0x00040020, 0x00000016, 0x00000009, 0x00000013, 0x0004003b, 0x00000016, 0x00000017, 0x00000009,
+    0x00040015, 0x00000018, 0x00000020, 0x00000001, 0x0004002b, 0x00000018, 0x00000019, 0x00000001,
+    0x00040020, 0x0000001a, 0x00000009, 0x00000006, 0x00020014, 0x0000001d, 0x0004002b, 0x00000018,
+    0x0000001f, 0x00000000, 0x00040020, 0x00000020, 0x00000009, 0x00000012, 0x00040020, 0x00000025,
+    0x000014e5, 0x00000014, 0x00040017, 0x00000027, 0x00000014, 0x00000003, 0x0004002b, 0x00000014,
+    0x00000028, 0x00000040, 0x0004002b, 0x00000014, 0x00000029, 0x00000001, 0x0006002c, 0x00000027,
+    0x0000002a, 0x00000028, 0x00000029, 0x00000029, 0x00050036, 0x00000002, 0x00000004, 0x00000000,
+    0x00000003, 0x000200f8, 0x00000005, 0x0004003b, 0x00000007, 0x00000008, 0x00000007, 0x0003003e,
+    0x00000008, 0x00000009, 0x000200f9, 0x0000000a, 0x000200f8, 0x0000000a, 0x000400f6, 0x0000000c,
+    0x0000000d, 0x00000000, 0x000200f9, 0x0000000b, 0x000200f8, 0x0000000b, 0x0004003d, 0x00000006,
+    0x0000000f, 0x00000008, 0x00050080, 0x00000006, 0x00000010, 0x0000000f, 0x0000000e, 0x0003003e,
+    0x00000008, 0x00000010, 0x000200f9, 0x0000000d, 0x000200f8, 0x0000000d, 0x0004003d, 0x00000006,
+    0x00000011, 0x00000008, 0x00050041, 0x0000001a, 0x0000001b, 0x00000017, 0x00000019, 0x0004003d,
+    0x00000006, 0x0000001c, 0x0000001b, 0x000500ab, 0x0000001d, 0x0000001e, 0x00000011, 0x0000001c,
+    0x000400fa, 0x0000001e, 0x0000000a, 0x0000000c, 0x000200f8, 0x0000000c, 0x00050041, 0x00000020,
+    0x00000021, 0x00000017, 0x0000001f, 0x0004003d, 0x00000012, 0x00000022, 0x00000021, 0x0004003d,
+    0x00000006, 0x00000023, 0x00000008, 0x00040071, 0x00000014, 0x00000024, 0x00000023, 0x00050041,
+    0x00000025, 0x00000026, 0x00000022, 0x0000001f, 0x0005003e, 0x00000026, 0x00000024, 0x00000002,
+    0x00000004, 0x000100fd, 0x00010038,
+];
+
+/// A compute kernel that faults: one workgroup of 64 threads reading a word through the address
+/// `freed` (a buffer's, destroyed before the dispatch) and writing it, plus one, through `words`.
+/// Compiled as [`NEVER_ENDS_SPIRV`] is:
+///
+/// ```glsl
+/// #version 460
+/// #extension GL_EXT_buffer_reference : require
+/// layout(local_size_x = 64) in;
+/// layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint value; };
+/// layout(push_constant) uniform Push { Words words; Words freed; } push;
+/// void main()
+/// {
+///     push.words.value = push.freed.value + 1u;
+/// }
+/// ```
+const FAULTS_SPIRV: [u32; 214] = [
+    0x07230203, 0x00010600, 0x0008000b, 0x0000001d, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
+    0x000014e3, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
+    0x000014e4, 0x00000001, 0x0006000f, 0x00000005, 0x00000004, 0x6e69616d, 0x00000000, 0x0000000b,
+    0x00060010, 0x00000004, 0x00000011, 0x00000040, 0x00000001, 0x00000001, 0x00030003, 0x00000002,
+    0x000001cc, 0x00070004, 0x455f4c47, 0x625f5458, 0x65666675, 0x65725f72, 0x65726566, 0x0065636e,
+    0x00040005, 0x00000004, 0x6e69616d, 0x00000000, 0x00040005, 0x00000007, 0x68737550, 0x00000000,
+    0x00050006, 0x00000007, 0x00000000, 0x64726f77, 0x00000073, 0x00050006, 0x00000007, 0x00000001,
+    0x65657266, 0x00000064, 0x00040005, 0x00000009, 0x64726f57, 0x00000073, 0x00050006, 0x00000009,
+    0x00000000, 0x756c6176, 0x00000065, 0x00040005, 0x0000000b, 0x68737570, 0x00000000, 0x00030047,
+    0x00000007, 0x00000002, 0x00050048, 0x00000007, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
+    0x00000007, 0x00000001, 0x00000023, 0x00000008, 0x00030047, 0x00000009, 0x00000002, 0x00050048,
+    0x00000009, 0x00000000, 0x00000023, 0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003,
+    0x00000002, 0x00030027, 0x00000006, 0x000014e5, 0x0004001e, 0x00000007, 0x00000006, 0x00000006,
+    0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0003001e, 0x00000009, 0x00000008, 0x00040020,
+    0x00000006, 0x000014e5, 0x00000009, 0x00040020, 0x0000000a, 0x00000009, 0x00000007, 0x0004003b,
+    0x0000000a, 0x0000000b, 0x00000009, 0x00040015, 0x0000000c, 0x00000020, 0x00000001, 0x0004002b,
+    0x0000000c, 0x0000000d, 0x00000000, 0x00040020, 0x0000000e, 0x00000009, 0x00000006, 0x0004002b,
+    0x0000000c, 0x00000011, 0x00000001, 0x00040020, 0x00000014, 0x000014e5, 0x00000008, 0x0004002b,
+    0x00000008, 0x00000017, 0x00000001, 0x00040017, 0x0000001a, 0x00000008, 0x00000003, 0x0004002b,
+    0x00000008, 0x0000001b, 0x00000040, 0x0006002c, 0x0000001a, 0x0000001c, 0x0000001b, 0x00000017,
+    0x00000017, 0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005,
+    0x00050041, 0x0000000e, 0x0000000f, 0x0000000b, 0x0000000d, 0x0004003d, 0x00000006, 0x00000010,
+    0x0000000f, 0x00050041, 0x0000000e, 0x00000012, 0x0000000b, 0x00000011, 0x0004003d, 0x00000006,
+    0x00000013, 0x00000012, 0x00050041, 0x00000014, 0x00000015, 0x00000013, 0x0000000d, 0x0006003d,
+    0x00000008, 0x00000016, 0x00000015, 0x00000002, 0x00000004, 0x00050080, 0x00000008, 0x00000018,
+    0x00000016, 0x00000017, 0x00050041, 0x00000014, 0x00000019, 0x00000010, 0x0000000d, 0x0005003e,
+    0x00000019, 0x00000018, 0x00000002, 0x00000004, 0x000100fd, 0x00010038,
+];
+
+/// A mesh shader that draws nothing (`SetMeshOutputsEXT(0, 0)`, 32 threads, triangles), compiled as
+/// [`NEVER_ENDS_SPIRV`] is with `-S mesh`.
+const DRAWS_NOTHING_SPIRV: [u32; 100] = [
+    0x07230203, 0x00010600, 0x0008000b, 0x0000000c, 0x00000000, 0x00020011, 0x000014a3, 0x0006000a,
+    0x5f565053, 0x5f545845, 0x6873656d, 0x6168735f, 0x00726564, 0x0006000b, 0x00000001, 0x4c534c47,
+    0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001, 0x0005000f, 0x000014f5,
+    0x00000004, 0x6e69616d, 0x00000000, 0x0006014b, 0x00000004, 0x00000026, 0x00000007, 0x00000008,
+    0x00000008, 0x00040010, 0x00000004, 0x0000001a, 0x00000003, 0x00040010, 0x00000004, 0x00001496,
+    0x00000001, 0x00030010, 0x00000004, 0x000014b2, 0x00030003, 0x00000002, 0x000001cc, 0x00060004,
+    0x455f4c47, 0x6d5f5458, 0x5f687365, 0x64616873, 0x00007265, 0x00040005, 0x00000004, 0x6e69616d,
+    0x00000000, 0x00020013, 0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006,
+    0x00000020, 0x00000000, 0x0004002b, 0x00000006, 0x00000007, 0x00000020, 0x0004002b, 0x00000006,
+    0x00000008, 0x00000001, 0x0004002b, 0x00000006, 0x00000009, 0x00000000, 0x00040017, 0x0000000a,
+    0x00000006, 0x00000003, 0x0006002c, 0x0000000a, 0x0000000b, 0x00000007, 0x00000008, 0x00000008,
+    0x00050036, 0x00000002, 0x00000004, 0x00000000, 0x00000003, 0x000200f8, 0x00000005, 0x000314af,
+    0x00000009, 0x00000009, 0x000100fd, 0x00010038,
+];
+
+/// A lost device's objects destroyed in the spec's order, each step timed (NEW-010's close: the
+/// RTX 4070's driver spun in `vkDestroyCommandPool` after a lost device, past 70 s): a kernel that
+/// never ends ([`NEVER_ENDS_SPIRV`]) dispatched on the preferred adapter, so Windows' watchdog
+/// resets the device and the fence's wait returns `ERROR_DEVICE_LOST`; then the fences waited for
+/// again, the device waited for idle, and everything destroyed, the device last. A driver report's
+/// repro: it loses the device, so run it alone, by hand, with a kill past 90 s:
+/// `cargo test --release -p vrs --test gpu -- --exact a_lost_device_s_objects_are_destroyed_in_order
+/// --include-ignored --nocapture`.
+///
+/// `LOST_DEVICE_REPRO_STEPS` (0 without it) adds what our engine does, the first that many, in
+/// order:
+/// 1. two submissions in flight from two command pools, each with its fence: the kernel that never
+///    ends, then a short one, the loss reported waiting for the first;
+/// 2. a timestamp query pool for each, reset and written around its commands;
+/// 3. fills, updates and copies of buffers in each, between barriers;
+/// 4. a mesh pipeline's draw of nothing in attachment-less dynamic rendering in each;
+/// 5. several GB of buffers held;
+/// 6. the pipeline cache's data read after the loss;
+/// 7. a fault in place of the kernel that never ends: a read through a destroyed buffer's address
+///    ([`FAULTS_SPIRV`]).
+#[test]
+#[ignore = "loses the device: a driver report's repro, run by hand"]
+fn a_lost_device_s_objects_are_destroyed_in_order() {
+    use std::io::Write;
+    use std::time::Instant;
+    let steps: u32 = std::env::var("LOST_DEVICE_REPRO_STEPS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(0);
+    let started = Instant::now();
+    // Each step said as it ends, with its time and the seconds since the test started.
+    let said = |step: &str, began: Instant| {
+        println!(
+            "{step}: {:.3} s (at {:.3} s)",
+            began.elapsed().as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        );
+        let _ = std::io::stdout().flush();
+    };
+    let mut app = headless_app();
+    let device = preferred_device(&mut app);
+    let properties = device.adapter.properties();
+    println!(
+        "{}: driver version {:#x}, Vulkan {}.{}.{}; steps {steps}",
+        device.adapter.name(),
+        properties.driver_version,
+        vk::api_version_major(properties.api_version),
+        vk::api_version_minor(properties.api_version),
+        vk::api_version_patch(properties.api_version)
+    );
+    let raw = &device.device;
+    let first = OneShot::new(&device);
+    let second = (steps >= 1).then(|| OneShot::new(&device));
+    let words = AddressedBuffer::new(&device.adapter, raw, 4, vk::BufferUsageFlags::empty())
+        .expect("a buffer");
+    let cache = PipelineCache::new(raw, &[]).expect("a pipeline cache");
+    let never_ends = ComputePipelines::new(
+        &device.adapter,
+        raw,
+        &NEVER_ENDS_SPIRV,
+        &[c"main"],
+        16,
+        &cache,
+        None,
+    )
+    .expect("the kernel's pipeline");
+    let faults = (steps >= 7).then(|| {
+        ComputePipelines::new(
+            &device.adapter,
+            raw,
+            &FAULTS_SPIRV,
+            &[c"main"],
+            16,
+            &cache,
+            None,
+        )
+        .expect("the faulting kernel's pipeline")
+    });
+    let timestamps = (steps >= 2).then(|| {
+        [
+            TimestampPool::new(&device, 512).expect("a timestamp pool"),
+            TimestampPool::new(&device, 512).expect("a timestamp pool"),
+        ]
+    });
+    let scratch = (steps >= 3).then(|| {
+        [
+            AddressedBuffer::new(&device.adapter, raw, 1 << 20, vk::BufferUsageFlags::empty())
+                .expect("a scratch buffer"),
+            AddressedBuffer::new(&device.adapter, raw, 1 << 20, vk::BufferUsageFlags::empty())
+                .expect("a scratch buffer"),
+        ]
+    });
+    let mesh = (steps >= 4).then(|| {
+        gpu::MeshPipeline::new(
+            raw,
+            &gpu::MeshPipelineDesc {
+                task: None,
+                mesh: gpu::ShaderStage {
+                    words: &DRAWS_NOTHING_SPIRV,
+                    entry: c"main",
+                },
+                fragment: None,
+                push_constant_size: 16,
+                color_formats: &[],
+                depth_format: None,
+                depth: gpu::DepthState {
+                    test: false,
+                    write: false,
+                    compare: vk::CompareOp::ALWAYS,
+                },
+                cull_mode: vk::CullModeFlags::NONE,
+                front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+            },
+            &cache,
+        )
+        .expect("the mesh pipeline")
+    });
+    let held: Vec<AddressedBuffer> = if steps >= 5 {
+        (0..6)
+            .map(|_| {
+                AddressedBuffer::new(
+                    &device.adapter,
+                    raw,
+                    512 << 20,
+                    vk::BufferUsageFlags::empty(),
+                )
+                .expect("512 MiB held")
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // The faulting kernel's address: a buffer's, destroyed before the dispatch.
+    let freed = (steps >= 7).then(|| {
+        let buffer =
+            AddressedBuffer::new(&device.adapter, raw, 1 << 20, vk::BufferUsageFlags::empty())
+                .expect("a buffer to free");
+        let address = buffer.address();
+        unsafe { buffer.destroy(raw) };
+        address
+    });
+    // Each submission's commands: its timestamps reset, the copies, the dispatch, the draw, a
+    // timestamp written after each.
+    let record = |cmd: vk::CommandBuffer,
+                  which: usize,
+                  pipelines: &ComputePipelines,
+                  push: [u64; 2]| unsafe {
+        let mut stamp = 0u32;
+        let mut stamped = |cmd: vk::CommandBuffer| {
+            if let Some(pools) = &timestamps {
+                pools[which].cmd_write(raw, cmd, stamp);
+                stamp += 1;
+            }
+        };
+        if let Some(pools) = &timestamps {
+            pools[which].cmd_reset(raw, cmd);
+        }
+        stamped(cmd);
+        if let Some([from, to]) = &scratch {
+            commands::cmd_fill_buffer(raw, cmd, from.handle(), 0, vk::WHOLE_SIZE, which as u32);
+            sync::cmd_pipeline_barrier(raw, cmd);
+            commands::cmd_update_buffer(
+                raw,
+                cmd,
+                from.handle(),
+                0,
+                bytemuck::cast_slice(&[7u32; 1024]),
+            );
+            sync::cmd_pipeline_barrier(raw, cmd);
+            commands::cmd_copy_buffer(raw, cmd, from.handle(), 0, to.handle(), 0, 1 << 20);
+            sync::cmd_pipeline_barrier(raw, cmd);
+            stamped(cmd);
+        }
+        commands::cmd_dispatch(
+            raw,
+            cmd,
+            pipelines.pipeline(0),
+            pipelines.layout(),
+            bytemuck::bytes_of(&push),
+            1,
+            1,
+        );
+        sync::cmd_pipeline_barrier(raw, cmd);
+        stamped(cmd);
+        if let Some(mesh) = &mesh {
+            let extent = vk::Extent2D {
+                width: 64,
+                height: 64,
+            };
+            commands::cmd_begin_rendering(raw, cmd, extent, None, None);
+            commands::cmd_set_viewport(raw, cmd, extent);
+            commands::cmd_set_scissor(raw, cmd, extent);
+            commands::cmd_bind_pipeline(raw, cmd, mesh.pipeline());
+            commands::cmd_push_constants(raw, cmd, mesh.layout(), bytemuck::bytes_of(&push));
+            commands::cmd_draw_mesh_tasks(&device.mesh_shader, cmd, 1);
+            commands::cmd_end_rendering(raw, cmd);
+            stamped(cmd);
+        }
+    };
+    // The first submission loses the device (the kernel that never ends, or the fault); the second,
+    // behind it, is short.
+    let (lost_pipelines, lost_push) = match (&faults, freed) {
+        (Some(faults), Some(freed)) => (faults, [words.address(), freed]),
+        _ => (&never_ends, [words.address(), 0u64]),
+    };
+    let began = Instant::now();
+    unsafe {
+        commands::begin_command_buffer(raw, first.command_buffer).expect("recording");
+        record(first.command_buffer, 0, lost_pipelines, lost_push);
+        commands::submit(&device, first.command_buffer, first.fence, &[], &[])
+            .expect("the submission");
+        if let Some(second) = &second {
+            commands::begin_command_buffer(raw, second.command_buffer).expect("recording");
+            record(
+                second.command_buffer,
+                1,
+                &never_ends,
+                [words.address(), 1u64],
+            );
+            commands::submit(&device, second.command_buffer, second.fence, &[], &[])
+                .expect("the second submission");
+        }
+    }
+    let ran = unsafe { sync::wait_for_fence(raw, first.fence) };
+    said(&format!("the first submission's wait ({ran:?})"), began);
+    if let Some(second) = &second {
+        let began = Instant::now();
+        let waited = unsafe { sync::wait_for_fence(raw, second.fence) };
+        said(&format!("the second submission's wait ({waited:?})"), began);
+    }
+    let began = Instant::now();
+    let waited = unsafe { sync::wait_for_fence(raw, first.fence) };
+    said(
+        &format!("the first fence waited for again ({waited:?})"),
+        began,
+    );
+    let began = Instant::now();
+    let idle = unsafe { sync::wait_for_device_idle(raw) };
+    said(&format!("the device waited for idle ({idle:?})"), began);
+    if steps >= 6 {
+        let began = Instant::now();
+        let data = cache.data(raw);
+        said(
+            &format!(
+                "the pipeline cache's data read ({:?} bytes)",
+                data.map(|bytes| bytes.len())
+            ),
+            began,
+        );
+    }
+    let began = Instant::now();
+    unsafe {
+        never_ends.destroy(raw);
+        if let Some(faults) = &faults {
+            faults.destroy(raw);
+        }
+        if let Some(mesh) = &mesh {
+            mesh.destroy(raw);
+        }
+    }
+    said("the pipelines destroyed", began);
+    let began = Instant::now();
+    unsafe { cache.destroy(raw) };
+    said("the pipeline cache destroyed", began);
+    let began = Instant::now();
+    unsafe {
+        words.destroy(raw);
+        for buffer in scratch.iter().flatten().chain(&held) {
+            buffer.destroy(raw);
+        }
+    }
+    said("the buffers destroyed", began);
+    if let Some(pools) = &timestamps {
+        let began = Instant::now();
+        unsafe {
+            for pool in pools {
+                pool.destroy(raw);
+            }
+        }
+        said("the timestamp pools destroyed", began);
+    }
+    for (name, one_shot) in [("first", Some(&first)), ("second", second.as_ref())] {
+        let Some(one_shot) = one_shot else {
+            continue;
+        };
+        let began = Instant::now();
+        unsafe { raw.destroy_fence(one_shot.fence, None) };
+        said(&format!("the {name} fence destroyed"), began);
+        let began = Instant::now();
+        unsafe { raw.destroy_command_pool(one_shot.pool, None) };
+        said(&format!("the {name} command pool destroyed"), began);
+    }
+    let began = Instant::now();
+    let destroyed = unsafe { app.destroy_device(&device) };
+    said(&format!("the device destroyed ({destroyed:?})"), began);
+    let began = Instant::now();
+    drop(app);
+    said("the instance destroyed", began);
+    assert_eq!(
+        ran,
+        Err(vk::Result::ERROR_DEVICE_LOST),
+        "the first submission lost the device"
+    );
 }

@@ -13,7 +13,8 @@ mod mesh_pipeline;
 mod target;
 
 pub use device::{
-    VulkanDevice, create_device, create_shared_device, memory_budget, missing_features,
+    VulkanDevice, create_device, create_device_with_diagnostics, create_shared_device,
+    device_fault_info, memory_budget, missing_features, queue_checkpoints,
 };
 pub use mesh_pipeline::{DepthState, MeshPipeline, MeshPipelineDesc, ShaderStage};
 pub use target::RenderImage;

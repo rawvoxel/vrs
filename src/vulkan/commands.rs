@@ -7,7 +7,7 @@ use crate::vulkan::{
     queue::QueueFamily,
     sync,
 };
-use ash::{ext, prelude::VkResult, vk};
+use ash::{ext, nv, prelude::VkResult, vk};
 use bytemuck::AnyBitPattern;
 use std::{mem, slice};
 
@@ -396,6 +396,22 @@ pub unsafe fn cmd_push_constants(
             0,
             push_constants,
         )
+    };
+}
+
+/// Records a checkpoint with `marker`: after the device is lost,
+/// [`queue_checkpoints`](crate::vulkan::gpu::queue_checkpoints) says the last each stage reached.
+///
+/// # Safety
+/// `command_buffer` is recording, on `checkpoints`' device.
+#[inline]
+pub unsafe fn cmd_set_checkpoint(
+    checkpoints: &nv::device_diagnostic_checkpoints::Device,
+    command_buffer: vk::CommandBuffer,
+    marker: u64,
+) {
+    unsafe {
+        checkpoints.cmd_set_checkpoint(command_buffer, marker as usize as *const std::ffi::c_void)
     };
 }
 
