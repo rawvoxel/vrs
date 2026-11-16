@@ -9,6 +9,9 @@ pub struct AddressedBuffer {
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
     size: vk::DeviceSize,
+    /// Its memory's size, at least `size`, and its memory type's index.
+    memory_size: vk::DeviceSize,
+    memory_type: u32,
     address: vk::DeviceAddress,
 }
 
@@ -27,7 +30,7 @@ impl AddressedBuffer {
             | vk::BufferUsageFlags::TRANSFER_SRC
             | vk::BufferUsageFlags::TRANSFER_DST
             | vk::BufferUsageFlags::INDIRECT_BUFFER;
-        let (handle, memory, _) = create(
+        let (handle, memory, memory_size, memory_type) = create(
             adapter,
             device,
             size,
@@ -42,6 +45,8 @@ impl AddressedBuffer {
             handle,
             memory,
             size,
+            memory_size,
+            memory_type,
             address,
         })
     }
@@ -61,6 +66,18 @@ impl AddressedBuffer {
     #[inline]
     pub fn size(&self) -> vk::DeviceSize {
         self.size
+    }
+
+    /// Its memory's size: what the buffer required, at least its own size.
+    #[inline]
+    pub fn memory_size(&self) -> vk::DeviceSize {
+        self.memory_size
+    }
+
+    /// Its memory's type: the index into the adapter's memory types.
+    #[inline]
+    pub fn memory_type(&self) -> u32 {
+        self.memory_type
     }
 
     /// Where shaders find it.
@@ -130,7 +147,9 @@ impl HostBuffer {
                 vk::MemoryPropertyFlags::HOST_CACHED,
             ),
         };
-        let (handle, memory, flags) = create(adapter, device, size, usage, required, preferred)?;
+        let (handle, memory, _, memory_type) =
+            create(adapter, device, size, usage, required, preferred)?;
+        let flags = adapter.memory_properties().memory_types[memory_type as usize].property_flags;
         // Frees what was made, if mapping fails.
         let destroy = |device: &ash::Device| unsafe {
             device.destroy_buffer(handle, None);
@@ -268,8 +287,8 @@ impl HostBuffer {
 }
 
 /// A buffer bound to new memory with the `required` properties, and the `preferred` ones too when
-/// some memory type has both, and the properties its memory got. The memory can be reached by
-/// device address.
+/// some memory type has both, and that memory's size (what the buffer required) and its type's
+/// index. The memory can be reached by device address.
 fn create(
     adapter: &Adapter,
     device: &ash::Device,
@@ -277,7 +296,7 @@ fn create(
     usage: vk::BufferUsageFlags,
     required: vk::MemoryPropertyFlags,
     preferred: vk::MemoryPropertyFlags,
-) -> VkResult<(vk::Buffer, vk::DeviceMemory, vk::MemoryPropertyFlags)> {
+) -> VkResult<(vk::Buffer, vk::DeviceMemory, vk::DeviceSize, u32)> {
     let buffer_info = vk::BufferCreateInfo::default()
         .size(size)
         .usage(usage)
@@ -327,8 +346,7 @@ fn create(
         }
         return Err(error);
     }
-    let flags = adapter.memory_properties().memory_types[memory_type_index as usize].property_flags;
-    Ok((handle, memory, flags))
+    Ok((handle, memory, requirements.size, memory_type_index))
 }
 
 /// The first memory type with `flags` that the buffer can use and whose heap can hold it.
