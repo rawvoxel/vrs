@@ -12,3 +12,9 @@ ash-window = "0.13.0"
 bytemuck = "1.23.1"
 log = "0.4.27"
 raw-window-handle = "0.6.2"
+
+# The workspace's lints (`[workspace.lints]` in raw_engine's root), named here: its own
+# repository builds and lints it on its own, with no workspace to inherit from.
+[lints.clippy]
+min_ident_chars = "warn"
+many_single_char_names = "warn"

@@ -1,0 +1,3 @@
+# No name of a single character (`clippy::min_ident_chars`, the workspace's lint): clippy's
+# default allows i, j, x, y, z, w and n; none here.
+allowed-idents-below-min-chars = []
